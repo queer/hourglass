@@ -1,0 +1,91 @@
+# Local Temporal cluster for Hourglass integration tests.
+#
+#   podman compose up -d         # start Temporal + Postgres (+ web UI) and
+#                                # auto-create the `hourglass-test` namespace
+#   mix test --include temporal --include integration
+#   podman compose down          # stop  (add -v to also wipe the DB volume)
+#
+# The Temporal frontend binds the SDK default localhost:7233, so the
+# integration suite connects with no env vars. Only one cluster can own a
+# given host port, so:
+#   * Stop any other local Temporal first, OR
+#   * Run this one on a different host port to coexist, e.g.
+#       HOURGLASS_TEMPORAL_PORT=7333 HOURGLASS_UI_PORT=8234 podman compose up -d
+#       TEMPORAL_TARGET_URL=http://localhost:7333 \
+#         mix test --include temporal --include integration
+#
+# Images are pinned for reproducibility; bump deliberately.
+
+name: hourglass
+
+services:
+  postgres:
+    image: docker.io/postgres:16-alpine
+    container_name: hourglass-postgres
+    environment:
+      POSTGRES_USER: hourglass
+      POSTGRES_PASSWORD: hourglass
+    volumes:
+      - hourglass-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hourglass"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  temporal:
+    image: docker.io/temporalio/auto-setup:1.25.2
+    container_name: hourglass-temporal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${HOURGLASS_TEMPORAL_PORT:-7233}:7233" # frontend gRPC
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: hourglass
+      POSTGRES_PWD: hourglass
+      POSTGRES_SEEDS: postgres
+      DBNAME: temporal
+      VISIBILITY_DBNAME: temporal_visibility
+      # Bind every interface so the in-container healthcheck (localhost) and
+      # the host port-forward both reach the frontend.
+      BIND_ON_IP: 0.0.0.0
+      TEMPORAL_ADDRESS: 0.0.0.0:7233
+      TEMPORAL_CLI_ADDRESS: localhost:7233
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "localhost:7233", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # One-shot: register the `hourglass-test` namespace the integration suite
+  # uses (config/test.exs). Idempotent — exits 0 if it already exists.
+  temporal-namespace:
+    image: docker.io/temporalio/auto-setup:1.25.2
+    container_name: hourglass-temporal-namespace
+    restart: "no"
+    depends_on:
+      temporal:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        temporal operator namespace describe --address temporal:7233 hourglass-test >/dev/null 2>&1
+        || temporal operator namespace create --address temporal:7233 --retention 24h hourglass-test
+
+  temporal-ui:
+    image: docker.io/temporalio/ui:2.32.0
+    container_name: hourglass-temporal-ui
+    depends_on:
+      temporal:
+        condition: service_healthy
+    ports:
+      - "${HOURGLASS_UI_PORT:-8233}:8080" # http://localhost:8233
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000
+
+volumes:
+  hourglass-pgdata:

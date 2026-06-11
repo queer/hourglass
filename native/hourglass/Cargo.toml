@@ -1,0 +1,30 @@
+[package]
+name = "hourglass"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+
+[lib]
+name = "hourglass"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "~0.37"
+# temporalio-sdk-core is the bridge layer we wrap. NOT temporalio-sdk
+# (that's the high-level Rust ergonomic SDK; we are building the
+# Elixir-side equivalent and would conflict). temporalio-sdk-core-api
+# is internal to sdk-core and not published separately on crates.io.
+temporalio-sdk-core = "0.3"
+temporalio-client = "0.3"
+temporalio-common = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+prost = "0.14"
+prost-wkt-types = "0.7"
+tonic = "0.12"
+thiserror = "2"
+url = "2"
+anyhow = "1"
+
+[profile.release]
+lto = true
+opt-level = 3

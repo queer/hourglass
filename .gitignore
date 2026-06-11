@@ -1,0 +1,16 @@
+/_build/
+/cover/
+/deps/
+/doc/
+/.fetch
+erl_crash.dump
+*.ez
+*.beam
+/config/*.secret.exs
+.elixir_ls/
+# Rust NIF build artifacts
+/native/hourglass/target/
+/priv/native/
+# Internal development artifacts (not part of the OSS release)
+/docs/
+/.claude/

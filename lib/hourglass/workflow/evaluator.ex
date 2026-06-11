@@ -1,0 +1,608 @@
+# credo:disable-for-this-file Credo.Check.Refactor.ModuleDependencies
+defmodule Hourglass.Workflow.Evaluator do
+  @moduledoc """
+  Pure recursive evaluator for Hourglass workflows. Per activation:
+
+   1. Replay-walks the activation's jobs to extend a `Workflow.State`:
+      `initialize_workflow` → `state.input`; each `resolve_activity{seq}`
+      → `state.resolved_results[seq] = decoded_value`; `remove_from_cache`
+      → return `:evict` shape.
+
+   2. Re-executes the workflow module's `run/1` inline (no Task spawn).
+      The Workflow API primitives consult the evaluator state via the
+      process dict (`CommandAccumulator`) and either return a resolved
+      value or `throw(:hourglass_temporal_suspend)` once the body hits a
+      command that has no result yet.
+
+   3. Catches the suspend sentinel at the `evaluate/3` boundary, sorts the
+      accumulated commands by command_id (lexicographic), assigns monotonic
+      global seqs starting at `state.next_global_seq`, and encodes a
+      `WorkflowActivationCompletion` proto.
+
+  No GenServer. No `:persistent_term`. No `send + receive` suspension.
+  State is threaded through arguments; the only mutable handle is the
+  process-dict command accumulator + the evaluator-state pointer, both
+  cleared on the way out.
+  """
+
+  alias Coresdk.WorkflowCommands.CompleteWorkflowExecution
+  alias Coresdk.WorkflowCommands.ContinueAsNewWorkflowExecution
+  alias Coresdk.WorkflowCommands.ScheduleActivity
+  alias Coresdk.WorkflowCommands.StartTimer
+  alias Coresdk.WorkflowCommands.WorkflowCommand
+  alias Coresdk.WorkflowCompletion.Failure
+  alias Coresdk.WorkflowCompletion.Success
+  alias Coresdk.WorkflowCompletion.WorkflowActivationCompletion
+  alias Hourglass.Workflow.CommandAccumulator
+  alias Hourglass.Workflow.State
+
+  require Logger
+
+  @suspend :hourglass_temporal_suspend
+
+  @spec evaluate(
+          workflow_module :: module(),
+          activation :: map(),
+          state :: State.t()
+        ) :: {:ok, WorkflowActivationCompletion.t(), State.t()}
+  def evaluate(workflow_module, activation, %State{} = state) do
+    prior_result = state.result
+
+    # Bind the workflow module to the cached state so subsequent activations
+    # (which may not carry `initialize_workflow`) can route via
+    # `Hourglass.Worker.WorkflowTypeResolver`, then apply the per-activation reset.
+    prepared = reset_per_activation(%{state | workflow_module: workflow_module})
+
+    {ingest_status, ingested} = ingest_jobs(activation, prepared)
+
+    cond do
+      # Once the workflow has previously completed, every subsequent
+      # activation re-emits the cached terminal completion —
+      # matching the GenServer-runner semantics. Temporal Server treats
+      # the duplicate as a no-op once it has already observed completion.
+      match?({:completed, _value}, prior_result) ->
+        {:completed, value} = prior_result
+        completion = build_success_completion(ingested, [build_complete_command(value)])
+        {:ok, completion, %{ingested | result: prior_result}}
+
+      ingest_status == :evict ->
+        # Pure cache-eviction activation with no prior terminal state — ack
+        # with empty Success and signal eviction in the returned state.
+        {:ok, empty_success_completion(ingested), %{ingested | result: :evict}}
+
+      true ->
+        run_body(workflow_module, ingested)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Per-activation reset (commands list emptied; resolvers/resolved_results
+  # persist across activations per the design).  `result` is reset here only
+  # so a fresh body re-execution starts from `nil`; the prior value is
+  # captured before reset and consulted in `evaluate/3` above for cached
+  # terminal-completion re-emit.
+  # ---------------------------------------------------------------------------
+
+  defp reset_per_activation(%State{} = state) do
+    %{state | commands: [], result: nil, child_count: 0}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Step 1 — ingest_jobs: walk activation.jobs, extending state.
+  # ---------------------------------------------------------------------------
+
+  defp ingest_jobs(%{jobs: jobs}, %State{} = state) when is_list(jobs) do
+    do_ingest(jobs, state, :ok)
+  end
+
+  defp do_ingest([], state, status), do: {status, state}
+
+  defp do_ingest([%{variant: {:initialize_workflow, init}} | rest], state, status) do
+    input =
+      case init.arguments do
+        [first | _rest] -> decode_payload(first)
+        _arguments -> nil
+      end
+
+    do_ingest(rest, %{state | input: input}, status)
+  end
+
+  defp do_ingest([%{variant: {:resolve_activity, resolve}} | rest], state, status) do
+    decoded = decode_activity_resolution(resolve.result)
+    new_results = Map.put(state.resolved_results, resolve.seq, decoded)
+    new_pending = Map.delete(state.pending_resolvers, resolve.seq)
+
+    do_ingest(
+      rest,
+      %{state | resolved_results: new_results, pending_resolvers: new_pending},
+      status
+    )
+  end
+
+  defp do_ingest([%{variant: {:remove_from_cache, _details}} | rest], state, _status) do
+    # Eviction job: no state mutation, but flag for the caller. Continue
+    # walking remaining jobs (Core may bundle additional jobs alongside
+    # the eviction in some sequences).
+    do_ingest(rest, state, :evict)
+  end
+
+  defp do_ingest([%{variant: {:fire_timer, %{seq: seq}}} | rest], state, status) do
+    do_ingest(
+      rest,
+      %{state | resolved_results: Map.put(state.resolved_results, seq, :fired)},
+      status
+    )
+  end
+
+  defp do_ingest([%{variant: {:signal_workflow, sig}} | rest], state, status) do
+    decoded =
+      case sig.input do
+        [first | _rest] -> decode_payload(first)
+        _input -> nil
+      end
+
+    buf = Map.get(state.signals, sig.signal_name, [])
+
+    # Signals are consumed in arrival order (Nth await_signal reads the Nth
+    # buffered payload); the per-name buffer must stay append-ordered.
+    # credo:disable-for-next-line Credo.Check.Refactor.AppendSingleItem
+    new_buf = buf ++ [decoded]
+
+    do_ingest(
+      rest,
+      %{state | signals: Map.put(state.signals, sig.signal_name, new_buf)},
+      status
+    )
+  end
+
+  defp do_ingest([%{variant: {:cancel_workflow, _details}} | rest], state, status) do
+    do_ingest(rest, %{state | cancel_requested: true}, status)
+  end
+
+  defp do_ingest([%{variant: {variant_name, _payload}} | rest], state, status) do
+    # Unsupported job variants are no-ops at runtime. Emit telemetry +
+    # info-log so operators can see when Core sends a variant we don't
+    # yet handle (signal, query, update_random_seed, etc).
+    #
+    # ErrorReporter is intentionally NOT used: it's a `:error|:exit|:throw`
+    # surface, and routine SDK protocol messages (e.g. update_random_seed,
+    # which Core fires on every subsequent workflow activation) are not
+    # errors. Misusing it raised FunctionClauseError on every activation,
+    # crashing the evaluator task and freezing the workflow.
+    :telemetry.execute(
+      [:hourglass, :workflow, :unhandled_job_variant],
+      %{count: 1},
+      %{variant: variant_name, run_id: state.run_id}
+    )
+
+    Logger.info(
+      "[Hourglass.Workflow.Evaluator] unhandled job variant #{inspect(variant_name)} (run_id=#{state.run_id}) — no-op"
+    )
+
+    do_ingest(rest, state, status)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Step 2 — re-execute the workflow body inline.
+  # ---------------------------------------------------------------------------
+
+  defp run_body(workflow_module, %State{} = state) do
+    CommandAccumulator.init()
+    CommandAccumulator.mark_evaluator_active(state)
+
+    try do
+      input = cast_workflow_input(workflow_module.__workflow_input_type__(), state.input)
+      result = workflow_module.run(input)
+      dumped = Hourglass.Codec.dump(workflow_module.__workflow_output_type__(), result)
+      finish_completed(state, dumped)
+    catch
+      :throw, @suspend ->
+        finish_suspended(state)
+
+      :throw, {:hourglass_temporal_continue_as_new, dumped_input} ->
+        finish_continue_as_new(state, dumped_input)
+
+      kind, reason when kind in [:error, :exit] ->
+        park_workflow(workflow_module, state, kind, reason, __STACKTRACE__)
+    after
+      CommandAccumulator.unmark_evaluator()
+      CommandAccumulator.clear()
+    end
+  end
+
+  # Park the workflow as a workflow-task failure: emit telemetry, warn, and
+  # build the failed completion. The server retries on the next activation.
+  defp park_workflow(workflow_module, %State{} = state, kind, reason, stacktrace) do
+    metadata = %{
+      kind: kind,
+      reason: reason,
+      workflow_module: workflow_module,
+      run_id: state.run_id
+    }
+
+    :telemetry.execute([:hourglass, :workflow, :exception], %{count: 1}, metadata)
+    :telemetry.execute([:hourglass, :workflow, :task_failed], %{count: 1}, metadata)
+
+    Logger.warning(
+      "[Hourglass.Workflow.Evaluator] workflow parked (workflow-task failure) " <>
+        "module=#{inspect(workflow_module)} run_id=#{state.run_id}: #{inspect(reason)}"
+    )
+
+    finish_task_failed(state, normalise_failure(kind, reason, stacktrace))
+  end
+
+  defp normalise_failure(:error, %_struct{} = exception, _stacktrace), do: exception
+  defp normalise_failure(:error, reason, _stacktrace), do: reason
+  defp normalise_failure(:exit, reason, _stacktrace), do: reason
+
+  @scalars [:string, :integer, :float, :boolean, :map, :any]
+
+  # Cast the raw workflow input only when the declared type is a schema module.
+  # Scalar types (:map, :any, etc.) pass the raw value through unchanged.
+  defp cast_workflow_input(type, raw) when type in @scalars, do: raw
+  defp cast_workflow_input(type, raw) when is_atom(type), do: Hourglass.Codec.cast!(type, raw)
+
+  # ---------------------------------------------------------------------------
+  # Step 3 — finish: build a completion proto + updated state.
+  # ---------------------------------------------------------------------------
+
+  defp finish_completed(%State{} = state, return_value) do
+    completion = build_success_completion(state, [build_complete_command(return_value)])
+    {:ok, completion, %{state | result: {:completed, return_value}}}
+  end
+
+  defp finish_continue_as_new(%State{} = state, dumped_input) do
+    args = [
+      %Temporal.Api.Common.V1.Payload{
+        metadata: %{"encoding" => "json/plain"},
+        data: Jason.encode!(dumped_input)
+      }
+    ]
+
+    cmd = %WorkflowCommand{
+      variant:
+        {:continue_as_new_workflow_execution,
+         %ContinueAsNewWorkflowExecution{
+           workflow_type: "",
+           task_queue: "",
+           arguments: args
+         }}
+    }
+
+    {:ok, build_success_completion(state, [cmd]), %{state | result: :continue_as_new}}
+  end
+
+  defp finish_task_failed(%State{} = state, reason) do
+    completion = %WorkflowActivationCompletion{
+      run_id: state.run_id,
+      status: {:failed, %Failure{failure: encode_failure(reason)}}
+    }
+
+    {:ok, completion, state}
+  end
+
+  # credo:disable-for-next-line Credo.Check.Refactor.ABCSize
+  defp finish_suspended(%State{} = state) do
+    accumulated = CommandAccumulator.take_commands()
+    sorted = Enum.sort_by(accumulated, fn {command_id, _cmd} -> command_id end)
+
+    {protos, assignments, next_seq} =
+      Enum.reduce(sorted, {[], [], state.next_global_seq}, fn
+        {command_id, command_term}, {acc_protos, acc_assigns, seq} ->
+          new_protos = command_to_proto(seq, command_term, state.task_queue)
+          {acc_protos ++ new_protos, [{seq, command_id, command_term} | acc_assigns], seq + 1}
+      end)
+
+    new_state =
+      State.register_assignments(
+        %{state | commands: sorted, next_global_seq: next_seq},
+        Enum.reverse(assignments)
+      )
+
+    completion = build_success_completion(new_state, protos)
+    {:ok, completion, new_state}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Suspend / resolve hook called from `Hourglass.Workflow` primitives
+  # when running under the pure-function evaluator (no runner).
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Called by `Workflow.execute_activity` (and friends) when the evaluator is
+  active on this process.  Either returns the resolved value (replay path)
+  or appends a fresh command and throws the suspend sentinel.
+  """
+  @spec suspend_or_resolve(State.command_id(), State.command_term()) :: term() | no_return()
+  def suspend_or_resolve(command_id, command_term) do
+    state =
+      CommandAccumulator.evaluator_state() ||
+        raise "Workflow.Evaluator.suspend_or_resolve/2 called outside an evaluator"
+
+    case Map.get(state.command_id_to_seq, command_id) do
+      nil ->
+        # First time we've seen this command_id — append + suspend.
+        CommandAccumulator.append_command(command_id, command_term)
+        throw(@suspend)
+
+      seq ->
+        case Map.fetch(state.resolved_results, seq) do
+          {:ok, value} -> value
+          :error -> throw(@suspend)
+        end
+    end
+  end
+
+  @doc """
+  Non-throwing variant of `suspend_or_resolve/2` for racing primitives
+  (e.g. `await_signal/2` with a timeout). First call appends the command;
+  returns `:pending` until resolved, then `{:resolved, value}`. Unlike
+  `suspend_or_resolve/2` it never throws the suspend sentinel — the caller
+  decides whether to suspend after peeking multiple racers.
+  """
+  @spec peek_command(State.command_id(), State.command_term()) :: :pending | {:resolved, term()}
+  def peek_command(command_id, command_term) do
+    state =
+      CommandAccumulator.evaluator_state() ||
+        raise "Workflow.Evaluator.peek_command/2 called outside an evaluator"
+
+    case Map.get(state.command_id_to_seq, command_id) do
+      nil ->
+        CommandAccumulator.append_command(command_id, command_term)
+        :pending
+
+      seq ->
+        case Map.fetch(state.resolved_results, seq) do
+          {:ok, value} -> {:resolved, value}
+          :error -> :pending
+        end
+    end
+  end
+
+  @doc """
+  Synchronous primitives (`uuid`, `random`) consume a deterministic
+  command_id but never produce a Temporal command and never suspend. They
+  short-circuit through this hook.
+  """
+  @spec synchronous(State.command_id(), State.command_term()) :: term()
+  def synchronous(command_id, {:uuid, _opts}) do
+    state =
+      CommandAccumulator.evaluator_state() ||
+        raise "Workflow.Evaluator.synchronous/2 called outside an evaluator"
+
+    generate_uuid(state.run_id, command_id)
+  end
+
+  def synchronous(command_id, {:random, %{max: max}}) do
+    state =
+      CommandAccumulator.evaluator_state() ||
+        raise "Workflow.Evaluator.synchronous/2 called outside an evaluator"
+
+    generate_random(state.run_id, command_id, max)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Completion builders
+  # ---------------------------------------------------------------------------
+
+  defp build_success_completion(%State{run_id: run_id}, commands) do
+    %WorkflowActivationCompletion{
+      run_id: run_id,
+      status: {:successful, %Success{commands: commands}}
+    }
+  end
+
+  defp empty_success_completion(%State{run_id: run_id}) do
+    %WorkflowActivationCompletion{
+      run_id: run_id,
+      status: {:successful, %Success{commands: []}}
+    }
+  end
+
+  defp build_complete_command(return_value) do
+    %WorkflowCommand{
+      variant:
+        {:complete_workflow_execution,
+         %CompleteWorkflowExecution{result: encode_result_payload(return_value)}}
+    }
+  end
+
+  # ---------------------------------------------------------------------------
+  # Command → proto translation.
+  # ---------------------------------------------------------------------------
+
+  defp command_to_proto(
+         seq,
+         {:execute_activity, %{module: mod, args: args, options: opts}},
+         task_queue
+       ) do
+    activity_type = Atom.to_string(mod)
+
+    [
+      %WorkflowCommand{
+        variant: {
+          :schedule_activity,
+          build_schedule_activity(seq, activity_type, args, opts, task_queue)
+        }
+      }
+    ]
+  end
+
+  defp command_to_proto(seq, {:start_timer, %{duration_ms: ms}}, _task_queue) do
+    [
+      %WorkflowCommand{
+        variant: {:start_timer, %StartTimer{seq: seq, start_to_fire_timeout: ms_to_duration(ms)}}
+      }
+    ]
+  end
+
+  defp command_to_proto(_seq, unknown, _task_queue) do
+    raise "Hourglass.Workflow.Evaluator.command_to_proto/3: " <>
+            "unreachable - unknown command term: #{inspect(unknown)}. " <>
+            "Add a clause for new command shapes."
+  end
+
+  defp build_schedule_activity(seq, activity_type, args, opts, default_task_queue) do
+    input_payload =
+      case args do
+        nil ->
+          []
+
+        _args ->
+          {encoding, data} =
+            case Jason.encode(args) do
+              {:ok, json} -> {"json/plain", json}
+              {:error, _reason} -> {"elixir/inspect", inspect(args)}
+            end
+
+          [
+            %Temporal.Api.Common.V1.Payload{
+              metadata: %{"encoding" => encoding},
+              data: data
+            }
+          ]
+      end
+
+    resolved_task_queue = Keyword.get(opts, :task_queue, default_task_queue)
+
+    %ScheduleActivity{
+      seq: seq,
+      activity_id: Integer.to_string(seq),
+      activity_type: activity_type,
+      task_queue: resolved_task_queue,
+      arguments: input_payload,
+      schedule_to_close_timeout: ms_to_duration(Keyword.get(opts, :schedule_to_close_timeout)),
+      start_to_close_timeout: ms_to_duration(Keyword.get(opts, :start_to_close_timeout)),
+      retry_policy: build_retry_policy_proto(Keyword.get(opts, :retry_policy))
+    }
+  end
+
+  defp ms_to_duration(nil), do: nil
+
+  defp ms_to_duration(ms) when is_integer(ms) do
+    %Google.Protobuf.Duration{seconds: div(ms, 1000), nanos: rem(ms, 1000) * 1_000_000}
+  end
+
+  defp build_retry_policy_proto(nil), do: nil
+
+  defp build_retry_policy_proto(policy) when is_list(policy) do
+    %Temporal.Api.Common.V1.RetryPolicy{
+      maximum_attempts: Keyword.get(policy, :max_attempts, 1),
+      initial_interval: ms_to_duration(Keyword.get(policy, :initial_interval, 1_000)),
+      backoff_coefficient: Keyword.get(policy, :backoff_coefficient, 2.0) * 1.0,
+      maximum_interval: ms_to_duration(Keyword.get(policy, :max_interval, 100_000))
+    }
+  end
+
+  # ---------------------------------------------------------------------------
+  # Payload + failure encoding.
+  # ---------------------------------------------------------------------------
+
+  defp encode_result_payload(term) do
+    {encoding, data} =
+      case Jason.encode(term) do
+        {:ok, json} -> {"json/plain", json}
+        {:error, _reason} -> {"elixir/inspect", inspect(term)}
+      end
+
+    %Temporal.Api.Common.V1.Payload{
+      metadata: %{"encoding" => encoding},
+      data: data
+    }
+  end
+
+  defp encode_failure(reason) do
+    message =
+      case reason do
+        msg when is_binary(msg) -> msg
+        _other -> inspect(reason)
+      end
+
+    %Temporal.Api.Failure.V1.Failure{message: message}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Activity result decoding.
+  # ---------------------------------------------------------------------------
+
+  defp decode_activity_resolution(nil), do: {:error, :no_result}
+
+  defp decode_activity_resolution(%Coresdk.ActivityResult.ActivityResolution{} = resolution) do
+    case resolution.status do
+      {:completed, %Coresdk.ActivityResult.Success{result: payload}} ->
+        {:ok, decode_payload(payload)}
+
+      {:failed, %Coresdk.ActivityResult.Failure{failure: failure}} ->
+        {:error, failure}
+
+      {:cancelled, %Coresdk.ActivityResult.Cancellation{failure: failure}} ->
+        {:error, {:cancelled, failure}}
+
+      {:backoff, %Coresdk.ActivityResult.DoBackoff{}} ->
+        {:error, :backoff}
+
+      nil ->
+        {:error, :no_result}
+    end
+  end
+
+  defp decode_activity_resolution(other) do
+    # Unrecognized resolution shape — Core may have introduced a new variant
+    # (signal ack, query result, etc.) that we don't yet handle. Return an
+    # error so the workflow fails non-retryably with a clear classification
+    # rather than silently treating the unknown shape as a successful result.
+    {:error, {:unknown_activity_resolution, other}}
+  end
+
+  defp decode_payload(%Temporal.Api.Common.V1.Payload{metadata: meta, data: data} = payload) do
+    encoding = Map.get(meta || %{}, "encoding", "")
+
+    case encoding do
+      "json/plain" ->
+        # Decode failure is a production-code bug, not normal operation: an
+        # activity claimed json/plain but produced unparseable bytes. Raise so the
+        # workflow fails with a real reason rather than receiving a raw proto
+        # struct and crashing later with MatchError on a downstream pattern.
+        # Note: typed cast (via __activity_output_type__) happens in execute_activity/2,3;
+        # decode_payload only decodes the raw JSON term.
+        case Jason.decode(data) do
+          {:ok, term} -> term
+          {:error, reason} -> raise "json/plain payload decode failed: #{inspect(reason)}"
+        end
+
+      _encoding ->
+        payload
+    end
+  end
+
+  defp decode_payload(nil), do: nil
+  defp decode_payload(other), do: other
+
+  # ---------------------------------------------------------------------------
+  # Deterministic primitives (uuid / random).
+  # ---------------------------------------------------------------------------
+
+  defp generate_uuid(run_id, command_id) do
+    seed = "#{run_id}:#{inspect(command_id)}"
+
+    <<a::32, b::16, c::16, d::16, e::48>> =
+      binary_part(:crypto.hash(:sha256, seed), 0, 16)
+
+    formatted =
+      :io_lib.format(
+        "~8.16.0b-~4.16.0b-~4.16.0b-~4.16.0b-~12.16.0b",
+        [a, b, c, d, e]
+      )
+
+    IO.iodata_to_binary(formatted)
+  end
+
+  defp generate_random(run_id, command_id, max) do
+    seed = "#{run_id}:#{inspect(command_id)}"
+
+    <<n::64>> =
+      binary_part(:crypto.hash(:sha256, seed), 0, 8)
+
+    rem(n, max)
+  end
+end
