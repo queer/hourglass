@@ -1,4 +1,9 @@
 # credo:disable-for-this-file Credo.Check.Refactor.ModuleDependencies
+# This module is a Credo check and requires Credo to be compiled first.
+# Guard the definition so that when hourglass is used as a library dependency
+# and Credo is not available (prod/non-dev contexts), this file compiles to
+# a no-op stub rather than raising a compile error.
+if Code.ensure_loaded?(Credo.Check) do
 defmodule Hourglass.Check.WorkflowDeterminism do
   @moduledoc """
   Credo check: flags non-deterministic calls inside `use Hourglass.Workflow`
@@ -122,4 +127,5 @@ defmodule Hourglass.Check.WorkflowDeterminism do
       line_no: meta[:line]
     )
   end
+end
 end
