@@ -4,7 +4,7 @@ defmodule Hourglass.MixProject do
   def project do
     [
       app: :hourglass,
-      version: "0.1.0",
+      version: "0.1.1",
       elixir: "~> 1.15",
       name: "hourglass",
       description: description(),
