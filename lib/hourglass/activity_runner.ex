@@ -149,13 +149,16 @@ defmodule Hourglass.ActivityRunner do
      }}
   end
 
-  defp invoke(%{variant: {:cancel, %{reason: reason}}}, _task_queue) do
-    # Temporal sends a Cancel variant when a workflow is terminated, an
-    # activity heartbeat times out, or completion races a cancellation
-    # request. We don't support mid-flight activity cancellation (activities
-    # are synchronous and don't poll a cancel context), so the right move is
-    # to acknowledge the cancel back to Core via a Cancellation completion.
-    # This unblocks Core's bookkeeping; the workflow has already moved on.
+  defp invoke(%{variant: {:cancel, %{reason: reason}}, task_token: task_token}, _task_queue) do
+    # Temporal sends a Cancel variant when a workflow is terminated, an activity heartbeat times
+    # out, or completion races a cancellation request. Mark the token so the (still-heartbeating)
+    # running activity observes the cancel at its next Hourglass.Activity.heartbeat/0 and stops,
+    # then acknowledge the cancel back to Core via a Cancellation completion. The Start task's
+    # `after` block clears the token once it finishes.
+    Hourglass.Activity.CancelRegistry.mark(task_token, reason)
+
+    :telemetry.execute([:hourglass, :activity, :cancel_received], %{count: 1}, %{reason: reason})
+
     {:cancelled, reason}
   end
 
