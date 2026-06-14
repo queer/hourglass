@@ -81,6 +81,7 @@ defmodule Hourglass.Application do
   # is up.
   defp local_singletons do
     [
+      Hourglass.Activity.CancelRegistry,
       Hourglass.WorkflowEvaluator.DynamicSupervisor,
       Hourglass.ActivityExecutor.DynamicSupervisor
     ]
