@@ -145,6 +145,38 @@ defmodule Hourglass.Activity do
   @spec attempt() :: pos_integer()
   def attempt, do: info().attempt
 
+  @doc """
+  Record a liveness heartbeat for the currently-running activity. Resets the activity's
+  `heartbeat_timeout` at Temporal. Best-effort and side-effect-free on the activity body:
+
+    * Outside an activity dispatch (or before `task_token` is populated) it is a `:ok` no-op.
+    * Emits a `[:hourglass, :activity, :heartbeat]` telemetry event (observability + test hook).
+    * Swallows a BridgeHolder `:exit` (holder absent or mid-recycle) — a heartbeat must never
+      crash or fail the activity.
+
+  Liveness only: no `details` payload (Hourglass does not surface heartbeat details on retry).
+  """
+  @spec heartbeat() :: :ok
+  def heartbeat do
+    case try_info() do
+      %Hourglass.Activity.Info{task_token: token, task_queue: q}
+      when is_binary(token) and token != "" ->
+        :telemetry.execute([:hourglass, :activity, :heartbeat], %{count: 1}, %{task_queue: q})
+        hb = %Coresdk.ActivityHeartbeat{task_token: token, details: []}
+        _ = safe_record(q, Protobuf.encode(hb))
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp safe_record(task_queue, bin) do
+    Hourglass.BridgeHolder.record_heartbeat(task_queue, bin)
+  catch
+    :exit, _ -> {:error, :holder_unavailable}
+  end
+
   defmacro __using__(opts) do
     input_raw = Keyword.get(opts, :input, :map)
     output_raw = Keyword.get(opts, :output, :map)

@@ -118,6 +118,33 @@ defmodule Hourglass.ActivityTest do
     end
   end
 
+  describe "heartbeat/0" do
+    test "heartbeat/0 is a :ok no-op (no telemetry) outside an activity dispatch" do
+      attach_hb()
+      assert Hourglass.Activity.heartbeat() == :ok
+      refute_receive {:hb, _}, 50
+    end
+
+    test "heartbeat/0 inside a dispatch emits telemetry and does not crash when the holder is absent" do
+      Process.put({Hourglass.Activity, :info}, %Hourglass.Activity.Info{
+        workflow_id: "w", run_id: "r", activity_id: "a", attempt: 1, task_token: "TOK", task_queue: "tq-1"
+      })
+      attach_hb()
+      assert Hourglass.Activity.heartbeat() == :ok
+      assert_receive {:hb, %{task_queue: "tq-1"}}
+      Process.delete({Hourglass.Activity, :info})
+    end
+
+    defp attach_hb do
+      ref = {__MODULE__, make_ref()}
+      pid = self()
+      :telemetry.attach(ref, [:hourglass, :activity, :heartbeat],
+        fn _e, _m, meta, _c -> send(pid, {:hb, meta}) end, nil)
+      on_exit(fn -> :telemetry.detach(ref) end)
+      ref
+    end
+  end
+
   describe "compile-time validation" do
     test "rejects :retryable_error_types (classifier owns eligibility)" do
       assert_raise CompileError, ~r/retryable_error_types/, fn ->
