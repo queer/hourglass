@@ -18,9 +18,16 @@ defmodule Hourglass.Activity.CancelRegistryTest do
     assert CancelRegistry.cancelled?(t) == nil
   end
 
+  test "mark overwrites an existing entry (last writer wins)" do
+    t = tok()
+    CancelRegistry.mark(t, :first)
+    CancelRegistry.mark(t, :second)
+    assert CancelRegistry.cancelled?(t) == :second
+  end
+
   test "sweep removes entries older than the TTL" do
     t = tok()
-    # Insert an entry with an artificially old monotonic stamp, then sweep.
+    # Direct insert (the table is :public by design) to forge an entry with an old stamp.
     :ets.insert(CancelRegistry, {t, :timed_out, System.monotonic_time(:millisecond) - 10_000_000})
     assert CancelRegistry.cancelled?(t) == :timed_out
     send(Process.whereis(CancelRegistry), :sweep)

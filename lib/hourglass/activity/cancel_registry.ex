@@ -25,22 +25,28 @@ defmodule Hourglass.Activity.CancelRegistry do
 
   @spec mark(binary(), term()) :: :ok
   def mark(task_token, reason) when is_binary(task_token) do
-    if table?(), do: :ets.insert(@table, {task_token, reason, now_ms()})
+    :ets.insert(@table, {task_token, reason, now_ms()})
     :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   @spec cancelled?(binary()) :: term() | nil
   def cancelled?(task_token) when is_binary(task_token) do
-    case table?() && :ets.lookup(@table, task_token) do
+    case :ets.lookup(@table, task_token) do
       [{^task_token, reason, _ts}] -> reason
       _ -> nil
     end
+  rescue
+    ArgumentError -> nil
   end
 
   @spec clear(binary()) :: :ok
   def clear(task_token) when is_binary(task_token) do
-    if table?(), do: :ets.delete(@table, task_token)
+    :ets.delete(@table, task_token)
     :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   @impl true
@@ -59,6 +65,5 @@ defmodule Hourglass.Activity.CancelRegistry do
   end
 
   defp schedule_sweep, do: Process.send_after(self(), :sweep, @sweep_interval_ms)
-  defp table?, do: :ets.whereis(@table) != :undefined
   defp now_ms, do: System.monotonic_time(:millisecond)
 end
