@@ -57,6 +57,11 @@ defmodule Hourglass.Bridge do
           :ok | {:error, Hourglass.Bridge.Error.t()}
   def worker_complete_activity_task(_worker, _bin), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec worker_record_activity_heartbeat(reference(), binary()) ::
+          :ok | {:error, Hourglass.Bridge.Error.t()}
+  def worker_record_activity_heartbeat(_worker, _heartbeat_bin),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec worker_shutdown(reference()) :: :ok | {:error, Hourglass.Bridge.Error.t()}
   def worker_shutdown(_worker), do: :erlang.nif_error(:nif_not_loaded)
 

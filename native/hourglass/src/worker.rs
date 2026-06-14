@@ -197,6 +197,29 @@ pub fn worker_complete_activity_task(
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
+pub fn worker_record_activity_heartbeat(
+    env: rustler::Env,
+    worker: ResourceArc<WorkerResource>,
+    heartbeat_bin: Binary,
+) -> OkOrError {
+    use temporalio_common::protos::coresdk::ActivityHeartbeat;
+
+    let hb = match ActivityHeartbeat::decode(heartbeat_bin.as_slice()) {
+        Ok(h) => h,
+        Err(e) => return OkOrError::Err(BridgeError::InvalidProto(e.to_string()).to_elixir(env)),
+    };
+
+    // record_activity_heartbeat is sync fire-and-forget; Core's heartbeat manager buffers and
+    // throttles delivery to the server. It may touch tokio internals, so run it inside the
+    // runtime context like worker_shutdown does.
+    worker.runtime.tokio_handle.block_on(async {
+        worker.worker.record_activity_heartbeat(hb);
+    });
+    let _ = env;
+    OkOrError::Ok
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
 pub fn worker_shutdown(
     env: rustler::Env,
     worker: ResourceArc<WorkerResource>,
