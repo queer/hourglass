@@ -146,17 +146,22 @@ defmodule Hourglass.Activity do
   def attempt, do: info().attempt
 
   @doc """
-  Record a liveness heartbeat for the currently-running activity. Resets the activity's
-  `heartbeat_timeout` at Temporal. Best-effort and side-effect-free on the activity body:
+  Record a liveness heartbeat for the currently-running activity and report whether the activity
+  has been cancelled. Resets the activity's `heartbeat_timeout` at Temporal. Best-effort and
+  side-effect-free on the activity body:
 
     * Outside an activity dispatch (or before `task_token` is populated) it is a `:ok` no-op.
     * Emits a `[:hourglass, :activity, :heartbeat]` telemetry event (observability + test hook).
     * Swallows a BridgeHolder `:exit` (holder absent or mid-recycle) — a heartbeat must never
       crash or fail the activity.
 
+  Returns `:cancel` iff Core has cancelled this activity (heartbeat timeout, workflow cancel, or
+  terminate) — the runner's Cancel-task handler marked the token in `CancelRegistry`. Long
+  activities check the return at their heartbeat points and stop cleanly; or use `heartbeat!/0`.
+
   Liveness only: no `details` payload (Hourglass does not surface heartbeat details on retry).
   """
-  @spec heartbeat() :: :ok
+  @spec heartbeat() :: :ok | :cancel
   def heartbeat do
     case try_info() do
       %Hourglass.Activity.Info{task_token: token, task_queue: q, workflow_id: wid, run_id: rid, activity_id: aid}
@@ -166,10 +171,24 @@ defmodule Hourglass.Activity do
         })
         hb = %Coresdk.ActivityHeartbeat{task_token: token, details: []}
         _ = safe_record(q, Protobuf.encode(hb))
-        :ok
+        if Hourglass.Activity.CancelRegistry.cancelled?(token), do: :cancel, else: :ok
 
       _ ->
         :ok
+    end
+  end
+
+  @doc """
+  Like `heartbeat/0`, but RAISES `Hourglass.Activity.Cancelled` when the activity has been
+  cancelled (instead of returning `:cancel`). The runner turns the raise into a Temporal
+  Cancellation completion. Use in activity bodies that want automatic unwinding at the next
+  heartbeat; the body needs no other change.
+  """
+  @spec heartbeat!() :: :ok
+  def heartbeat! do
+    case heartbeat() do
+      :cancel -> raise(Hourglass.Activity.Cancelled, reason: :cancel_requested)
+      :ok -> :ok
     end
   end
 
