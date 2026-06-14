@@ -82,6 +82,20 @@ defmodule Hourglass.ActivityRunnerTest do
     def execute(%{"action" => "fail_unclassified"}), do: {:error, "no clause for me"}
   end
 
+  # Captures Activity.Info fields by sending directly to self(). ActivityRunner.run/3
+  # executes the activity body synchronously in the calling process, so self() here
+  # IS the test pid — no bridging mechanism needed.
+  defmodule CtxActivity do
+    use Hourglass.Activity, input: :map, output: :map
+
+    @impl Hourglass.Activity.Behaviour
+    def execute(_args) do
+      info = Hourglass.Activity.info()
+      send(self(), {:ctx, info.task_token, info.task_queue})
+      %{}
+    end
+  end
+
   # A tiny schema for the output-dump test.
   defmodule OutputSchema do
     use Hourglass.Schema
@@ -345,6 +359,37 @@ defmodule Hourglass.ActivityRunnerTest do
       assert failure.message =~ "RetryClassifier"
       assert failure.message =~ "UnclassifiedActivity"
     end
+  end
+
+  test "Activity.Info carries task_token and task_queue" do
+    activity_task = %Coresdk.ActivityTask.ActivityTask{
+      task_token: "TOK",
+      variant:
+        {:start,
+         %Coresdk.ActivityTask.Start{
+           activity_type: Atom.to_string(CtxActivity),
+           activity_id: "ctx-activity",
+           attempt: 1,
+           workflow_execution: %Temporal.Api.Common.V1.WorkflowExecution{
+             workflow_id: "ctx-wf",
+             run_id: "ctx-run"
+           },
+           input: [
+             %Temporal.Api.Common.V1.Payload{
+               metadata: %{"encoding" => "json/plain"},
+               data: Jason.encode!(%{})
+             }
+           ]
+         }}
+    }
+
+    ExUnit.CaptureLog.capture_log(fn ->
+      # run/3 is synchronous — the activity body runs in this process, so
+      # {:ctx, ...} is already in the mailbox before assert_receive.
+      ActivityRunner.run(activity_task, "tq-1", fn _tq, _bytes -> :ok end)
+    end)
+
+    assert_receive {:ctx, "TOK", "tq-1"}, 0
   end
 
   describe "telemetry on [:hourglass, :activity, :failure] (custom classifier)" do

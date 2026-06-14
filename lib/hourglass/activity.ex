@@ -109,7 +109,8 @@ defmodule Hourglass.Activity do
 
   @doc """
   Returns the per-dispatch context as a `Hourglass.Activity.Info`
-  struct. Fields: `workflow_id`, `run_id`, `activity_id`, `attempt`.
+  struct. Fields: `workflow_id`, `run_id`, `activity_id`, `attempt`,
+  `task_token`, `task_queue`.
 
   Read from a process-dictionary key (`{Hourglass.Activity, :info}`)
   that `Hourglass.ActivityRunner` sets immediately before each dispatch

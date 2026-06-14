@@ -76,7 +76,7 @@ defmodule Hourglass.ActivityRunner do
       ) do
     completion =
       try do
-        invoke(activity_task)
+        invoke(activity_task, task_queue)
       rescue
         e -> failed_from_exception(activity_task, e)
       catch
@@ -149,7 +149,7 @@ defmodule Hourglass.ActivityRunner do
      }}
   end
 
-  defp invoke(%{variant: {:cancel, %{reason: reason}}}) do
+  defp invoke(%{variant: {:cancel, %{reason: reason}}}, _task_queue) do
     # Temporal sends a Cancel variant when a workflow is terminated, an
     # activity heartbeat times out, or completion races a cancellation
     # request. We don't support mid-flight activity cancellation (activities
@@ -159,15 +159,18 @@ defmodule Hourglass.ActivityRunner do
     {:cancelled, reason}
   end
 
-  defp invoke(activity_task) do
+  defp invoke(activity_task, task_queue) do
     %{variant: {:start, start}} = activity_task
     raw = decode_args(start.input)
 
-    # Expose per-dispatch context (workflow id, run id, activity id, attempt)
-    # to the activity body via Hourglass.Activity.info/0. Cleared on the
-    # way out — including the raise path — so a failed activity doesn't leak
-    # stale context onto whichever process picks the task up next.
-    Process.put({Hourglass.Activity, :info}, build_info(start))
+    # Expose per-dispatch context (workflow id, run id, activity id, attempt,
+    # task_token, task_queue) to the activity body via Hourglass.Activity.info/0.
+    # Cleared on the way out — including the raise path — so a failed activity
+    # doesn't leak stale context onto whichever process picks the task up next.
+    Process.put(
+      {Hourglass.Activity, :info},
+      build_info(start, activity_task.task_token, task_queue)
+    )
 
     try do
       case find_activity_module(start.activity_type) do
@@ -197,20 +200,26 @@ defmodule Hourglass.ActivityRunner do
   # rather than silently bucketing every malformed task into a single empty
   # `(workflow_id, run_id, activity_id)` slot — callers that key on these
   # fields for idempotency would mis-correlate every malformed dispatch.
-  defp build_info(%Coresdk.ActivityTask.Start{
-         workflow_execution: %Temporal.Api.Common.V1.WorkflowExecution{
-           workflow_id: workflow_id,
-           run_id: run_id
+  defp build_info(
+         %Coresdk.ActivityTask.Start{
+           workflow_execution: %Temporal.Api.Common.V1.WorkflowExecution{
+             workflow_id: workflow_id,
+             run_id: run_id
+           },
+           activity_id: activity_id,
+           attempt: attempt
          },
-         activity_id: activity_id,
-         attempt: attempt
-       })
+         task_token,
+         task_queue
+       )
        when is_binary(activity_id) do
     %Info{
       workflow_id: workflow_id,
       run_id: run_id,
       activity_id: activity_id,
-      attempt: normalise_attempt(attempt)
+      attempt: normalise_attempt(attempt),
+      task_token: task_token,
+      task_queue: task_queue
     }
   end
 
