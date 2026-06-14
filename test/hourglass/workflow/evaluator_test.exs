@@ -66,6 +66,16 @@ defmodule Hourglass.Workflow.EvaluatorTest do
     end
   end
 
+  defmodule HeartbeatTimeoutWorkflow do
+    use Hourglass.Workflow
+
+    @impl Hourglass.Workflow.Behaviour
+    def run(input) do
+      result = execute_activity(MyAct, input, heartbeat_timeout: 30_000)
+      {:ok, result}
+    end
+  end
+
   defmodule TwoStep do
     use Hourglass.Workflow
 
@@ -540,6 +550,26 @@ defmodule Hourglass.Workflow.EvaluatorTest do
     assert sa.activity_type == expected
     # No function suffix: the type must not end with ".something_lowercase"
     refute sa.activity_type =~ ~r/\.[a-z_]+$/
+  end
+
+  test "execute_activity/3 forwards heartbeat_timeout to ScheduleActivity command" do
+    state0 = fresh_state("r-heartbeat-1")
+
+    {:ok, completion, _s1} =
+      Evaluator.evaluate(HeartbeatTimeoutWorkflow, activation([init_job(%{})]), state0)
+
+    assert [%WorkflowCommand{variant: {:schedule_activity, sa}}] = commands_of(completion)
+    assert sa.heartbeat_timeout == %Google.Protobuf.Duration{seconds: 30, nanos: 0}
+  end
+
+  test "execute_activity/2 omitting heartbeat_timeout yields nil on ScheduleActivity command" do
+    state0 = fresh_state("r-heartbeat-nil-1")
+
+    {:ok, completion, _s1} =
+      Evaluator.evaluate(SingleStep, activation([init_job(%{})]), state0)
+
+    assert [%WorkflowCommand{variant: {:schedule_activity, sa}}] = commands_of(completion)
+    assert sa.heartbeat_timeout == nil
   end
 
   # -------------------------------------------------------------------------

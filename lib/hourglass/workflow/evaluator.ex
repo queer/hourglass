@@ -473,6 +473,7 @@ defmodule Hourglass.Workflow.Evaluator do
       arguments: input_payload,
       schedule_to_close_timeout: ms_to_duration(Keyword.get(opts, :schedule_to_close_timeout)),
       start_to_close_timeout: ms_to_duration(Keyword.get(opts, :start_to_close_timeout)),
+      heartbeat_timeout: ms_to_duration(Keyword.get(opts, :heartbeat_timeout)),
       retry_policy: build_retry_policy_proto(Keyword.get(opts, :retry_policy))
     }
   end
