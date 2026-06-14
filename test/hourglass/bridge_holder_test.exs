@@ -80,6 +80,14 @@ defmodule Hourglass.BridgeHolderTest do
                BridgeHolder.complete_activity_task(queue, <<>>)
     end
 
+    test "record_heartbeat on an unregistered task_queue returns :worker_not_registered" do
+      assert {:error, :worker_not_registered} =
+               BridgeHolder.record_heartbeat(
+                 "no-such-queue-#{System.unique_integer([:positive])}",
+                 <<>>
+               )
+    end
+
     test "poll_workflow_activation returns {:error, :worker_not_registered}" do
       queue = "bh-poll-wf-#{System.unique_integer([:positive])}"
 

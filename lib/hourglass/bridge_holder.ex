@@ -291,6 +291,17 @@ defmodule Hourglass.BridgeHolder do
     GenServer.call(__MODULE__, {:complete_activity_task, task_queue, bytes}, 30_000)
   end
 
+  @doc """
+  Record an activity heartbeat (liveness) for `task_queue`. Fast, in-process NIF call —
+  fire-and-forget at Core. Unknown task_queue returns `{:error, :worker_not_registered}`
+  (the heartbeat is best-effort; the caller swallows this).
+  """
+  @spec record_heartbeat(String.t(), binary()) :: :ok | {:error, term()}
+  def record_heartbeat(task_queue, heartbeat_bin)
+      when is_binary(task_queue) and is_binary(heartbeat_bin) do
+    GenServer.call(__MODULE__, {:record_heartbeat, task_queue, heartbeat_bin}, 30_000)
+  end
+
   # ---------------------------------------------------------------------------
   # GenServer callbacks
   # ---------------------------------------------------------------------------
@@ -464,6 +475,32 @@ defmodule Hourglass.BridgeHolder do
           %{task_queue: task_queue}
         )
 
+        {:reply, {:error, :worker_not_registered}, state}
+    end
+  end
+
+  @impl GenServer
+  def handle_call({:record_heartbeat, task_queue, bytes}, _from, state) do
+    case Map.fetch(state.handles, task_queue) do
+      {:ok, handle} ->
+        reply =
+          try do
+            Bridge.worker_record_activity_heartbeat(handle, bytes)
+          rescue
+            err in ArgumentError ->
+              :telemetry.execute(
+                [:hourglass, :worker, :registration_failed],
+                %{count: 1},
+                %{failure_class: :nif_reload, task_queue: task_queue, detail: Exception.message(err)}
+              )
+
+              signal_nif_reload!("worker_record_activity_heartbeat")
+              {:error, :nif_reloaded}
+          end
+
+        {:reply, reply, state}
+
+      :error ->
         {:reply, {:error, :worker_not_registered}, state}
     end
   end
