@@ -78,6 +78,7 @@ defmodule Hourglass.ActivityRunner do
       try do
         invoke(activity_task, task_queue)
       rescue
+        e in Hourglass.Activity.Cancelled -> {:cancelled, e.reason}
         e -> failed_from_exception(activity_task, e)
       catch
         kind, value -> failed_from_caught(activity_task, kind, value)
@@ -162,8 +163,7 @@ defmodule Hourglass.ActivityRunner do
     {:cancelled, reason}
   end
 
-  defp invoke(activity_task, task_queue) do
-    %{variant: {:start, start}} = activity_task
+  defp invoke(%{variant: {:start, start}} = activity_task, task_queue) do
     raw = decode_args(start.input)
 
     # Expose per-dispatch context (workflow id, run id, activity id, attempt,
@@ -192,6 +192,7 @@ defmodule Hourglass.ActivityRunner do
       end
     after
       Process.delete({Hourglass.Activity, :info})
+      Hourglass.Activity.CancelRegistry.clear(activity_task.task_token)
     end
   end
 
