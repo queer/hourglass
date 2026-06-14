@@ -18,6 +18,7 @@ defmodule Hourglass.Telemetry do
     # reserved — not currently emitted; :failure carries classification as metadata
     [:hourglass, :activity, :failure, :unclassified],
     [:hourglass, :activity, :exception],
+    [:hourglass, :activity, :cancel_received],
     [:hourglass, :activity, :dispatch_failed],
     [:hourglass, :workflow, :exception],
     # workflow body raised → parked as a workflow-task failure; retried by the server
