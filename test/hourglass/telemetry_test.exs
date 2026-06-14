@@ -7,8 +7,8 @@ defmodule Hourglass.TelemetryTest do
     assert not Enum.empty?(Telemetry.events())
   end
 
-  test "events/0 returns exactly 12 canonical events" do
-    assert length(Hourglass.Telemetry.events()) == 12
+  test "events/0 returns exactly 13 canonical events" do
+    assert length(Hourglass.Telemetry.events()) == 13
   end
 
   test "every event is a list of atoms beginning with :hourglass" do

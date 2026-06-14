@@ -159,9 +159,11 @@ defmodule Hourglass.Activity do
   @spec heartbeat() :: :ok
   def heartbeat do
     case try_info() do
-      %Hourglass.Activity.Info{task_token: token, task_queue: q}
+      %Hourglass.Activity.Info{task_token: token, task_queue: q, workflow_id: wid, run_id: rid, activity_id: aid}
       when is_binary(token) and token != "" ->
-        :telemetry.execute([:hourglass, :activity, :heartbeat], %{count: 1}, %{task_queue: q})
+        :telemetry.execute([:hourglass, :activity, :heartbeat], %{count: 1}, %{
+          task_queue: q, workflow_id: wid, run_id: rid, activity_id: aid
+        })
         hb = %Coresdk.ActivityHeartbeat{task_token: token, details: []}
         _ = safe_record(q, Protobuf.encode(hb))
         :ok

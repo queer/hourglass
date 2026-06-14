@@ -11,6 +11,7 @@ defmodule Hourglass.Telemetry do
   @events [
     [:hourglass, :connection, :failed],
     [:hourglass, :worker, :registration_failed],
+    [:hourglass, :activity, :heartbeat],
     # reserved — not currently emitted; placeholder for future heartbeat tracking
     [:hourglass, :activity, :heartbeat_lost],
     [:hourglass, :activity, :failure],
