@@ -133,6 +133,32 @@ def execute(%MyApp.Greet.In{} = args) do
 end
 ```
 
+### Activity heartbeat & cancellation
+
+Long-running activities should heartbeat periodically. `Hourglass.Activity.heartbeat/0` resets the
+activity's Temporal `heartbeat_timeout` and returns `:ok | :cancel` — `:cancel` once Temporal has
+cancelled the activity. `heartbeat!/0` raises `Hourglass.Activity.Cancelled` on cancel instead of
+returning it, and the runner reports a Temporal Cancellation completion. Check the return (or use
+the bang form) at your loop's natural boundaries so a cancelled activity stops instead of running
+on as a zombie after Temporal has abandoned it:
+
+```elixir
+def execute(_args) do
+  Enum.each(work, fn item ->
+    do_chunk(item)
+    Hourglass.Activity.heartbeat!()   # raises Cancelled when cancelled → the activity unwinds
+  end)
+end
+```
+
+`heartbeat/0` is best-effort and never crashes the activity body (a missing/absent runtime degrades
+to `:ok`).
+
+> **Scope:** cancellation is delivered by Temporal Core as a Cancel activity task — currently on
+> **heartbeat timeout** and server-side activity cancellation. Requesting cancellation of the parent
+> *workflow* (`Hourglass.cancel/2`) does not yet propagate to in-flight activities (the evaluator
+> flags the workflow cancelled but issues no activity-cancel command).
+
 ## Running a worker
 
 Configure Hourglass in `config/runtime.exs` (or `config/config.exs`):
@@ -204,6 +230,8 @@ Hourglass emits the following `:telemetry` events:
 | `[:hourglass, :activity, :failure]` | Activity returned `{:error, _}` or raised; metadata includes classification |
 | `[:hourglass, :activity, :exception]` | Unhandled exception in activity dispatch |
 | `[:hourglass, :activity, :dispatch_failed]` | Activity could not be dispatched |
+| `[:hourglass, :activity, :heartbeat]` | Activity recorded a liveness heartbeat |
+| `[:hourglass, :activity, :cancel_received]` | A Cancel activity task arrived (heartbeat timeout / server-side cancel); metadata includes `reason` |
 | `[:hourglass, :activity, :heartbeat_lost]` | *(reserved — not yet emitted)* |
 | `[:hourglass, :activity, :failure, :unclassified]` | *(reserved — not yet emitted)* |
 | `[:hourglass, :workflow, :task_failed]` | Workflow-task parked as a failure (uncaught exception; server will retry on next activation) |
