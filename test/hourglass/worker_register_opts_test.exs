@@ -56,4 +56,23 @@ defmodule Hourglass.WorkerRegisterOptsTest do
     assert decoded.max_outstanding_activities == 88
     assert decoded.max_outstanding_local_activities == 99
   end
+
+  test "max_cached_workflows defaults to BridgeHolder.default_max_cached_workflows/0" do
+    # No :max_cached_workflows opt → the configurable default is applied on the
+    # proto wire, so a host that leaves it unset still gets the sensible size.
+    bin = BridgeHolder.build_worker_config(@task_queue, [])
+    decoded = WorkerConfig.decode(bin)
+
+    assert decoded.max_cached_workflows == BridgeHolder.default_max_cached_workflows()
+    # Guard the regression that made this a bug: the old default (10) is far
+    # too small for concurrent-workflow workloads.
+    assert decoded.max_cached_workflows > 10
+  end
+
+  test "explicit :max_cached_workflows overrides the default end-to-end" do
+    bin = BridgeHolder.build_worker_config(@task_queue, max_cached_workflows: 512)
+    decoded = WorkerConfig.decode(bin)
+
+    assert decoded.max_cached_workflows == 512
+  end
 end

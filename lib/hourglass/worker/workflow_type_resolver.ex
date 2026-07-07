@@ -23,40 +23,57 @@ defmodule Hourglass.Worker.WorkflowTypeResolver do
        `WorkflowStateCache.fetch(task_queue, run_id)` and return the
        stored module.
 
-  Both tiers fall through if exhausted; the function raises a clear
-  error rather than guessing.
+  When both tiers are exhausted the function returns
+  `{:error, :sticky_cache_miss}` rather than raising. That case is a
+  *recoverable* Core/cache desync: an incremental (sticky) activation
+  arrived for a run the worker never cached (or evicted). It is NOT a
+  bug in the activation — a non-sticky full-history redelivery of the
+  same run always carries `initialize_workflow` (tier 1), so the caller
+  recovers by failing the sticky workflow task to force that redelivery.
+  See `Hourglass.Worker.WorkflowPollLoop` for the recovery.
+
+  A workflow-type name that IS present but cannot be turned into a
+  loaded Hourglass workflow (bad format / unknown atom / not a workflow
+  module) still raises: replaying won't change the type name, so that is
+  a genuine deploy/coding error, not a transient desync.
   """
 
   alias Coresdk.WorkflowActivation.WorkflowActivation
   alias Hourglass.Worker.WorkflowStateCache
   alias Hourglass.Workflow.State
 
+  @typedoc """
+  Result of `resolve/2`: the resolved module, or the recoverable
+  sticky-cache-miss signal the poll loop turns into a workflow-task
+  failure (forcing a non-sticky, full-history redelivery).
+  """
+  @type result :: {:ok, module()} | {:error, :sticky_cache_miss}
+
   @doc """
   Resolve the workflow module for an activation.
 
-  See moduledoc for lookup order. Raises with a descriptive message
-  when neither tier yields a module — that case indicates either an
-  unknown/unloaded workflow type or a Core/cache invariant violation
-  (e.g. an incremental activation arriving before any
-  `initialize_workflow` ever populated the state cache).
+  See moduledoc for lookup order. Returns `{:ok, module}` on success and
+  `{:error, :sticky_cache_miss}` when neither tier yields a module — the
+  recoverable "incremental activation for an uncached run" case. Raises
+  only when a workflow-type name is present but unresolvable (unknown or
+  unloaded module), which no redelivery can fix.
   """
-  @spec resolve(WorkflowActivation.t(), String.t()) :: module()
+  @spec resolve(WorkflowActivation.t(), String.t()) :: result()
   def resolve(%WorkflowActivation{} = activation, task_queue)
       when is_binary(task_queue) do
     cond do
       type_name = workflow_type_from_activation(activation) ->
-        resolve_structural!(type_name, task_queue, activation.run_id)
+        {:ok, resolve_structural!(type_name, task_queue, activation.run_id)}
 
       cached = cached_module(task_queue, activation.run_id) ->
-        cached
+        {:ok, cached}
 
       true ->
-        raise """
-        Cannot resolve workflow module for activation
-        (task_queue=#{task_queue}, run_id=#{activation.run_id}).
-        Activation has no `initialize_workflow` job and the
-        WorkflowStateCache has no entry — both lookup tiers exhausted.
-        """
+        # Both tiers exhausted: a sticky (incremental) activation for a
+        # run this worker has no cached State for. Recoverable — signal
+        # the caller to fail the sticky task so Core redelivers with full
+        # history (which carries `initialize_workflow` → tier 1).
+        {:error, :sticky_cache_miss}
     end
   end
 

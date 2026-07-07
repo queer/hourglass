@@ -177,6 +177,28 @@ defmodule Hourglass.BridgeHolder do
 
   require Logger
 
+  # Default sticky-workflow-cache size when the caller doesn't set
+  # `:max_cached_workflows`. This is the number of workflow runs Core keeps
+  # "hot" (state cached) so it can deliver *incremental* activations instead
+  # of replaying full history every task. When the live-workflow count
+  # exceeds it, Core evicts LRU runs and re-delivers them non-sticky — extra
+  # replay work, and (before the poll-loop recovery) the trigger for
+  # sticky-cache-miss churn.
+  #
+  # Raised from the historical 10 to 100. Ten is far too small for any real
+  # workload (Coffee runs many concurrent per-store projection workflows,
+  # and its worker-task concurrency already defaults to 100); a cache smaller
+  # than the outstanding-task concurrency guarantees thrash. 100 is a
+  # conservative bump — each cached run holds State in Core plus the mirror
+  # `WorkflowStateCache` ETS entry, so we don't default to the thousands some
+  # SDKs use. Hosts that run more concurrent workflows raise it explicitly via
+  # worker opts or `config :hourglass, Hourglass.Worker, max_cached_workflows: N`.
+  @default_max_cached_workflows 100
+
+  @doc false
+  @spec default_max_cached_workflows() :: pos_integer()
+  def default_max_cached_workflows, do: @default_max_cached_workflows
+
   @typedoc "Options accepted by `register_worker/2`."
   @type register_opts :: [
           namespace: String.t(),
@@ -918,7 +940,8 @@ defmodule Hourglass.BridgeHolder do
     Protobuf.encode(%Hourglass.Proto.WorkerConfig{
       namespace: Keyword.get(opts, :namespace, Client.default_namespace()),
       task_queue: task_queue,
-      max_cached_workflows: Keyword.get(opts, :max_cached_workflows, 10),
+      max_cached_workflows:
+        Keyword.get(opts, :max_cached_workflows, @default_max_cached_workflows),
       client_target_url: Keyword.get(opts, :target_url, Client.default_target_url()),
       max_outstanding_workflow_tasks: Keyword.get(opts, :max_outstanding_workflow_tasks, 0),
       max_outstanding_activities: Keyword.get(opts, :max_outstanding_activities, 0),

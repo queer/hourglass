@@ -62,18 +62,25 @@ defmodule Hourglass.WorkerLauncher do
     # Hourglass.Client.default_namespace/0, which is the canonical
     # source. Passing it explicitly here would duplicate the lookup.
     #
-    # Concurrency opts come from `:hourglass, Hourglass.Worker` config.
-    # Unset = 0 → Rust DEFAULT_OUTSTANDING (10).
-    concurrency_opts =
+    # Tunables come from `:hourglass, Hourglass.Worker` config:
+    #   * the three `:max_outstanding_*` (unset = 0 → Rust DEFAULT_OUTSTANDING),
+    #   * `:max_cached_workflows` (unset → BridgeHolder's default). Without
+    #     forwarding it here, a host setting
+    #     `config :hourglass, Hourglass.Worker, max_cached_workflows: N`
+    #     would have it silently dropped for the default worker — the key is
+    #     whitelisted in `Worker.__register_opts_keys__/0` but only reaches
+    #     the bridge if the launcher passes it through.
+    worker_opts =
       :hourglass
       |> Application.get_env(Hourglass.Worker, [])
       |> Keyword.take([
+        :max_cached_workflows,
         :max_outstanding_workflow_tasks,
         :max_outstanding_activities,
         :max_outstanding_local_activities
       ])
 
-    opts = [task_queue: @default_task_queue] ++ concurrency_opts
+    opts = [task_queue: @default_task_queue] ++ worker_opts
 
     case WorkerSupervisor.start_worker(opts) do
       {:ok, _pid} -> :ignore

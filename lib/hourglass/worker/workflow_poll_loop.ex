@@ -37,9 +37,40 @@ defmodule Hourglass.Worker.WorkflowPollLoop do
   Other bridge errors log + sleep + retry. The Supervisor's
   `:transient` restart for this child means `:normal` exit is final
   (no flapping during graceful shutdown).
+
+  ## Sticky-cache-miss recovery (do NOT crash the loop)
+
+  `WorkflowTypeResolver.resolve/2` has two tiers: the activation's
+  `initialize_workflow` job (present on full-history / non-sticky
+  deliveries) and the worker's `WorkflowStateCache` (populated by prior
+  activations, mirrors Core's sticky cache). An **incremental (sticky)**
+  activation for a run this worker never cached — or evicted — exhausts
+  both tiers. That is a recoverable Core/worker cache desync, not a bug
+  in the activation; it shows up under load when workflows sit idle for
+  long stretches or the live-workflow count approaches
+  `max_cached_workflows`.
+
+  Historically `resolve/2` raised here, the raise propagated through
+  `dispatch/2` → `loop/1`, and the whole poll-loop Task crashed. It
+  self-healed only because Core eventually timed out the sticky task and
+  re-delivered non-sticky with full history — but every occurrence was a
+  crash + `:transient` restart + re-register + replay, spamming errors.
+
+  The correct Temporal behavior is to **fail the current (sticky)
+  workflow task**: ship a `WorkflowActivationCompletion{status: {:failed,
+  ...}}` for the run. SDK-Core responds by evicting the run from its
+  sticky cache and reporting the workflow-task failure to the server; the
+  server reschedules the task, and because Core no longer has the run
+  cached it fetches full history and re-delivers **non-sticky** — that
+  activation carries `initialize_workflow`, so tier 1 resolves it. The
+  poll loop never crashes: `dispatch/2` ships the failure inline and
+  keeps polling. Workflow tasks retry indefinitely on the server (they do
+  not fail the workflow), so this is safe and self-correcting.
   """
 
   alias Coresdk.WorkflowActivation.WorkflowActivation
+  alias Coresdk.WorkflowCompletion.Failure
+  alias Coresdk.WorkflowCompletion.WorkflowActivationCompletion
   alias Hourglass.Bridge
   alias Hourglass.BridgeHolder
   alias Hourglass.Worker.WorkflowTypeResolver
@@ -49,7 +80,8 @@ defmodule Hourglass.Worker.WorkflowPollLoop do
 
   @typedoc "Options accepted by `start_link/1`."
   @type opts :: [
-          task_queue: String.t()
+          task_queue: String.t(),
+          complete_fn: (String.t(), binary() -> :ok | {:error, term()})
         ]
 
   @doc """
@@ -80,7 +112,15 @@ defmodule Hourglass.Worker.WorkflowPollLoop do
   def run(opts) do
     task_queue = Keyword.fetch!(opts, :task_queue)
 
-    loop(%{task_queue: task_queue})
+    # `:complete_fn` is a test seam only (mirrors
+    # `Hourglass.Worker.WorkflowEvaluator`'s `:complete_fn`): production
+    # callers never pass it, so the sticky-cache-miss recovery ships its
+    # workflow-task failure through `BridgeHolder`. Tests inject a stub to
+    # assert the recovery without a live bridge.
+    complete_fn =
+      Keyword.get(opts, :complete_fn, &BridgeHolder.complete_workflow_activation/2)
+
+    loop(%{task_queue: task_queue, complete_fn: complete_fn})
   end
 
   defp loop(state) do
@@ -114,10 +154,25 @@ defmodule Hourglass.Worker.WorkflowPollLoop do
     end
   end
 
-  defp dispatch(bytes, state) do
+  # Public (`@doc false`) only as the poll-loop test seam: feeds decoded
+  # bytes + state through the same path `loop/1` uses so the
+  # sticky-cache-miss recovery is testable without a live bridge. Returns
+  # `:ok` on every path — it must never raise, or it would kill `loop/1`.
+  @doc false
+  @spec dispatch(binary(), map()) :: :ok
+  def dispatch(bytes, state) do
     activation = WorkflowActivation.decode(bytes)
-    module = WorkflowTypeResolver.resolve(activation, state.task_queue)
 
+    case WorkflowTypeResolver.resolve(activation, state.task_queue) do
+      {:ok, module} ->
+        start_evaluator(bytes, activation, module, state)
+
+      {:error, :sticky_cache_miss} ->
+        fail_sticky_task(activation, state)
+    end
+  end
+
+  defp start_evaluator(bytes, activation, module, state) do
     args = %{
       run_id: activation.run_id,
       task_queue: state.task_queue,
@@ -134,6 +189,51 @@ defmodule Hourglass.Worker.WorkflowPollLoop do
           "WorkflowEvaluator.DynamicSupervisor.start_child failed: " <>
             "#{inspect(reason)} (run_id=#{activation.run_id})"
         )
+    end
+  end
+
+  # Recover from a sticky-cache miss (see moduledoc "Sticky-cache-miss
+  # recovery"): fail the current workflow task so Core evicts the run and
+  # re-delivers it non-sticky with full history (tier-1 resolvable). We
+  # cannot run the workflow — the module is unknown — so we build a
+  # minimal `failed` completion from the run_id alone and ship it. Always
+  # returns `:ok`: a shipping error is logged, not raised, so the poll
+  # loop keeps polling (Core's sticky-task timeout then forces the same
+  # non-sticky redelivery as a fallback).
+  defp fail_sticky_task(activation, state) do
+    Logger.info(
+      "sticky-cache miss (task_queue=#{state.task_queue}, run_id=#{activation.run_id}): " <>
+        "incremental activation with no initialize_workflow job and no WorkflowStateCache " <>
+        "entry. Failing the sticky workflow task to force a non-sticky, full-history redelivery."
+    )
+
+    completion = %WorkflowActivationCompletion{
+      run_id: activation.run_id,
+      status:
+        {:failed,
+         %Failure{
+           failure: %Temporal.Api.Failure.V1.Failure{
+             message:
+               "hourglass sticky-cache miss: run not present in worker WorkflowStateCache; " <>
+                 "failing workflow task to force non-sticky replay with full history"
+           }
+         }}
+    }
+
+    bytes = Protobuf.encode(completion)
+
+    case state.complete_fn.(state.task_queue, bytes) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "sticky-cache-miss workflow-task failure could not be shipped " <>
+            "(task_queue=#{state.task_queue}, run_id=#{activation.run_id}): #{inspect(reason)}. " <>
+            "Core's sticky-task timeout will redeliver non-sticky."
+        )
+
+        :ok
     end
   end
 end

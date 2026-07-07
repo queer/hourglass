@@ -37,12 +37,12 @@ defmodule Hourglass.Worker.WorkflowTypeResolverTest do
       activation = init_activation("run-1", Atom.to_string(WorkflowB))
       queue = unique_queue()
 
-      assert WorkflowB == WorkflowTypeResolver.resolve(activation, queue)
+      assert {:ok, WorkflowB} == WorkflowTypeResolver.resolve(activation, queue)
     end
 
     test "resolves WorkflowA from its type name" do
       activation = init_activation("run-1a", Atom.to_string(WorkflowA))
-      assert WorkflowA == WorkflowTypeResolver.resolve(activation, unique_queue())
+      assert {:ok, WorkflowA} == WorkflowTypeResolver.resolve(activation, unique_queue())
     end
 
     test "raises a descriptive error when the workflow_type atom is unknown in this VM" do
@@ -69,16 +69,19 @@ defmodule Hourglass.Worker.WorkflowTypeResolverTest do
 
       activation = resolve_activity_only_activation(run_id)
 
-      assert WorkflowC == WorkflowTypeResolver.resolve(activation, queue)
+      assert {:ok, WorkflowC} == WorkflowTypeResolver.resolve(activation, queue)
     end
 
-    test "raises when activation has no init_workflow AND the cache is empty" do
+    test "returns {:error, :sticky_cache_miss} when no init_workflow AND the cache is empty" do
+      # Incremental (sticky) activation for a run this worker never cached:
+      # both tiers exhausted. Recoverable — the resolver must NOT raise (that
+      # crashed the poll loop in production); it signals the miss so the loop
+      # fails the sticky task and forces a non-sticky, full-history replay.
       activation =
         resolve_activity_only_activation("run-uncached-#{System.unique_integer([:positive])}")
 
-      assert_raise RuntimeError, ~r/Cannot resolve workflow module/s, fn ->
-        WorkflowTypeResolver.resolve(activation, unique_queue())
-      end
+      assert {:error, :sticky_cache_miss} ==
+               WorkflowTypeResolver.resolve(activation, unique_queue())
     end
   end
 
@@ -95,7 +98,7 @@ defmodule Hourglass.Worker.WorkflowTypeResolverTest do
 
       activation = init_activation(run_id, Atom.to_string(WorkflowB))
 
-      assert WorkflowB == WorkflowTypeResolver.resolve(activation, queue)
+      assert {:ok, WorkflowB} == WorkflowTypeResolver.resolve(activation, queue)
     end
   end
 
