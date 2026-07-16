@@ -23,7 +23,7 @@ Add `hourglass` to your dependencies in `mix.exs`:
 ```elixir
 defp deps do
   [
-    {:hourglass, "~> 0.1.0"}
+    {:hourglass, "~> 0.5.0"}
   ]
 end
 ```
@@ -107,6 +107,42 @@ From the client side:
 # Request cancellation
 :ok = Hourglass.cancel(handle_or_id, "operator requested")
 ```
+
+### Child workflows
+
+A workflow can orchestrate another workflow as a real Temporal child:
+
+```elixir
+# Await the child's result.
+{:ok, result} = execute_child(MyApp.Workflows.Ingest, %{"url" => url})
+
+# Or raise on failure.
+result = execute_child!(MyApp.Workflows.Ingest, %{"url" => url})
+
+# Fan out — no child-specific machinery; the ordinary scopes compose.
+urls
+|> Enum.map(fn u -> async(fn -> execute_child!(MyApp.Workflows.Ingest, %{"url" => u}) end) end)
+|> await_all()
+
+# Fire-and-forget. :parent_close_policy is required — see below.
+{:ok, handle} =
+  start_child(MyApp.Workflows.Ingest, %{"url" => url}, parent_close_policy: :abandon)
+```
+
+`start_child/3` requires `:parent_close_policy` because Temporal's default is
+TERMINATE: a parent that completes right after a naive fire-and-forget would
+silently kill its child mid-flight. Pass `:abandon` to let the child outlive the
+parent, or `:terminate` to tie its lifetime to the parent's.
+
+Child workflow ids default to a deterministic derivation from the parent's
+`run_id` and the call's command id. Pin `:id` for singleton semantics (pair with
+`workflow_id_reuse_policy: :reject_duplicate`). A random nonce or a timestamp is
+illegal — workflow bodies must be deterministic; use `uuid/0` for a
+readable-and-unique id.
+
+Options: `:id`, `:task_queue`, `:parent_close_policy`, `:workflow_id_reuse_policy`,
+`:workflow_execution_timeout`, `:workflow_run_timeout`, `:workflow_task_timeout`,
+`:retry_policy`.
 
 ## Defining an activity
 
