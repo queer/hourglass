@@ -84,6 +84,7 @@ defmodule Hourglass.Workflow do
           execute_child: 3,
           execute_child!: 2,
           execute_child!: 3,
+          start_child: 3,
           async: 1,
           await: 1,
           await_all: 1,
@@ -424,6 +425,56 @@ defmodule Hourglass.Workflow do
     case execute_child(module, input, opts) do
       {:ok, value} -> value
       {:error, reason} -> raise Hourglass.ChildWorkflowError, workflow: module, reason: reason
+    end
+  end
+
+  @doc """
+  Start a child workflow **without** awaiting its result. Suspends only until the
+  child has started, then returns its `Hourglass.WorkflowHandle`.
+
+  `:parent_close_policy` is **required** — no default. Temporal's default is
+  TERMINATE, meaning a parent that completes right after a naive fire-and-forget
+  would silently kill the child mid-flight: no error, no result, just half-done
+  work. Both policies are legitimate for a detached child (an explorer wants
+  `:abandon`; a parent orchestrating a cancellable batch may want `:terminate`),
+  so this refuses to guess. Every other option matches `execute_child/3`.
+
+      {:ok, handle} = start_child(Ingest, %{"url" => url}, parent_close_policy: :abandon)
+
+  The returned handle identifies the child (for logging, or for returning out of
+  the workflow). It is **not** usable with the client functions that take a
+  handle — `Hourglass.result/2`, `signal/3`, `cancel/2` poll or perform network
+  IO and must never be called from inside a workflow body. Acting on a running
+  child from its parent arrives with the deferred cancel/signal work.
+  """
+  @spec start_child(module(), term(), keyword()) ::
+          {:ok, Hourglass.WorkflowHandle.t()} | {:error, term()}
+  def start_child(module, input, opts) do
+    Keyword.has_key?(opts, :parent_close_policy) ||
+      raise ArgumentError,
+            "start_child/3 requires :parent_close_policy (:terminate | :abandon | :request_cancel). " <>
+              "A detached child is killed when its parent closes unless you say otherwise, " <>
+              "so there is no safe default to guess."
+
+    {peeked, workflow_id} = issue_child_command(module, input, opts)
+
+    case peeked do
+      # Only the START phase is awaited — a running child is already a success
+      # here, and a finished one is no different: the result is never consumed.
+      :pending ->
+        throw(:hourglass_temporal_suspend)
+
+      {:started, run_id} ->
+        {:ok, %Hourglass.WorkflowHandle{id: workflow_id, run_id: run_id}}
+
+      {:started, run_id, _result} ->
+        {:ok, %Hourglass.WorkflowHandle{id: workflow_id, run_id: run_id}}
+
+      {:start_failed, cause} ->
+        {:error, {:start_failed, cause}}
+
+      {:start_cancelled, failure} ->
+        {:error, {:cancelled, failure}}
     end
   end
 

@@ -478,4 +478,86 @@ defmodule Hourglass.Workflow.ChildWorkflowTest do
     assert Exception.message(error) =~ "MyChild"
     assert Exception.message(error) =~ "nope"
   end
+
+  test "start_child returns a handle at the START phase without awaiting the result" do
+    defmodule Detached do
+      use Hourglass.Workflow
+
+      @impl Hourglass.Workflow.Behaviour
+      def run(_input) do
+        {:ok, handle} = start_child(MyChild, %{}, parent_close_policy: :abandon)
+        {:started, handle.id, handle.run_id}
+      end
+    end
+
+    state0 = fresh_state("r10")
+    {:ok, completion1, state1} = Evaluator.evaluate(Detached, activation([init_job(%{})]), state0)
+
+    assert [%WorkflowCommand{variant: {:start_child_workflow_execution, sc}}] =
+             commands_of(completion1)
+
+    assert sc.parent_close_policy == :PARENT_CLOSE_POLICY_ABANDON
+
+    # The START resolution alone completes the body — no result job is needed.
+    {:ok, completion2, state2} =
+      Evaluator.evaluate(
+        Detached,
+        activation([child_started_job(sc.seq, "detached-run")]),
+        state1
+      )
+
+    assert [%WorkflowCommand{variant: {:complete_workflow_execution, _cwe}}] =
+             commands_of(completion2)
+
+    assert {:completed, {:started, child_id, "detached-run"}} = state2.result
+    assert child_id == sc.workflow_id
+  end
+
+  test "start_child requires :parent_close_policy" do
+    defmodule NoPolicy do
+      use Hourglass.Workflow
+
+      @impl Hourglass.Workflow.Behaviour
+      # start_child/3 is the only arity (no default opts) — call it with an
+      # explicit empty opts list so this compiles as arity-3 and the raise is
+      # a RUNTIME check for the missing key, not a compile-time undefined-function.
+      def run(_input), do: start_child(MyChild, %{}, [])
+    end
+
+    # The raise parks the workflow task rather than escaping the evaluator.
+    {:ok, completion, _state} =
+      Evaluator.evaluate(NoPolicy, activation([init_job(%{})]), fresh_state("r11"))
+
+    assert %WorkflowActivationCompletion{status: {:failed, _failure}} = completion
+  end
+
+  test "start_child surfaces a start failure as an error" do
+    defmodule DetachedFails do
+      use Hourglass.Workflow
+
+      @impl Hourglass.Workflow.Behaviour
+      def run(_input) do
+        case start_child(MyChild, %{}, parent_close_policy: :abandon, id: "dupe-id") do
+          {:ok, _handle} -> :unexpected
+          {:error, reason} -> {:rejected, reason}
+        end
+      end
+    end
+
+    state0 = fresh_state("r12")
+
+    {:ok, completion1, state1} =
+      Evaluator.evaluate(DetachedFails, activation([init_job(%{})]), state0)
+
+    assert [%WorkflowCommand{variant: {:start_child_workflow_execution, sc}}] =
+             commands_of(completion1)
+
+    {:ok, _completion2, state2} =
+      Evaluator.evaluate(DetachedFails, activation([child_start_failed_job(sc.seq)]), state1)
+
+    assert {:completed,
+            {:rejected,
+             {:start_failed, :START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS}}} =
+             state2.result
+  end
 end
