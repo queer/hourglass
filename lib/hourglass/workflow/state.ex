@@ -13,6 +13,11 @@ defmodule Hourglass.Workflow.State do
       look up "have I seen this command_id before? what seq did it get?"
     * `resolved_results` — `%{global_seq => decoded_value}` populated from
       prior `resolve_activity` jobs delivered on this or earlier activations.
+    * `child_starts` — `%{global_seq => start_resolution}` populated from
+      `resolve_child_workflow_execution_start` jobs. A child workflow issues one
+      command but resolves **twice** (start, then result); the result reuses the
+      `resolved_results` slot for its seq, so the start phase needs its own map.
+      `{:started, run_id} | {:start_failed, cause} | {:start_cancelled, failure}`.
     * `input` — the decoded `initialize_workflow` first argument; set once.
     * `workflow_module` — the workflow module bound to this run (e.g.
       `MyApp.Workflows.IngestSource`). Set by
@@ -44,6 +49,8 @@ defmodule Hourglass.Workflow.State do
 
   @type command_term ::
           {:execute_activity, %{module: module(), args: term(), options: keyword()}}
+          | {:start_child,
+             %{module: module(), args: term(), options: keyword(), workflow_id: String.t()}}
           | {:start_timer, %{duration_ms: non_neg_integer()}}
           | {:uuid, map()}
           | {:random, %{max: pos_integer()}}
@@ -59,6 +66,7 @@ defmodule Hourglass.Workflow.State do
           workflow_module: module() | nil,
           next_global_seq: pos_integer(),
           resolved_results: %{optional(pos_integer()) => term()},
+          child_starts: %{optional(pos_integer()) => term()},
           pending_resolvers: %{optional(pos_integer()) => command_id()},
           command_id_to_seq: %{optional(command_id()) => pos_integer()},
           commands: [command_entry()],
@@ -74,6 +82,7 @@ defmodule Hourglass.Workflow.State do
             workflow_module: nil,
             next_global_seq: 1,
             resolved_results: %{},
+            child_starts: %{},
             pending_resolvers: %{},
             command_id_to_seq: %{},
             commands: [],

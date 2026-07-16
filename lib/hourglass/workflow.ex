@@ -80,6 +80,8 @@ defmodule Hourglass.Workflow do
           execute_activity: 3,
           execute_activity!: 2,
           execute_activity!: 3,
+          execute_child: 2,
+          execute_child: 3,
           async: 1,
           await: 1,
           await_all: 1,
@@ -340,6 +342,107 @@ defmodule Hourglass.Workflow do
     case execute_activity(module, input, opts) do
       {:ok, value} -> value
       {:error, failure} -> raise Hourglass.ActivityError, activity: module, reason: failure
+    end
+  end
+
+  @doc """
+  Start a child workflow and await its result.
+
+  Returns `{:ok, result}` with the child's output cast through its declared
+  `__workflow_output_type__/0`, or `{:error, reason}` where reason is one of:
+
+    * `{:start_failed, cause}` — the child could not be started (`cause` is a
+      `Coresdk.ChildWorkflow.StartChildWorkflowExecutionFailedCause`, in practice
+      `:START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS`).
+      Kept distinct from a run failure on purpose: an "already exists" against a
+      pinned singleton `:id` is usually expected rather than a fault.
+    * `%Temporal.Api.Failure.V1.Failure{}` — the child started and its run failed.
+    * `{:cancelled, failure}` — the child was cancelled.
+
+  ## Options
+
+    * `:id` — the child's workflow id. Defaults to a deterministic derivation
+      from `{run_id, command_id}`. Pin it for singleton/dedup semantics (pair
+      with `workflow_id_reuse_policy: :reject_duplicate`). A random nonce or a
+      timestamp is **illegal** here — workflow bodies must be deterministic; use
+      `uuid/0` if you want a readable-and-unique id.
+    * `:task_queue` — defaults to the parent's task queue.
+    * `:parent_close_policy` — `:terminate` (default) | `:abandon` | `:request_cancel`.
+    * `:workflow_id_reuse_policy` — `:allow_duplicate` (default) |
+      `:allow_duplicate_failed_only` | `:reject_duplicate` | `:terminate_if_running`.
+    * `:workflow_execution_timeout` / `:workflow_run_timeout` /
+      `:workflow_task_timeout` — millisecond integers.
+    * `:retry_policy` — same keyword shape as activities.
+
+  Fan out with the ordinary scopes — no child-specific machinery needed:
+
+      urls
+      |> Enum.map(fn u -> async(fn -> execute_child!(Ingest, %{"url" => u}) end) end)
+      |> await_all()
+  """
+  @spec execute_child(module(), term()) :: {:ok, term()} | {:error, term()}
+  @spec execute_child(module(), term(), keyword()) :: {:ok, term()} | {:error, term()}
+  def execute_child(module, input, opts \\ []) do
+    {peeked, _workflow_id} = issue_child_command(module, input, opts)
+
+    case peeked do
+      # Issued but not started yet, or started but still running: in both cases
+      # the result isn't in, so stop cleanly and ship the accumulated commands.
+      :pending ->
+        throw(:hourglass_temporal_suspend)
+
+      {:started, _run_id} ->
+        throw(:hourglass_temporal_suspend)
+
+      {:started, _run_id, {:ok, raw}} ->
+        {:ok, Hourglass.Codec.cast!(module.__workflow_output_type__(), raw)}
+
+      {:started, _run_id, {:error, failure}} ->
+        {:error, failure}
+
+      {:start_failed, cause} ->
+        {:error, {:start_failed, cause}}
+
+      {:start_cancelled, failure} ->
+        {:error, {:cancelled, failure}}
+    end
+  end
+
+  # Allocate the command_id, resolve the child's workflow id, dump the input, and
+  # peek both resolution phases. Shared by execute_child/3 and start_child/3 —
+  # they differ only in which phase they stop at. Returns the workflow_id
+  # alongside the peek result because `start_child/3` needs it for the handle.
+  @spec issue_child_command(module(), term(), keyword()) :: {term(), String.t()}
+  defp issue_child_command(module, input, opts) do
+    command_id = CommandAccumulator.next_command_id()
+    workflow_id = child_workflow_id(opts, command_id)
+    dumped = Hourglass.Codec.dump(module.__workflow_input_type__(), input)
+
+    peeked =
+      Evaluator.peek_child(
+        command_id,
+        {:start_child, %{module: module, args: dumped, options: opts, workflow_id: workflow_id}}
+      )
+
+    {peeked, workflow_id}
+  end
+
+  # A child's workflow id must be deterministic across re-execution. Deriving from
+  # the run_id (not the parent's workflow_id + seq) is what makes it survive
+  # continue_as_new: seq restarts at 1 on each run, and continue_as_new begins a
+  # fresh run under the SAME workflow id, so a seq-derived id would collide with
+  # the previous generation's child. Every generation gets a fresh run_id.
+  defp child_workflow_id(opts, command_id) do
+    case Keyword.fetch(opts, :id) do
+      {:ok, id} when is_binary(id) ->
+        id
+
+      _other ->
+        state =
+          CommandAccumulator.evaluator_state() ||
+            raise "Hourglass.Workflow child primitives called outside a workflow evaluator"
+
+        Evaluator.derive_child_id(state.run_id, command_id)
     end
   end
 

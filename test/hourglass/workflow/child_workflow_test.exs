@@ -1,0 +1,258 @@
+defmodule Hourglass.Workflow.ChildWorkflowTest do
+  # async: true — the pure-function evaluator owns no global resources; each
+  # test builds its own activations + run_id.
+  use ExUnit.Case, async: true
+
+  alias Coresdk.WorkflowCommands.WorkflowCommand
+  alias Coresdk.WorkflowCompletion.Success
+  alias Coresdk.WorkflowCompletion.WorkflowActivationCompletion
+  alias Hourglass.Workflow.Evaluator
+  alias Hourglass.Workflow.State
+
+  @moduletag capture_log: true
+
+  # A stub child workflow: the evaluator only reads the type callbacks off the
+  # module, so this needs no `use Hourglass.Workflow` and no `run/1`. Mirrors
+  # the stub-activity convention in evaluator_test.exs.
+  defmodule MyChild do
+    def __workflow_input_type__, do: :map
+    def __workflow_output_type__, do: :map
+  end
+
+  defmodule SingleChild do
+    use Hourglass.Workflow
+
+    @impl Hourglass.Workflow.Behaviour
+    def run(input) do
+      result = execute_child(MyChild, input)
+      {:ok, result}
+    end
+  end
+
+  # -- activation fabrication (mirrors test/hourglass/workflow/evaluator_test.exs) --
+
+  defp activation(jobs, opts \\ []) do
+    %{
+      timestamp: Keyword.get(opts, :timestamp, DateTime.utc_now()),
+      is_replaying: Keyword.get(opts, :is_replaying, false),
+      jobs: jobs,
+      run_id: Keyword.get(opts, :run_id, "test-run")
+    }
+  end
+
+  defp init_job(input) do
+    %{
+      variant:
+        {:initialize_workflow,
+         %Coresdk.WorkflowActivation.InitializeWorkflow{
+           workflow_type: "TestWf",
+           workflow_id: "wf-1",
+           arguments: [synthetic_payload(input)]
+         }}
+    }
+  end
+
+  defp child_started_job(seq, run_id) do
+    %{
+      variant:
+        {:resolve_child_workflow_execution_start,
+         %Coresdk.WorkflowActivation.ResolveChildWorkflowExecutionStart{
+           seq: seq,
+           status:
+             {:succeeded,
+              %Coresdk.WorkflowActivation.ResolveChildWorkflowExecutionStartSuccess{
+                run_id: run_id
+              }}
+         }}
+    }
+  end
+
+  defp child_completed_job(seq, value) do
+    %{
+      variant:
+        {:resolve_child_workflow_execution,
+         %Coresdk.WorkflowActivation.ResolveChildWorkflowExecution{
+           seq: seq,
+           result: %Coresdk.ChildWorkflow.ChildWorkflowResult{
+             status:
+               {:completed, %Coresdk.ChildWorkflow.Success{result: synthetic_payload(value)}}
+           }
+         }}
+    }
+  end
+
+  defp synthetic_payload(data) do
+    %Temporal.Api.Common.V1.Payload{
+      metadata: %{"encoding" => "json/plain"},
+      data: Jason.encode!(data)
+    }
+  end
+
+  defp commands_of(%WorkflowActivationCompletion{
+         status: {:successful, %Success{commands: commands}}
+       }),
+       do: commands
+
+  defp fresh_state(run_id), do: State.new(run_id, "test-tq")
+
+  # -- tests --
+
+  test "execute_child issues one StartChildWorkflowExecution and suspends" do
+    state0 = fresh_state("r1")
+
+    {:ok, completion, state1} =
+      Evaluator.evaluate(SingleChild, activation([init_job(%{"msg" => "hi"})]), state0)
+
+    assert [%WorkflowCommand{variant: {:start_child_workflow_execution, sc}}] =
+             commands_of(completion)
+
+    assert sc.seq == 1
+    assert sc.workflow_type == Atom.to_string(MyChild)
+    assert sc.task_queue == "test-tq"
+    assert sc.namespace == ""
+    assert sc.parent_close_policy == :PARENT_CLOSE_POLICY_TERMINATE
+    assert sc.workflow_id_reuse_policy == :WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE
+    assert [%Temporal.Api.Common.V1.Payload{data: data}] = sc.input
+    assert Jason.decode!(data) == %{"msg" => "hi"}
+
+    # Derived id: non-empty, and NOT the parent's workflow id.
+    assert is_binary(sc.workflow_id) and sc.workflow_id != ""
+    refute sc.workflow_id == "wf-1"
+
+    assert state1.next_global_seq == 2
+    assert Map.has_key?(state1.pending_resolvers, 1)
+  end
+
+  test "start resolution alone does not complete execute_child; the result does" do
+    state0 = fresh_state("r2")
+
+    {:ok, completion1, state1} =
+      Evaluator.evaluate(SingleChild, activation([init_job(%{"msg" => "hi"})]), state0)
+
+    assert [%WorkflowCommand{variant: {:start_child_workflow_execution, sc}}] =
+             commands_of(completion1)
+
+    # Phase 1: started — the child is running, so the body must STILL suspend.
+    {:ok, completion2, state2} =
+      Evaluator.evaluate(
+        SingleChild,
+        activation([child_started_job(sc.seq, "child-run-1")]),
+        state1
+      )
+
+    assert commands_of(completion2) == []
+    assert state2.child_starts[sc.seq] == {:started, "child-run-1"}
+    assert state2.result == nil
+
+    # Phase 2: result — now the body completes.
+    {:ok, completion3, state3} =
+      Evaluator.evaluate(
+        SingleChild,
+        activation([child_completed_job(sc.seq, %{"msg" => "done"})]),
+        state2
+      )
+
+    assert [%WorkflowCommand{variant: {:complete_workflow_execution, _cwe}}] =
+             commands_of(completion3)
+
+    assert {:completed, {:ok, {:ok, %{"msg" => "done"}}}} = state3.result
+  end
+
+  test "explicit :id overrides the derived child workflow id" do
+    defmodule PinnedChild do
+      use Hourglass.Workflow
+
+      @impl Hourglass.Workflow.Behaviour
+      def run(_input), do: execute_child(MyChild, %{}, id: "pinned-id")
+    end
+
+    {:ok, completion, _state} =
+      Evaluator.evaluate(PinnedChild, activation([init_job(%{})]), fresh_state("r3"))
+
+    assert [%WorkflowCommand{variant: {:start_child_workflow_execution, sc}}] =
+             commands_of(completion)
+
+    assert sc.workflow_id == "pinned-id"
+  end
+
+  test "derived child id is stable across re-execution but differs across run_ids" do
+    command_id = {[], 1}
+
+    assert Evaluator.derive_child_id("run-a", command_id) ==
+             Evaluator.derive_child_id("run-a", command_id)
+
+    refute Evaluator.derive_child_id("run-a", command_id) ==
+             Evaluator.derive_child_id("run-b", command_id)
+  end
+
+  test "opts map onto the proto: task_queue, policies, timeouts, retry_policy" do
+    defmodule OptsChild do
+      use Hourglass.Workflow
+
+      @impl Hourglass.Workflow.Behaviour
+      def run(_input) do
+        execute_child(MyChild, %{},
+          task_queue: "other-tq",
+          parent_close_policy: :abandon,
+          workflow_id_reuse_policy: :reject_duplicate,
+          workflow_execution_timeout: 60_000,
+          workflow_run_timeout: 30_000,
+          workflow_task_timeout: 10_000,
+          retry_policy: [max_attempts: 5]
+        )
+      end
+    end
+
+    {:ok, completion, _state} =
+      Evaluator.evaluate(OptsChild, activation([init_job(%{})]), fresh_state("r4"))
+
+    assert [%WorkflowCommand{variant: {:start_child_workflow_execution, sc}}] =
+             commands_of(completion)
+
+    assert sc.task_queue == "other-tq"
+    assert sc.parent_close_policy == :PARENT_CLOSE_POLICY_ABANDON
+    assert sc.workflow_id_reuse_policy == :WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE
+    assert sc.workflow_execution_timeout == %Google.Protobuf.Duration{seconds: 60, nanos: 0}
+    assert sc.workflow_run_timeout == %Google.Protobuf.Duration{seconds: 30, nanos: 0}
+    assert sc.workflow_task_timeout == %Google.Protobuf.Duration{seconds: 10, nanos: 0}
+    assert sc.retry_policy.maximum_attempts == 5
+  end
+
+  test "fan-out: two children via async/await_all issue two commands" do
+    defmodule FanOutChild do
+      use Hourglass.Workflow
+
+      @impl Hourglass.Workflow.Behaviour
+      def run(_input) do
+        [a, b] =
+          await_all([
+            async(fn -> execute_child(MyChild, %{"n" => 1}) end),
+            async(fn -> execute_child(MyChild, %{"n" => 2}) end)
+          ])
+
+        {a, b}
+      end
+    end
+
+    {:ok, completion, _state} =
+      Evaluator.evaluate(FanOutChild, activation([init_job(%{})]), fresh_state("r5"))
+
+    commands = commands_of(completion)
+    assert length(commands) == 2
+
+    seqs =
+      Enum.map(commands, fn %WorkflowCommand{variant: {:start_child_workflow_execution, sc}} ->
+        sc.seq
+      end)
+
+    assert Enum.sort(seqs) == [1, 2]
+
+    ids =
+      Enum.map(commands, fn %WorkflowCommand{variant: {:start_child_workflow_execution, sc}} ->
+        sc.workflow_id
+      end)
+
+    # Distinct command_ids ⇒ distinct derived child ids (no collision).
+    assert length(Enum.uniq(ids)) == 2
+  end
+end

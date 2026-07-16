@@ -28,6 +28,7 @@ defmodule Hourglass.Workflow.Evaluator do
   alias Coresdk.WorkflowCommands.CompleteWorkflowExecution
   alias Coresdk.WorkflowCommands.ContinueAsNewWorkflowExecution
   alias Coresdk.WorkflowCommands.ScheduleActivity
+  alias Coresdk.WorkflowCommands.StartChildWorkflowExecution
   alias Coresdk.WorkflowCommands.StartTimer
   alias Coresdk.WorkflowCommands.WorkflowCommand
   alias Coresdk.WorkflowCompletion.Failure
@@ -109,6 +110,37 @@ defmodule Hourglass.Workflow.Evaluator do
 
   defp do_ingest([%{variant: {:resolve_activity, resolve}} | rest], state, status) do
     decoded = decode_activity_resolution(resolve.result)
+    new_results = Map.put(state.resolved_results, resolve.seq, decoded)
+    new_pending = Map.delete(state.pending_resolvers, resolve.seq)
+
+    do_ingest(
+      rest,
+      %{state | resolved_results: new_results, pending_resolvers: new_pending},
+      status
+    )
+  end
+
+  # A child workflow resolves TWICE for one seq: the start phase lands in
+  # `child_starts`, the result phase reuses the `resolved_results` slot (a seq
+  # belongs to exactly one command, so there is no collision). If the child
+  # fails to start, the start job arrives and NO result job ever does — which is
+  # why `peek_child/2` must consult this map rather than waiting on the result.
+  defp do_ingest(
+         [%{variant: {:resolve_child_workflow_execution_start, resolve}} | rest],
+         state,
+         status
+       ) do
+    decoded = decode_child_start(resolve.status)
+
+    do_ingest(
+      rest,
+      %{state | child_starts: Map.put(state.child_starts, resolve.seq, decoded)},
+      status
+    )
+  end
+
+  defp do_ingest([%{variant: {:resolve_child_workflow_execution, resolve}} | rest], state, status) do
+    decoded = decode_child_result(resolve.result)
     new_results = Map.put(state.resolved_results, resolve.seq, decoded)
     new_pending = Map.delete(state.pending_resolvers, resolve.seq)
 
@@ -360,6 +392,60 @@ defmodule Hourglass.Workflow.Evaluator do
   end
 
   @doc """
+  Two-phase peek for a child workflow command. Like `peek_command/2` it appends
+  the command on first sight and never throws — the caller decides when to
+  suspend. Unlike an activity, a child resolves twice, so this reports the start
+  phase and the result phase separately:
+
+    * `:pending` — command issued; the start has not resolved yet.
+    * `{:start_failed, cause}` — the child could not be started. **No result
+      resolution will ever arrive**, so a caller MUST NOT keep waiting.
+    * `{:start_cancelled, failure}` — cancelled during start.
+    * `{:started, run_id}` — running; the result has not resolved yet.
+    * `{:started, run_id, {:ok, raw} | {:error, failure}}` — result is in.
+  """
+  @spec peek_child(State.command_id(), State.command_term()) ::
+          :pending
+          | {:start_failed, term()}
+          | {:start_cancelled, term()}
+          | {:started, String.t()}
+          | {:started, String.t(), {:ok, term()} | {:error, term()}}
+  def peek_child(command_id, command_term) do
+    state =
+      CommandAccumulator.evaluator_state() ||
+        raise "Workflow.Evaluator.peek_child/2 called outside an evaluator"
+
+    case Map.get(state.command_id_to_seq, command_id) do
+      nil ->
+        CommandAccumulator.append_command(command_id, command_term)
+        :pending
+
+      seq ->
+        peek_child_phases(state, seq)
+    end
+  end
+
+  defp peek_child_phases(state, seq) do
+    case Map.fetch(state.child_starts, seq) do
+      :error ->
+        :pending
+
+      {:ok, {:started, run_id}} ->
+        case Map.fetch(state.resolved_results, seq) do
+          {:ok, result} -> {:started, run_id, result}
+          :error -> {:started, run_id}
+        end
+
+      {:ok, terminal} ->
+        terminal
+    end
+  end
+
+  @doc false
+  @spec derive_child_id(String.t(), State.command_id()) :: String.t()
+  def derive_child_id(run_id, command_id), do: generate_uuid(run_id, command_id)
+
+  @doc """
   Synchronous primitives (`uuid`, `random`) consume a deterministic
   command_id but never produce a Temporal command and never suspend. They
   short-circuit through this hook.
@@ -428,6 +514,21 @@ defmodule Hourglass.Workflow.Evaluator do
     ]
   end
 
+  defp command_to_proto(
+         seq,
+         {:start_child, %{module: mod, args: args, options: opts, workflow_id: workflow_id}},
+         task_queue
+       ) do
+    [
+      %WorkflowCommand{
+        variant: {
+          :start_child_workflow_execution,
+          build_start_child(seq, workflow_id, Atom.to_string(mod), args, opts, task_queue)
+        }
+      }
+    ]
+  end
+
   defp command_to_proto(seq, {:start_timer, %{duration_ms: ms}}, _task_queue) do
     [
       %WorkflowCommand{
@@ -443,26 +544,6 @@ defmodule Hourglass.Workflow.Evaluator do
   end
 
   defp build_schedule_activity(seq, activity_type, args, opts, default_task_queue) do
-    input_payload =
-      case args do
-        nil ->
-          []
-
-        _args ->
-          {encoding, data} =
-            case Jason.encode(args) do
-              {:ok, json} -> {"json/plain", json}
-              {:error, _reason} -> {"elixir/inspect", inspect(args)}
-            end
-
-          [
-            %Temporal.Api.Common.V1.Payload{
-              metadata: %{"encoding" => encoding},
-              data: data
-            }
-          ]
-      end
-
     resolved_task_queue = Keyword.get(opts, :task_queue, default_task_queue)
 
     %ScheduleActivity{
@@ -470,12 +551,79 @@ defmodule Hourglass.Workflow.Evaluator do
       activity_id: Integer.to_string(seq),
       activity_type: activity_type,
       task_queue: resolved_task_queue,
-      arguments: input_payload,
+      arguments: encode_input_payloads(args),
       schedule_to_close_timeout: ms_to_duration(Keyword.get(opts, :schedule_to_close_timeout)),
       start_to_close_timeout: ms_to_duration(Keyword.get(opts, :start_to_close_timeout)),
       heartbeat_timeout: ms_to_duration(Keyword.get(opts, :heartbeat_timeout)),
       retry_policy: build_retry_policy_proto(Keyword.get(opts, :retry_policy))
     }
+  end
+
+  # `namespace` is deliberately left "": core passes the field straight through
+  # to the server without substituting the parent's, and the reference Rust SDK's
+  # ChildWorkflowOptions has no namespace field at all (its into_command never
+  # sets one), so "" is what the official SDK ships and the server resolves it to
+  # the parent's namespace. `cancellation_type` is left unset: its zero-value is
+  # ABANDON and nothing in 0.5.0 cancels a child, so the field is inert.
+  defp build_start_child(seq, workflow_id, workflow_type, args, opts, default_task_queue) do
+    %StartChildWorkflowExecution{
+      seq: seq,
+      namespace: "",
+      workflow_id: workflow_id,
+      workflow_type: workflow_type,
+      task_queue: Keyword.get(opts, :task_queue, default_task_queue),
+      input: encode_input_payloads(args),
+      parent_close_policy:
+        parent_close_policy_proto(Keyword.get(opts, :parent_close_policy, :terminate)),
+      workflow_id_reuse_policy:
+        reuse_policy_proto(Keyword.get(opts, :workflow_id_reuse_policy, :allow_duplicate)),
+      workflow_execution_timeout: ms_to_duration(Keyword.get(opts, :workflow_execution_timeout)),
+      workflow_run_timeout: ms_to_duration(Keyword.get(opts, :workflow_run_timeout)),
+      workflow_task_timeout: ms_to_duration(Keyword.get(opts, :workflow_task_timeout)),
+      retry_policy: build_retry_policy_proto(Keyword.get(opts, :retry_policy))
+    }
+  end
+
+  @parent_close_policies %{
+    terminate: :PARENT_CLOSE_POLICY_TERMINATE,
+    abandon: :PARENT_CLOSE_POLICY_ABANDON,
+    request_cancel: :PARENT_CLOSE_POLICY_REQUEST_CANCEL
+  }
+
+  defp parent_close_policy_proto(policy) do
+    Map.get(@parent_close_policies, policy) ||
+      raise ArgumentError,
+            "invalid :parent_close_policy #{inspect(policy)}; " <>
+              "expected one of #{inspect(Map.keys(@parent_close_policies))}"
+  end
+
+  # Defaults to :allow_duplicate rather than transmitting the zero-value: the
+  # reference Rust SDK normalises Unspecified -> AllowDuplicate when building the
+  # command instead of letting an unspecified policy reach the server.
+  @reuse_policies %{
+    allow_duplicate: :WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
+    allow_duplicate_failed_only: :WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
+    reject_duplicate: :WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+    terminate_if_running: :WORKFLOW_ID_REUSE_POLICY_TERMINATE_IF_RUNNING
+  }
+
+  defp reuse_policy_proto(policy) do
+    Map.get(@reuse_policies, policy) ||
+      raise ArgumentError,
+            "invalid :workflow_id_reuse_policy #{inspect(policy)}; " <>
+              "expected one of #{inspect(Map.keys(@reuse_policies))}"
+  end
+
+  defp encode_input_payloads(nil), do: []
+
+  defp encode_input_payloads(args) do
+    {encoding, data} =
+      case Jason.encode(args) do
+        {:ok, json} -> {"json/plain", json}
+        {:error, _reason} -> {"elixir/inspect", inspect(args)}
+      end
+
+    [%Temporal.Api.Common.V1.Payload{metadata: %{"encoding" => encoding}, data: data}]
   end
 
   defp ms_to_duration(nil), do: nil
@@ -554,6 +702,48 @@ defmodule Hourglass.Workflow.Evaluator do
     # rather than silently treating the unknown shape as a successful result.
     {:error, {:unknown_activity_resolution, other}}
   end
+
+  # -- Child workflow resolution decoding --
+
+  defp decode_child_start(
+         {:succeeded,
+          %Coresdk.WorkflowActivation.ResolveChildWorkflowExecutionStartSuccess{run_id: run_id}}
+       ),
+       do: {:started, run_id}
+
+  defp decode_child_start(
+         {:failed,
+          %Coresdk.WorkflowActivation.ResolveChildWorkflowExecutionStartFailure{cause: cause}}
+       ),
+       do: {:start_failed, cause}
+
+  defp decode_child_start(
+         {:cancelled,
+          %Coresdk.WorkflowActivation.ResolveChildWorkflowExecutionStartCancelled{
+            failure: failure
+          }}
+       ),
+       do: {:start_cancelled, failure}
+
+  defp decode_child_start(other), do: {:start_failed, {:unknown_child_start_resolution, other}}
+
+  defp decode_child_result(%Coresdk.ChildWorkflow.ChildWorkflowResult{status: status}) do
+    case status do
+      {:completed, %Coresdk.ChildWorkflow.Success{result: payload}} ->
+        {:ok, decode_payload(payload)}
+
+      {:failed, %Coresdk.ChildWorkflow.Failure{failure: failure}} ->
+        {:error, failure}
+
+      {:cancelled, %Coresdk.ChildWorkflow.Cancellation{failure: failure}} ->
+        {:error, {:cancelled, failure}}
+
+      nil ->
+        {:error, :no_result}
+    end
+  end
+
+  defp decode_child_result(other), do: {:error, {:unknown_child_resolution, other}}
 
   defp decode_payload(%Temporal.Api.Common.V1.Payload{metadata: meta, data: data} = payload) do
     encoding = Map.get(meta || %{}, "encoding", "")
