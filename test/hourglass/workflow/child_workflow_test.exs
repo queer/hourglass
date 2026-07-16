@@ -90,6 +90,55 @@ defmodule Hourglass.Workflow.ChildWorkflowTest do
     }
   end
 
+  defp child_start_failed_job(seq) do
+    %{
+      variant:
+        {:resolve_child_workflow_execution_start,
+         %Coresdk.WorkflowActivation.ResolveChildWorkflowExecutionStart{
+           seq: seq,
+           status:
+             {:failed,
+              %Coresdk.WorkflowActivation.ResolveChildWorkflowExecutionStartFailure{
+                workflow_id: "dupe-id",
+                workflow_type: "MyChild",
+                cause: :START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS
+              }}
+         }}
+    }
+  end
+
+  defp child_start_cancelled_job(seq) do
+    %{
+      variant:
+        {:resolve_child_workflow_execution_start,
+         %Coresdk.WorkflowActivation.ResolveChildWorkflowExecutionStart{
+           seq: seq,
+           status:
+             {:cancelled,
+              %Coresdk.WorkflowActivation.ResolveChildWorkflowExecutionStartCancelled{
+                failure: %Temporal.Api.Failure.V1.Failure{message: "start cancelled"}
+              }}
+         }}
+    }
+  end
+
+  defp child_failed_job(seq, message) do
+    %{
+      variant:
+        {:resolve_child_workflow_execution,
+         %Coresdk.WorkflowActivation.ResolveChildWorkflowExecution{
+           seq: seq,
+           result: %Coresdk.ChildWorkflow.ChildWorkflowResult{
+             status:
+               {:failed,
+                %Coresdk.ChildWorkflow.Failure{
+                  failure: %Temporal.Api.Failure.V1.Failure{message: message}
+                }}
+           }
+         }}
+    }
+  end
+
   defp commands_of(%WorkflowActivationCompletion{
          status: {:successful, %Success{commands: commands}}
        }),
@@ -334,5 +383,99 @@ defmodule Hourglass.Workflow.ChildWorkflowTest do
     assert msg =~ "ArgumentError"
     assert msg =~ "123"
     refute match?({:completed, _}, state1.result)
+  end
+
+  test "start failure resolves execute_child immediately — it does NOT wait for a result" do
+    # The regression this design exists to prevent: a child that fails to start
+    # gets a start resolution and NO result resolution, ever. A body that awaited
+    # only the result would hang forever on a duplicate workflow id.
+    state0 = fresh_state("r6")
+
+    {:ok, completion1, state1} =
+      Evaluator.evaluate(SingleChild, activation([init_job(%{})]), state0)
+
+    assert [%WorkflowCommand{variant: {:start_child_workflow_execution, sc}}] =
+             commands_of(completion1)
+
+    {:ok, completion2, state2} =
+      Evaluator.evaluate(SingleChild, activation([child_start_failed_job(sc.seq)]), state1)
+
+    # Completed on the START resolution alone — no second resolution needed.
+    assert [%WorkflowCommand{variant: {:complete_workflow_execution, _cwe}}] =
+             commands_of(completion2)
+
+    assert {:completed,
+            {:ok,
+             {:error,
+              {:start_failed,
+               :START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS}}}} =
+             state2.result
+  end
+
+  test "start cancellation surfaces as {:cancelled, failure}" do
+    state0 = fresh_state("r7")
+
+    {:ok, completion1, state1} =
+      Evaluator.evaluate(SingleChild, activation([init_job(%{})]), state0)
+
+    assert [%WorkflowCommand{variant: {:start_child_workflow_execution, sc}}] =
+             commands_of(completion1)
+
+    {:ok, _completion2, state2} =
+      Evaluator.evaluate(SingleChild, activation([child_start_cancelled_job(sc.seq)]), state1)
+
+    assert {:completed, {:ok, {:error, {:cancelled, %Temporal.Api.Failure.V1.Failure{}}}}} =
+             state2.result
+  end
+
+  test "a child that starts then fails surfaces the run Failure" do
+    state0 = fresh_state("r8")
+
+    {:ok, completion1, state1} =
+      Evaluator.evaluate(SingleChild, activation([init_job(%{})]), state0)
+
+    assert [%WorkflowCommand{variant: {:start_child_workflow_execution, sc}}] =
+             commands_of(completion1)
+
+    {:ok, _c2, state2} =
+      Evaluator.evaluate(SingleChild, activation([child_started_job(sc.seq, "run-x")]), state1)
+
+    {:ok, _c3, state3} =
+      Evaluator.evaluate(SingleChild, activation([child_failed_job(sc.seq, "boom")]), state2)
+
+    assert {:completed, {:ok, {:error, %Temporal.Api.Failure.V1.Failure{message: "boom"}}}} =
+             state3.result
+  end
+
+  test "execute_child! raises ChildWorkflowError, parking the workflow task" do
+    defmodule BangChild do
+      use Hourglass.Workflow
+
+      @impl Hourglass.Workflow.Behaviour
+      def run(_input), do: execute_child!(MyChild, %{})
+    end
+
+    state0 = fresh_state("r9")
+
+    {:ok, completion1, state1} =
+      Evaluator.evaluate(BangChild, activation([init_job(%{})]), state0)
+
+    assert [%WorkflowCommand{variant: {:start_child_workflow_execution, sc}}] =
+             commands_of(completion1)
+
+    {:ok, _c2, state2} =
+      Evaluator.evaluate(BangChild, activation([child_started_job(sc.seq, "run-y")]), state1)
+
+    # A raise inside the body is a workflow-task failure (park), not a completion.
+    {:ok, completion3, _state3} =
+      Evaluator.evaluate(BangChild, activation([child_failed_job(sc.seq, "kaboom")]), state2)
+
+    assert %WorkflowActivationCompletion{status: {:failed, _failure}} = completion3
+  end
+
+  test "ChildWorkflowError message names the workflow and the reason" do
+    error = %Hourglass.ChildWorkflowError{workflow: MyChild, reason: :nope}
+    assert Exception.message(error) =~ "MyChild"
+    assert Exception.message(error) =~ "nope"
   end
 end

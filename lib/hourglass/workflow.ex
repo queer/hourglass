@@ -82,6 +82,8 @@ defmodule Hourglass.Workflow do
           execute_activity!: 3,
           execute_child: 2,
           execute_child: 3,
+          execute_child!: 2,
+          execute_child!: 3,
           async: 1,
           await: 1,
           await_all: 1,
@@ -377,7 +379,7 @@ defmodule Hourglass.Workflow do
   Fan out with the ordinary scopes — no child-specific machinery needed:
 
       urls
-      |> Enum.map(fn u -> async(fn -> execute_child(Ingest, %{"url" => u}) end) end)
+      |> Enum.map(fn u -> async(fn -> execute_child!(Ingest, %{"url" => u}) end) end)
       |> await_all()
   """
   @spec execute_child(module(), term()) :: {:ok, term()} | {:error, term()}
@@ -405,6 +407,23 @@ defmodule Hourglass.Workflow do
 
       {:start_cancelled, failure} ->
         {:error, {:cancelled, failure}}
+    end
+  end
+
+  @doc """
+  `execute_child/3` that raises `Hourglass.ChildWorkflowError` instead of
+  returning `{:error, reason}`. Mirrors `execute_activity!/3`.
+
+  Note a raise inside a workflow body is a **workflow-task failure** (the run
+  parks and the server retries the task) — it is not a way to author a business
+  failure. Return `execute_child/3`'s `{:error, _}` for that.
+  """
+  @spec execute_child!(module(), term()) :: term()
+  @spec execute_child!(module(), term(), keyword()) :: term()
+  def execute_child!(module, input, opts \\ []) do
+    case execute_child(module, input, opts) do
+      {:ok, value} -> value
+      {:error, reason} -> raise Hourglass.ChildWorkflowError, workflow: module, reason: reason
     end
   end
 
