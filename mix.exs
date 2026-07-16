@@ -83,6 +83,13 @@ defmodule Hourglass.MixProject do
       # Cluster integration tests (tagged :temporal + :integration, excluded
       # from the default lane). Bring the cluster up first (see compose.yaml):
       #   podman compose up -d  &&  mix test.integration
+      #
+      # Concurrency is capped at run time by test/test_helper.exs, deliberately
+      # NOT by a --max-cases flag here: each :temporal test starts a Worker
+      # holding two blocking dirty-IO long-polls, so the safe width depends on
+      # the VM's dirty-IO pool and any number hardcoded here would be wrong on a
+      # box with a different pool. For full width, give the VM a bigger pool:
+      #   ERL_FLAGS="+SDio 128" mix test.integration
       "test.integration": [
         "test --include temporal --include integration"
       ]

@@ -40,6 +40,39 @@ temporal_included? =
   |> Enum.any?(&(&1 == :temporal or match?({:temporal, _opts}, &1)))
 
 if temporal_included? do
+  # Cap test concurrency to what the BEAM's dirty-IO scheduler pool can sustain.
+  #
+  # Every :temporal test `start_supervised`s its own Hourglass.Worker, and each
+  # Worker holds TWO blocking long-poll NIF calls (workflow + activity) parked on
+  # dirty-IO schedulers for the life of the poll. ExUnit's default max_cases is
+  # `schedulers_online * 2` (20 on a 10-core box) while the default dirty-IO pool
+  # is 10 (see README, "Dirty-IO schedulers"). So the default lane wants ~40 slots
+  # and gets 10: the pool starves, most Workers never poll at all, their workflows
+  # sit Running forever, and `mix test.integration` HANGS rather than failing —
+  # the worst failure mode, since a hang is indistinguishable from slow progress.
+  #
+  # Deriving the cap from the live pool keeps this correct on any machine, and
+  # lets the README's own remedy pay off instead of fighting it: with `+SDio 128`
+  # the computed cap lands above ExUnit's default, nothing is capped, and the
+  # suite runs at full width. Measured: ~14s uncapped with +SDio 128, ~15s capped
+  # on the default pool — both far better than the ~29s a serial `--trace` costs.
+  #
+  # The `- 1` is headroom: worker SHUTDOWN also calls into the NIF, and must not
+  # deadlock against a pool fully occupied by polls.
+  dirty_io = :erlang.system_info(:dirty_io_schedulers)
+  supported_workers = max(1, div(dirty_io, 2) - 1)
+  requested = ExUnit.configuration() |> Keyword.get(:max_cases, 1)
+
+  if requested > supported_workers do
+    IO.puts(
+      "[hourglass] capping max_cases #{requested} -> #{supported_workers}: each Worker holds 2 " <>
+        "blocking dirty-IO long-polls and this VM has only #{dirty_io} dirty-IO schedulers. " <>
+        "Run with ERL_FLAGS=\"+SDio 128\" to lift the cap and run the suite at full width."
+    )
+
+    ExUnit.configure(max_cases: supported_workers)
+  end
+
   # Integration suite: bring up the full cluster-facing tree once for the run.
   # The Subsystem (:rest_for_one) owns Runtime + BridgeHolder + WorkerRegistry +
   # Worker.Supervisor + WorkerLauncher. WorkerLauncher does NOT auto-start a

@@ -231,6 +231,19 @@ poll and shutdown calls never starve each other. Set it at VM boot via
 +SDio 128
 ```
 
+Starving this pool does **not** surface as an error: the polls simply never get a
+scheduler, workflows sit `Running` forever, and the process looks slow rather than
+broken. If workers appear to hang under concurrency, check this first.
+
+The integration suite is subject to exactly this: every `:temporal` test starts its
+own worker, so `test/test_helper.exs` caps ExUnit's `max_cases` to
+`(dirty_io_schedulers / 2) - 1` and says so on stderr. Lift the cap — and run the
+suite at full width — by giving the VM a bigger pool:
+
+```
+ERL_FLAGS="+SDio 128" mix test.integration
+```
+
 ## Starting and observing workflows
 
 ```elixir
