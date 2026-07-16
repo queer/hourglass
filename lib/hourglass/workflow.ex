@@ -354,9 +354,14 @@ defmodule Hourglass.Workflow do
   Returns `{:ok, result}` with the child's output cast through its declared
   `__workflow_output_type__/0`, or `{:error, reason}` where reason is one of:
 
-    * `{:start_failed, cause}` — the child could not be started (`cause` is a
-      `Coresdk.ChildWorkflow.StartChildWorkflowExecutionFailedCause`, in practice
-      `:START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS`).
+    * `{:start_failed, cause}` — the child could not be started. `cause` is
+      normally a `Coresdk.ChildWorkflow.StartChildWorkflowExecutionFailedCause`
+      atom — in practice
+      `:START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS`,
+      the only non-unspecified value that enum defines. A start resolution whose
+      shape this SDK does not recognise (e.g. a variant added by a newer Core)
+      surfaces as `{:unknown_child_start_resolution, raw}` instead, so match
+      defensively rather than assuming `is_atom(cause)`.
       Kept distinct from a run failure on purpose: an "already exists" against a
       pinned singleton `:id` is usually expected rather than a fault.
     * `%Temporal.Api.Failure.V1.Failure{}` — the child started and its run failed.
@@ -441,11 +446,15 @@ defmodule Hourglass.Workflow do
 
       {:ok, handle} = start_child(Ingest, %{"url" => url}, parent_close_policy: :abandon)
 
-  The returned handle identifies the child (for logging, or for returning out of
-  the workflow). It is **not** usable with the client functions that take a
-  handle — `Hourglass.result/2`, `signal/3`, `cancel/2` poll or perform network
-  IO and must never be called from inside a workflow body. Acting on a running
-  child from its parent arrives with the deferred cancel/signal work.
+  The returned value is an ordinary `Hourglass.WorkflowHandle` naming the child's
+  `id` and `run_id` — useful for logging, or for returning out of the workflow so
+  **client** code can later `Hourglass.result/2` / `signal/3` / `cancel/2` it.
+
+  What you must not do is call those client functions from *inside* a workflow
+  body: they poll and perform network IO, which would break replay determinism.
+  That restriction is about where you call them from, not about this handle.
+  Acting on a running child from within its parent arrives with the deferred
+  cancel/signal work.
   """
   @spec start_child(module(), term(), keyword()) ::
           {:ok, Hourglass.WorkflowHandle.t()} | {:error, term()}

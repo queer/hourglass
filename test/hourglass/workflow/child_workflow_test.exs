@@ -470,7 +470,15 @@ defmodule Hourglass.Workflow.ChildWorkflowTest do
     {:ok, completion3, _state3} =
       Evaluator.evaluate(BangChild, activation([child_failed_job(sc.seq, "kaboom")]), state2)
 
-    assert %WorkflowActivationCompletion{status: {:failed, _failure}} = completion3
+    assert %WorkflowActivationCompletion{status: {:failed, failure}} = completion3
+
+    # Assert on the message, not just on {:failed, _}: a bare wildcard passes for
+    # ANY exception, so it could not tell a ChildWorkflowError park from an
+    # unrelated crash. `encode_failure/1` inspects non-binary reasons, so the
+    # struct name and the child's failure both surface here.
+    message = failure.failure.message
+    assert message =~ "ChildWorkflowError"
+    assert message =~ "kaboom"
   end
 
   test "ChildWorkflowError message names the workflow and the reason" do
