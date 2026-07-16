@@ -64,8 +64,13 @@ defmodule Hourglass.TestSupport.SlowChild do
 
   @impl Hourglass.Workflow.Behaviour
   def run(_args) do
-    # Long enough that the parent is guaranteed to close first.
-    sleep({:sec, 10})
+    # Must still be sleeping when the :abandon/:terminate assertions run, so the
+    # margin is what makes those tests non-flaky: `assert_eventually` spends up
+    # to ~5s of retries plus round-trips, and the parent closes immediately
+    # (it never awaits this child). 60s gives ~12x headroom under a loaded CI
+    # box while still fitting the 120s @moduletag timeout. An abandoned child
+    # outliving its test by design is harmless — the namespace is test-only.
+    sleep({:sec, 60})
     %{"finished" => true}
   end
 end
