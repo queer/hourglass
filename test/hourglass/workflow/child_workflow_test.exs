@@ -4,6 +4,8 @@ defmodule Hourglass.Workflow.ChildWorkflowTest do
   use ExUnit.Case, async: true
 
   alias Coresdk.WorkflowCommands.WorkflowCommand
+  # Failure is needed for the raise-on-bad-:id assertion
+  alias Coresdk.WorkflowCompletion.Failure
   alias Coresdk.WorkflowCompletion.Success
   alias Coresdk.WorkflowCompletion.WorkflowActivationCompletion
   alias Hourglass.Workflow.Evaluator
@@ -254,5 +256,83 @@ defmodule Hourglass.Workflow.ChildWorkflowTest do
 
     # Distinct command_ids ⇒ distinct derived child ids (no collision).
     assert length(Enum.uniq(ids)) == 2
+  end
+
+  # -------------------------------------------------------------------------
+  # encode_input_payloads/1 fallback branches (child path) — mirrors the
+  # activity-path tests in evaluator_test.exs, pinning the shared helper's
+  # behaviour for both callers.
+  # -------------------------------------------------------------------------
+
+  test "execute_child with nil args encodes StartChildWorkflowExecution.input as []" do
+    defmodule NilArgsChild do
+      use Hourglass.Workflow
+
+      @impl Hourglass.Workflow.Behaviour
+      def run(_input), do: execute_child(MyChild, nil)
+    end
+
+    {:ok, completion, _state} =
+      Evaluator.evaluate(NilArgsChild, activation([init_job(%{})]), fresh_state("r-nilargs"))
+
+    assert [%WorkflowCommand{variant: {:start_child_workflow_execution, sc}}] =
+             commands_of(completion)
+
+    assert sc.input == []
+  end
+
+  test "execute_child with non-JSON-encodable args falls back to elixir/inspect encoding" do
+    defmodule NonJsonArgsChild do
+      use Hourglass.Workflow
+
+      @impl Hourglass.Workflow.Behaviour
+      def run(_input), do: execute_child(MyChild, {:not, :json, :encodable})
+    end
+
+    {:ok, completion, _state} =
+      Evaluator.evaluate(
+        NonJsonArgsChild,
+        activation([init_job(%{})]),
+        fresh_state("r-inspectargs")
+      )
+
+    assert [%WorkflowCommand{variant: {:start_child_workflow_execution, sc}}] =
+             commands_of(completion)
+
+    assert [
+             %Temporal.Api.Common.V1.Payload{
+               metadata: %{"encoding" => "elixir/inspect"},
+               data: data
+             }
+           ] = sc.input
+
+    assert data == inspect({:not, :json, :encodable})
+  end
+
+  # -------------------------------------------------------------------------
+  # child_workflow_id/2: a present-but-non-binary :id must raise, not silently
+  # fall back to a derived id.
+  # -------------------------------------------------------------------------
+
+  test "execute_child with a present but non-binary :id raises ArgumentError naming the value" do
+    defmodule BadIdChild do
+      use Hourglass.Workflow
+
+      @impl Hourglass.Workflow.Behaviour
+      def run(_input), do: execute_child(MyChild, %{}, id: 123)
+    end
+
+    {:ok, completion, state1} =
+      Evaluator.evaluate(BadIdChild, activation([init_job(%{})]), fresh_state("r-bad-id"))
+
+    # The raise happens inside run/1, so the evaluator's :error/:exit catch
+    # parks the workflow as a workflow-task failure rather than propagating —
+    # mirrors evaluator_test.exs's "raise inside run/1 parks the workflow" test.
+    assert {:failed, %Failure{failure: %Temporal.Api.Failure.V1.Failure{message: msg}}} =
+             completion.status
+
+    assert msg =~ "ArgumentError"
+    assert msg =~ "123"
+    refute match?({:completed, _}, state1.result)
   end
 end

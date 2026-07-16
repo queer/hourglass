@@ -377,7 +377,7 @@ defmodule Hourglass.Workflow do
   Fan out with the ordinary scopes — no child-specific machinery needed:
 
       urls
-      |> Enum.map(fn u -> async(fn -> execute_child!(Ingest, %{"url" => u}) end) end)
+      |> Enum.map(fn u -> async(fn -> execute_child(Ingest, %{"url" => u}) end) end)
       |> await_all()
   """
   @spec execute_child(module(), term()) :: {:ok, term()} | {:error, term()}
@@ -437,7 +437,12 @@ defmodule Hourglass.Workflow do
       {:ok, id} when is_binary(id) ->
         id
 
-      _other ->
+      {:ok, other} ->
+        raise ArgumentError,
+              "invalid :id #{inspect(other)}; expected a binary workflow id " <>
+                "(or omit :id to let one be derived)"
+
+      :error ->
         state =
           CommandAccumulator.evaluator_state() ||
             raise "Hourglass.Workflow child primitives called outside a workflow evaluator"

@@ -573,6 +573,61 @@ defmodule Hourglass.Workflow.EvaluatorTest do
   end
 
   # -------------------------------------------------------------------------
+  # encode_input_payloads/1 fallback branches (activity path), pinned here so
+  # a future edit to the shared helper can't silently change the published
+  # execute_activity wire format. Mirrored for the child path in
+  # child_workflow_test.exs.
+  # -------------------------------------------------------------------------
+
+  defmodule NilArgsWorkflow do
+    use Hourglass.Workflow
+
+    @impl Hourglass.Workflow.Behaviour
+    def run(_input) do
+      result = execute_activity(MyAct, nil)
+      {:ok, result}
+    end
+  end
+
+  defmodule NonJsonArgsWorkflow do
+    use Hourglass.Workflow
+
+    @impl Hourglass.Workflow.Behaviour
+    def run(_input) do
+      result = execute_activity(MyAct, {:not, :json, :encodable})
+      {:ok, result}
+    end
+  end
+
+  test "execute_activity/2 with nil args encodes ScheduleActivity.arguments as []" do
+    state0 = fresh_state("r-nilargs-1")
+
+    {:ok, completion, _state1} =
+      Evaluator.evaluate(NilArgsWorkflow, activation([init_job(nil)]), state0)
+
+    assert [%WorkflowCommand{variant: {:schedule_activity, sa}}] = commands_of(completion)
+    assert sa.arguments == []
+  end
+
+  test "execute_activity/2 with non-JSON-encodable args falls back to elixir/inspect encoding" do
+    state0 = fresh_state("r-inspectargs-1")
+
+    {:ok, completion, _state1} =
+      Evaluator.evaluate(NonJsonArgsWorkflow, activation([init_job(nil)]), state0)
+
+    assert [%WorkflowCommand{variant: {:schedule_activity, sa}}] = commands_of(completion)
+
+    assert [
+             %Temporal.Api.Common.V1.Payload{
+               metadata: %{"encoding" => "elixir/inspect"},
+               data: data
+             }
+           ] = sa.arguments
+
+    assert data == inspect({:not, :json, :encodable})
+  end
+
+  # -------------------------------------------------------------------------
   # Durable timer (sleep/1)
   # -------------------------------------------------------------------------
 
