@@ -23,7 +23,7 @@ Add `hourglass` to your dependencies in `mix.exs`:
 ```elixir
 defp deps do
   [
-    {:hourglass, "~> 0.5.0"}
+    {:hourglass, "~> 0.6.0"}
   ]
 end
 ```
