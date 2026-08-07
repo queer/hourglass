@@ -23,6 +23,8 @@ defmodule Hourglass.Telemetry do
     [:hourglass, :workflow, :exception],
     # workflow body raised → parked as a workflow-task failure; retried by the server
     [:hourglass, :workflow, :task_failed],
+    # workflow body called fail/2,3 → terminal FailWorkflowExecution; not retried
+    [:hourglass, :workflow, :failed],
     [:hourglass, :workflow, :unhandled_job_variant],
     [:hourglass, :bridge_holder, :activity_result_unrouted],
     # reserved — not currently emitted; intended for the replay CI gate mix task

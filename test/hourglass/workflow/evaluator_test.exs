@@ -3,6 +3,7 @@ defmodule Hourglass.Workflow.EvaluatorTest do
   # test builds its own activations + run_id.
   use ExUnit.Case, async: true
 
+  alias Coresdk.WorkflowCommands.FailWorkflowExecution
   alias Coresdk.WorkflowCommands.WorkflowCommand
   # Failure is needed for the park-on-raise assertions
   alias Coresdk.WorkflowCompletion.Failure
@@ -10,6 +11,11 @@ defmodule Hourglass.Workflow.EvaluatorTest do
   alias Coresdk.WorkflowCompletion.WorkflowActivationCompletion
   alias Hourglass.Workflow.Evaluator
   alias Hourglass.Workflow.State
+  # Not aliased as `Failure` — that name is already bound above to
+  # Coresdk.WorkflowCompletion.Failure (the task-failure wrapper). This is
+  # the *proto* Failure a FailWorkflowExecution command carries; referenced
+  # fully-qualified below to avoid the collision.
+  alias Temporal.Api.Failure.V1.ApplicationFailureInfo
 
   # CrashingAsync + RaiseInBody fixtures intentionally raise to verify
   # the catch path; the workflow_exception telemetry log is expected.
@@ -137,6 +143,64 @@ defmodule Hourglass.Workflow.EvaluatorTest do
       value = execute_activity!(MyAct, %{})
       {:ok, value}
     end
+  end
+
+  # fail/2,3 fixtures — a workflow body ending its run as genuinely failed
+  # (distinct from CrashingAsync/RaiseInBody above, which park).
+  defmodule FailingWorkflow do
+    use Hourglass.Workflow
+
+    @impl Hourglass.Workflow.Behaviour
+    def run(_input) do
+      fail("ParseFailed", "could not parse document", details: %{"stage" => "decompose"})
+    end
+  end
+
+  defmodule FailNoOptsWorkflow do
+    use Hourglass.Workflow
+
+    @impl Hourglass.Workflow.Behaviour
+    def run(_input), do: fail("Boom", "no details or overrides supplied")
+  end
+
+  defmodule FailRetryableWorkflow do
+    use Hourglass.Workflow
+
+    @impl Hourglass.Workflow.Behaviour
+    def run(_input), do: fail("Transient", "let a workflow-level retry policy retry this", non_retryable: false)
+  end
+
+  # Proves a redelivered activation does not re-execute the body: run/1
+  # raises if invoked a second time. Process.get/put is safe here only
+  # because the pure-function evaluator runs run/1 inline in the calling
+  # process (no Task spawn — see Evaluator's moduledoc), so the counter is
+  # scoped to whichever ExUnit test process calls Evaluator.evaluate/3.
+  defmodule FailOnceWorkflow do
+    use Hourglass.Workflow
+
+    @impl Hourglass.Workflow.Behaviour
+    def run(_input) do
+      key = {__MODULE__, :run_count}
+      count = Process.get(key, 0)
+      Process.put(key, count + 1)
+
+      if count > 0 do
+        raise "run/1 invoked again after a cached failure — redelivery must not re-run the body"
+      end
+
+      fail("DecomposeFailed", "decomposition failed on first attempt")
+    end
+  end
+
+  defmodule BadFailArgWorkflow do
+    use Hourglass.Workflow
+
+    @impl Hourglass.Workflow.Behaviour
+    # :oops is not a binary — fail/2's guard clause rejects it, raising
+    # FunctionClauseError, which run_body/2's generic :error clause parks
+    # exactly like any other workflow-body bug. It must NOT reach
+    # build_fail_command/1 with a malformed shape.
+    def run(_input), do: fail(:oops, "message")
   end
 
   defmodule IOSchema do
@@ -397,6 +461,138 @@ defmodule Hourglass.Workflow.EvaluatorTest do
 
     assert msg =~ "workflow body explodes"
     # parked, not terminal -> next activation re-runs
+    refute match?({:completed, _}, state1.result)
+    refute match?({:failed, _}, state1.result)
+  end
+
+  # -------------------------------------------------------------------------
+  # fail/2,3 — a workflow body ending its run as genuinely failed. New
+  # coverage sits beside (never replaces) the park-on-raise tests above.
+  # -------------------------------------------------------------------------
+
+  test "fail/2 ends the run with a terminal FailWorkflowExecution inside a SUCCESSFUL completion" do
+    state0 = fresh_state("r-fail-1")
+
+    {:ok, completion, state1} =
+      Evaluator.evaluate(FailingWorkflow, activation([init_job(nil)]), state0)
+
+    # Protocol-level: the activation completion is {:successful, ...} —
+    # fail_workflow_execution lives in the SAME command oneof as
+    # complete_workflow_execution, never the {:failed, ...} task-status shape
+    # parking uses (contrast the RaiseInBody test immediately above).
+    assert {:successful, %Success{commands: [command]}} = completion.status
+    assert %WorkflowCommand{variant: {:fail_workflow_execution, fwe}} = command
+    assert %FailWorkflowExecution{failure: failure} = fwe
+    assert %Temporal.Api.Failure.V1.Failure{} = failure
+    assert failure.message == "could not parse document"
+    assert failure.source == "ParseFailed"
+
+    assert {:application_failure_info, %ApplicationFailureInfo{} = info} = failure.failure_info
+    assert info.type == "ParseFailed"
+    assert info.non_retryable == true
+    assert %Temporal.Api.Common.V1.Payloads{payloads: [payload]} = info.details
+    assert Jason.decode!(payload.data) == %{"stage" => "decompose"}
+
+    # State carries the same decision — this is what a redelivered
+    # activation re-emits without re-deciding (see the redelivery test below).
+    assert state1.result ==
+             {:failed,
+              %{
+                type: "ParseFailed",
+                message: "could not parse document",
+                details: %{"stage" => "decompose"},
+                non_retryable: true
+              }}
+  end
+
+  test "fail/2 (no opts) defaults details to nil and non_retryable to true" do
+    state0 = fresh_state("r-fail-2")
+
+    {:ok, completion, state1} =
+      Evaluator.evaluate(FailNoOptsWorkflow, activation([init_job(nil)]), state0)
+
+    assert {:successful, %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, fwe}}]}} =
+             completion.status
+
+    assert {:application_failure_info, %ApplicationFailureInfo{} = info} = fwe.failure.failure_info
+    assert info.type == "Boom"
+    assert info.non_retryable == true
+    assert info.details == nil
+    assert state1.result == {:failed, %{type: "Boom", message: "no details or overrides supplied", details: nil, non_retryable: true}}
+  end
+
+  test "fail/3 :non_retryable override reaches ApplicationFailureInfo.non_retryable" do
+    state0 = fresh_state("r-fail-3")
+
+    {:ok, completion, _state1} =
+      Evaluator.evaluate(FailRetryableWorkflow, activation([init_job(nil)]), state0)
+
+    assert {:successful, %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, fwe}}]}} =
+             completion.status
+
+    assert {:application_failure_info, %ApplicationFailureInfo{non_retryable: false}} = fwe.failure.failure_info
+  end
+
+  test "fail/2's outcome is structurally distinct from an uncaught raise's park — same activation shape, different wire result" do
+    # Two workflows, same shape of activation, deliberately different
+    # terminal decisions. This is the adversarial check: prove the two paths
+    # diverge on protocol (status variant / command variant), not merely that
+    # "the workflow stopped" in both cases.
+    {:ok, fail_completion, fail_state} =
+      Evaluator.evaluate(FailingWorkflow, activation([init_job(nil)]), fresh_state("r-distinct-fail"))
+
+    {:ok, raise_completion, raise_state} =
+      Evaluator.evaluate(RaiseInBody, activation([init_job(nil)]), fresh_state("r-distinct-raise"))
+
+    # fail/2: successful completion, fail_workflow_execution command, result cached as {:failed, _}.
+    assert {:successful, %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, _fwe}}]}} =
+             fail_completion.status
+
+    assert match?({:failed, _}, fail_state.result)
+
+    # raise: task-status failure, no commands at all, result stays nil (not terminal).
+    assert {:failed, %Failure{}} = raise_completion.status
+    refute match?({:completed, _}, raise_state.result)
+    refute match?({:failed, _}, raise_state.result)
+
+    # The two `status` shapes don't even share a variant tag: :successful vs :failed.
+    assert elem(fail_completion.status, 0) == :successful
+    assert elem(raise_completion.status, 0) == :failed
+  end
+
+  test "a redelivered activation after fail/2 re-emits the cached FailWorkflowExecution WITHOUT re-running the body" do
+    state0 = fresh_state("r-fail-redeliver")
+
+    {:ok, completion1, state1} =
+      Evaluator.evaluate(FailOnceWorkflow, activation([init_job(nil)]), state0)
+
+    assert {:successful, %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, fwe1}}]}} =
+             completion1.status
+
+    assert match?({:failed, _}, state1.result)
+
+    # Redelivery: same workflow module, a fresh activation, the ALREADY-FAILED
+    # state. If the body re-ran, FailOnceWorkflow's second invocation raises
+    # (which would park, not re-emit) — so a non-parked, identical-failure
+    # result here proves the cached branch short-circuited before run_body/2.
+    {:ok, completion2, state2} =
+      Evaluator.evaluate(FailOnceWorkflow, activation([init_job(nil)]), state1)
+
+    assert {:successful, %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, fwe2}}]}} =
+             completion2.status
+
+    assert fwe1 == fwe2
+    assert state2.result == state1.result
+
+    # Direct proof the body ran exactly once, from the fixture's own counter.
+    assert Process.get({FailOnceWorkflow, :run_count}) == 1
+  end
+
+  test "fail/2 requires a binary type and message — a caller mistake parks like any other bug" do
+    {:ok, completion, state1} =
+      Evaluator.evaluate(BadFailArgWorkflow, activation([init_job(nil)]), fresh_state("r-fail-badarg"))
+
+    assert {:failed, %Failure{}} = completion.status
     refute match?({:completed, _}, state1.result)
     refute match?({:failed, _}, state1.result)
   end

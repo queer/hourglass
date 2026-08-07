@@ -66,13 +66,25 @@ end
 | `await_signal/1` | Block until a named signal arrives, return its payload |
 | `cancelled?/0` | Returns `true` if a cancellation request has been delivered |
 | `continue_as_new/1` | Emit `ContinueAsNewWorkflowExecution` — reset history and continue |
+| `fail/2,3` | Emit `FailWorkflowExecution` — end the run as genuinely, terminally failed |
 | `info/0` | Per-activation context (`run_id`, `task_queue`) |
 | `uuid/0` | Deterministic UUID from the SDK |
 | `random/1` | Deterministic random integer from the SDK |
 
 Workflow code is **deterministic by re-execution** — the evaluator replays the body from the top on each activation. Non-deterministic primitives (`:rand`, `System.monotonic_time`, `DateTime.utc_now`, `Process.sleep`, …) cause a **compile error** via a `@before_compile` lint and are also flagged by the packaged `Hourglass.Check.WorkflowDeterminism` Credo check. Use `uuid/0` / `random/1` / `sleep/1` instead.
 
-A workflow cannot author its own terminal failure — an uncaught exception **parks** the workflow as a workflow-task failure (the server retries; deploy a fix to resume). Business outcomes are return values. The event `[:hourglass, :workflow, :task_failed]` is emitted on each such park.
+An uncaught exception **parks** the workflow as a workflow-task failure (the server retries; deploy a fix to resume) — that is not a way to author a business failure, and stays true regardless of `fail/2,3` below. Business outcomes are ordinarily return values. The event `[:hourglass, :workflow, :task_failed]` is emitted on each park.
+
+To end a run as **genuinely, terminally failed** instead — the server marks it `Failed` and does not retry — call `fail/2,3` with a type and a message:
+
+```elixir
+case execute_activity(Parse, input) do
+  {:ok, result} -> {:ok, result}
+  {:error, reason} -> fail("ParseFailed", "could not parse document", details: %{reason: inspect(reason)})
+end
+```
+
+`fail/2,3` emits `FailWorkflowExecution` inside a *successful* activation completion — the same command oneof as `complete_workflow_execution` — never the workflow-task-failure status a raise produces. `:details` (optional, a JSON-encodable map) and `:non_retryable` (default `true`) round out the same `ApplicationFailureInfo` shape an activity failure carries. The event `[:hourglass, :workflow, :failed]` is emitted on each terminal failure. A redelivered activation after a run has failed re-emits the cached `FailWorkflowExecution` command rather than re-running the body — same handling as a redelivery after a normal completion.
 
 ### Signals, timers & cancellation
 
@@ -284,6 +296,7 @@ Hourglass emits the following `:telemetry` events:
 | `[:hourglass, :activity, :heartbeat_lost]` | *(reserved — not yet emitted)* |
 | `[:hourglass, :activity, :failure, :unclassified]` | *(reserved — not yet emitted)* |
 | `[:hourglass, :workflow, :task_failed]` | Workflow-task parked as a failure (uncaught exception; server will retry on next activation) |
+| `[:hourglass, :workflow, :failed]` | Workflow body called `fail/2,3`; terminal `FailWorkflowExecution`, not retried |
 | `[:hourglass, :workflow, :exception]` | Unhandled exception in workflow evaluation |
 | `[:hourglass, :workflow, :unhandled_job_variant]` | Unknown activation job variant |
 | `[:hourglass, :bridge_holder, :activity_result_unrouted]` | Activity result had no waiting caller |

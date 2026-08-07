@@ -27,6 +27,7 @@ defmodule Hourglass.Workflow.Evaluator do
 
   alias Coresdk.WorkflowCommands.CompleteWorkflowExecution
   alias Coresdk.WorkflowCommands.ContinueAsNewWorkflowExecution
+  alias Coresdk.WorkflowCommands.FailWorkflowExecution
   alias Coresdk.WorkflowCommands.ScheduleActivity
   alias Coresdk.WorkflowCommands.StartChildWorkflowExecution
   alias Coresdk.WorkflowCommands.StartTimer
@@ -57,13 +58,15 @@ defmodule Hourglass.Workflow.Evaluator do
     {ingest_status, ingested} = ingest_jobs(activation, prepared)
 
     cond do
-      # Once the workflow has previously completed, every subsequent
-      # activation re-emits the cached terminal completion —
-      # matching the GenServer-runner semantics. Temporal Server treats
-      # the duplicate as a no-op once it has already observed completion.
-      match?({:completed, _value}, prior_result) ->
-        {:completed, value} = prior_result
-        completion = build_success_completion(ingested, [build_complete_command(value)])
+      # Once the workflow has previously reached a terminal outcome —
+      # completed OR failed (via `fail/2,3`) — every subsequent activation
+      # re-emits the cached terminal completion rather than re-deciding.
+      # Matches GenServer-runner semantics for :completed; required for
+      # :failed too, so a redelivered activation cannot re-run the body and
+      # reach a *different* terminal outcome. Temporal Server treats the
+      # duplicate as a no-op once it has already observed the terminal state.
+      terminal_result?(prior_result) ->
+        completion = build_success_completion(ingested, [terminal_command(prior_result)])
         {:ok, completion, %{ingested | result: prior_result}}
 
       ingest_status == :evict ->
@@ -75,6 +78,14 @@ defmodule Hourglass.Workflow.Evaluator do
         run_body(workflow_module, ingested)
     end
   end
+
+  @spec terminal_result?(State.result()) :: boolean()
+  defp terminal_result?({:completed, _value}), do: true
+  defp terminal_result?({:failed, _failure_data}), do: true
+  defp terminal_result?(_other), do: false
+
+  defp terminal_command({:completed, value}), do: build_complete_command(value)
+  defp terminal_command({:failed, failure_data}), do: build_fail_command(failure_data)
 
   # ---------------------------------------------------------------------------
   # Per-activation reset (commands list emptied; resolvers/resolved_results
@@ -218,6 +229,12 @@ defmodule Hourglass.Workflow.Evaluator do
   # Step 2 — re-execute the workflow body inline.
   # ---------------------------------------------------------------------------
 
+  # Four distinct terminal/suspend outcomes, each caught by its own clause and
+  # dispatched to its own one-line finisher — the complexity here is the
+  # outcome count itself (suspend / continue-as-new / fail / park), not
+  # accidental structure to simplify away. Same shape as finish_suspended/1's
+  # disable below: real per-branch cost, not a code smell.
+  # credo:disable-for-next-line Credo.Check.Refactor.ABCSize
   defp run_body(workflow_module, %State{} = state) do
     CommandAccumulator.init()
     CommandAccumulator.mark_evaluator_active(state)
@@ -233,6 +250,9 @@ defmodule Hourglass.Workflow.Evaluator do
 
       :throw, {:hourglass_temporal_continue_as_new, dumped_input} ->
         finish_continue_as_new(state, dumped_input)
+
+      :throw, {:hourglass_temporal_fail, failure_data} ->
+        finish_failed(state, failure_data)
 
       kind, reason when kind in [:error, :exit] ->
         park_workflow(workflow_module, state, kind, reason, __STACKTRACE__)
@@ -281,6 +301,30 @@ defmodule Hourglass.Workflow.Evaluator do
   defp finish_completed(%State{} = state, return_value) do
     completion = build_success_completion(state, [build_complete_command(return_value)])
     {:ok, completion, %{state | result: {:completed, return_value}}}
+  end
+
+  # The workflow body ended its run via `fail/2,3`: unlike `park_workflow/5`,
+  # this builds a *successful* activation completion carrying
+  # `fail_workflow_execution` — the command lives in the same
+  # `WorkflowCommand.variant` oneof as `complete_workflow_execution`, so from
+  # the wire's perspective this is structurally identical to completing, just
+  # with a different command. The server reads FailWorkflowExecution as a
+  # terminal `WorkflowExecutionFailed`, not a retry signal.
+  defp finish_failed(%State{} = state, failure_data) do
+    :telemetry.execute(
+      [:hourglass, :workflow, :failed],
+      %{count: 1},
+      %{workflow_module: state.workflow_module, run_id: state.run_id, type: failure_data.type}
+    )
+
+    Logger.warning(
+      "[Hourglass.Workflow.Evaluator] workflow failed (terminal) " <>
+        "module=#{inspect(state.workflow_module)} run_id=#{state.run_id} " <>
+        "type=#{failure_data.type}: #{failure_data.message}"
+    )
+
+    completion = build_success_completion(state, [build_fail_command(failure_data)])
+    {:ok, completion, %{state | result: {:failed, failure_data}}}
   end
 
   defp finish_continue_as_new(%State{} = state, dumped_input) do
@@ -490,6 +534,17 @@ defmodule Hourglass.Workflow.Evaluator do
       variant:
         {:complete_workflow_execution,
          %CompleteWorkflowExecution{result: encode_result_payload(return_value)}}
+    }
+  end
+
+  # Same shape ActivityRunner uses for an activity's own terminal failure —
+  # see `Hourglass.Failure` — so a workflow's `fail/2,3` and an activity's
+  # classified failure encode identically on the wire.
+  defp build_fail_command(failure_data) do
+    %WorkflowCommand{
+      variant:
+        {:fail_workflow_execution,
+         %FailWorkflowExecution{failure: Hourglass.Failure.application_failure(failure_data)}}
     }
   end
 

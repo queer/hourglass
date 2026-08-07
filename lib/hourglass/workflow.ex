@@ -92,6 +92,8 @@ defmodule Hourglass.Workflow do
           await_signal: 2,
           cancelled?: 0,
           continue_as_new: 1,
+          fail: 2,
+          fail: 3,
           info: 0,
           uuid: 0,
           random: 1,
@@ -422,7 +424,9 @@ defmodule Hourglass.Workflow do
 
   Note a raise inside a workflow body is a **workflow-task failure** (the run
   parks and the server retries the task) — it is not a way to author a business
-  failure. Return `execute_child/3`'s `{:error, _}` for that.
+  failure. Return `execute_child/3`'s `{:error, _}` and decide what to do with
+  it instead: retry your own logic, complete with a value describing the
+  outcome, or call `fail/2,3` to end the run as genuinely failed.
   """
   @spec execute_child!(module(), term()) :: term()
   @spec execute_child!(module(), term(), keyword()) :: term()
@@ -600,6 +604,56 @@ defmodule Hourglass.Workflow do
 
     dumped = Hourglass.Codec.dump(state.workflow_module.__workflow_input_type__(), input)
     throw({:hourglass_temporal_continue_as_new, dumped})
+  end
+
+  @doc """
+  Terminal: ends the workflow run as genuinely failed. Emits Temporal's own
+  `FailWorkflowExecution` command — inside a *successful* activation
+  completion, alongside `complete_workflow_execution` in the same command
+  oneof — so the server marks the run `Failed` and does not retry it. This is
+  the deliberate counterpart to an uncaught raise: a raise still **parks**
+  the workflow as a workflow-task failure (the server redelivers the task
+  forever; nothing here changes that path). Call `fail/2,3` only when you
+  mean the run to end, terminally, right now.
+
+  `type` and `message` are both required — a caller needs something to
+  branch on (`type`) as well as something to read (`message`); pass only a
+  message and there is nothing structured left for a caller to act on.
+  `:details` (a JSON-encodable map, default `nil`) carries structured
+  context. `:non_retryable` (default `true`) is meaningful only if the
+  workflow was started with a Temporal-level retry policy — pass `false` to
+  let such a policy start a fresh run.
+
+  Like every workflow primitive, what decides a failure must be derivable
+  from workflow-visible state (activity results, signals, input) rather than
+  from a wall clock or other hidden input — the same determinism the
+  compile-time lint and `Hourglass.Check.WorkflowDeterminism` already
+  enforce elsewhere in the body. `fail/2,3` does not itself consult any
+  non-deterministic source; it only packages the arguments its caller
+  computed.
+
+      case execute_activity(Parse, input) do
+        {:ok, result} -> {:ok, result}
+        {:error, reason} -> fail("ParseFailed", "could not parse document", details: %{reason: inspect(reason)})
+      end
+
+  Raises if called outside a workflow evaluator.
+  """
+  @spec fail(String.t(), String.t()) :: no_return()
+  @spec fail(String.t(), String.t(), keyword()) :: no_return()
+  def fail(type, message, opts \\ [])
+      when is_binary(type) and is_binary(message) and is_list(opts) do
+    CommandAccumulator.evaluator_state() ||
+      raise "Hourglass.Workflow.fail/2,3 called outside a workflow evaluator"
+
+    failure_data = %{
+      type: type,
+      message: message,
+      details: Keyword.get(opts, :details),
+      non_retryable: Keyword.get(opts, :non_retryable, true)
+    }
+
+    throw({:hourglass_temporal_fail, failure_data})
   end
 
   @spec uuid() :: String.t()

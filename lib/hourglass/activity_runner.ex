@@ -52,6 +52,7 @@ defmodule Hourglass.ActivityRunner do
   alias Hourglass.Activity.Info
   alias Hourglass.Activity.RetryClassifier
   alias Hourglass.BridgeHolder
+  alias Hourglass.Failure
 
   require Logger
 
@@ -471,20 +472,7 @@ defmodule Hourglass.ActivityRunner do
   end
 
   defp encode_completion(activity_task, {:failed, failure_data}) do
-    %{type: type, message: message, details: details, non_retryable: non_retryable} =
-      failure_data
-
-    application_info = %Temporal.Api.Failure.V1.ApplicationFailureInfo{
-      type: type,
-      non_retryable: non_retryable,
-      details: encode_details(details)
-    }
-
-    failure = %Temporal.Api.Failure.V1.Failure{
-      message: message,
-      source: type,
-      failure_info: {:application_failure_info, application_info}
-    }
+    failure = Failure.application_failure(failure_data)
 
     completion = %Coresdk.ActivityTaskCompletion{
       task_token: activity_task.task_token,
@@ -494,27 +482,6 @@ defmodule Hourglass.ActivityRunner do
     }
 
     Protobuf.encode(completion)
-  end
-
-  # `details` is `ApplicationFailureInfo.details :: Payloads`. We encode a
-  # non-nil details map as a single json/plain Payload so downstream consumers
-  # (history inspectors, replay tooling) can decode it. Nil → no Payloads at all.
-  # Unencodable maps fall back to inspect to preserve at least a textual trail.
-  defp encode_details(nil), do: nil
-
-  defp encode_details(details) when is_map(details) do
-    data =
-      case Jason.encode(details) do
-        {:ok, json} -> json
-        {:error, _reason} -> Jason.encode!(%{inspect: inspect(details)})
-      end
-
-    payload = %Temporal.Api.Common.V1.Payload{
-      metadata: %{"encoding" => "json/plain"},
-      data: data
-    }
-
-    %Temporal.Api.Common.V1.Payloads{payloads: [payload]}
   end
 
   # Emitted when Temporal hands the worker an activity_type that cannot be
