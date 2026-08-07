@@ -127,8 +127,14 @@ defmodule Hourglass.ActivityTest do
 
     test "heartbeat/0 inside a dispatch emits telemetry and does not crash when the holder is absent" do
       Process.put({Hourglass.Activity, :info}, %Hourglass.Activity.Info{
-        workflow_id: "w", run_id: "r", activity_id: "a", attempt: 1, task_token: "TOK", task_queue: "tq-1"
+        workflow_id: "w",
+        run_id: "r",
+        activity_id: "a",
+        attempt: 1,
+        task_token: "TOK",
+        task_queue: "tq-1"
       })
+
       attach_hb()
       assert Hourglass.Activity.heartbeat() == :ok
       assert_receive {:hb, %{task_queue: "tq-1"}}
@@ -138,8 +144,21 @@ defmodule Hourglass.ActivityTest do
     defp attach_hb do
       ref = {__MODULE__, make_ref()}
       pid = self()
-      :telemetry.attach(ref, [:hourglass, :activity, :heartbeat],
-        fn _e, _m, meta, _c -> send(pid, {:hb, meta}) end, nil)
+
+      :telemetry.attach(
+        ref,
+        [:hourglass, :activity, :heartbeat],
+        # Handlers run synchronously in the EMITTING process, so `self()` here
+        # is whoever heartbeated. Forward only what this test emitted inline: a
+        # telemetry handler is attached VM-wide and this case is `async: true`,
+        # so in the integration lane the `:temporal` heartbeat tests — real
+        # workers heartbeating on their own queues — are delivered here too.
+        # Unfiltered, that fails `refute_receive` on a sibling's traffic, and
+        # lets the positive case pass on an event this test never caused.
+        fn _e, _m, meta, _c -> if self() == pid, do: send(pid, {:hb, meta}) end,
+        nil
+      )
+
       on_exit(fn -> :telemetry.detach(ref) end)
       ref
     end
