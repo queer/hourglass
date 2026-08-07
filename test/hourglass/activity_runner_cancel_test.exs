@@ -11,8 +11,14 @@ defmodule Hourglass.ActivityRunnerCancelTest do
 
     handler = "cancel-recv-#{System.unique_integer([:positive])}"
     me = self()
-    :telemetry.attach(handler, [:hourglass, :activity, :cancel_received],
-      fn _e, _m, meta, _ -> send(me, {:cancel_received, meta}) end, nil)
+
+    :telemetry.attach(
+      handler,
+      [:hourglass, :activity, :cancel_received],
+      fn _e, _m, meta, _config -> send(me, {:cancel_received, meta}) end,
+      nil
+    )
+
     on_exit(fn -> :telemetry.detach(handler) end)
 
     # complete_fn is injected so we don't need a live bridge.
@@ -25,24 +31,29 @@ defmodule Hourglass.ActivityRunnerCancelTest do
   defmodule CancelRaisingActivity do
     use Hourglass.Activity, input: :map, output: :map
     @impl Hourglass.Activity.Behaviour
-    def execute(_), do: raise(Hourglass.Activity.Cancelled, reason: :cancelled)
+    def execute(_input), do: raise(Hourglass.Activity.Cancelled, reason: :cancelled)
   end
 
   defmodule TrivialActivity do
     use Hourglass.Activity, input: :map, output: :map
     @impl Hourglass.Activity.Behaviour
-    def execute(_), do: %{"ok" => true}
+    def execute(_input), do: %{"ok" => true}
   end
 
   defp start_task(token, activity_module) do
     %{
-      variant: {:start, %Coresdk.ActivityTask.Start{
-        activity_type: Atom.to_string(activity_module),
-        workflow_execution: %Temporal.Api.Common.V1.WorkflowExecution{workflow_id: "w", run_id: "r"},
-        activity_id: "a",
-        attempt: 1,
-        input: [%{data: "{}", metadata: %{"encoding" => "json/plain"}}]
-      }},
+      variant:
+        {:start,
+         %Coresdk.ActivityTask.Start{
+           activity_type: Atom.to_string(activity_module),
+           workflow_execution: %Temporal.Api.Common.V1.WorkflowExecution{
+             workflow_id: "w",
+             run_id: "r"
+           },
+           activity_id: "a",
+           attempt: 1,
+           input: [%{data: "{}", metadata: %{"encoding" => "json/plain"}}]
+         }},
       task_token: token
     }
   end
@@ -50,18 +61,29 @@ defmodule Hourglass.ActivityRunnerCancelTest do
   test "an activity that raises Cancelled produces a Cancellation completion" do
     t = tok()
     me = self()
-    assert :ok = ActivityRunner.run(start_task(t, CancelRaisingActivity), "q",
-      fn _q, bytes -> send(me, {:bytes, bytes}); :ok end)
+
+    capture = fn _q, bytes ->
+      send(me, {:bytes, bytes})
+      :ok
+    end
+
+    task = start_task(t, CancelRaisingActivity)
+    assert :ok = ActivityRunner.run(task, "q", capture)
 
     assert_received {:bytes, bytes}
     completion = Coresdk.ActivityTaskCompletion.decode(bytes)
-    assert {:cancelled, _} = completion.result.status
+    assert {:cancelled, _details} = completion.result.status
   end
 
   test "Start completion clears the token from the registry" do
     t = tok()
     CancelRegistry.mark(t, :cancelled)
-    assert :ok = ActivityRunner.run(start_task(t, TrivialActivity), "q", fn _q, _bytes -> :ok end)
+
+    assert :ok =
+             t
+             |> start_task(TrivialActivity)
+             |> ActivityRunner.run("q", fn _q, _bytes -> :ok end)
+
     assert CancelRegistry.cancelled?(t) == nil
   end
 end

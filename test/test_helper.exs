@@ -61,10 +61,11 @@ if temporal_included? do
   # deadlock against a pool fully occupied by polls.
   dirty_io = :erlang.system_info(:dirty_io_schedulers)
   supported_workers = max(1, div(dirty_io, 2) - 1)
-  requested = ExUnit.configuration() |> Keyword.get(:max_cases, 1)
+  ex_unit_config = ExUnit.configuration()
+  requested = Keyword.get(ex_unit_config, :max_cases, 1)
 
   if requested > supported_workers do
-    IO.puts(
+    Mix.shell().info(
       "[hourglass] capping max_cases #{requested} -> #{supported_workers}: each Worker holds 2 " <>
         "blocking dirty-IO long-polls and this VM has only #{dirty_io} dirty-IO schedulers. " <>
         "Run with ERL_FLAGS=\"+SDio 128\" to lift the cap and run the suite at full width."

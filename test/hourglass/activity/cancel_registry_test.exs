@@ -32,7 +32,7 @@ defmodule Hourglass.Activity.CancelRegistryTest do
     assert CancelRegistry.cancelled?(t) == :timed_out
     send(Process.whereis(CancelRegistry), :sweep)
     # Give the GenServer a beat to process the sweep message.
-    _ = :sys.get_state(CancelRegistry)
+    _state = :sys.get_state(CancelRegistry)
     assert CancelRegistry.cancelled?(t) == nil
   end
 end

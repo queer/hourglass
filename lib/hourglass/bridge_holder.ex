@@ -513,7 +513,11 @@ defmodule Hourglass.BridgeHolder do
               :telemetry.execute(
                 [:hourglass, :worker, :registration_failed],
                 %{count: 1},
-                %{failure_class: :nif_reload, task_queue: task_queue, detail: Exception.message(err)}
+                %{
+                  failure_class: :nif_reload,
+                  task_queue: task_queue,
+                  detail: Exception.message(err)
+                }
               )
 
               signal_nif_reload!("worker_record_activity_heartbeat")

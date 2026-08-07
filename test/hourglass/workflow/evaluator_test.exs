@@ -167,7 +167,8 @@ defmodule Hourglass.Workflow.EvaluatorTest do
     use Hourglass.Workflow
 
     @impl Hourglass.Workflow.Behaviour
-    def run(_input), do: fail("Transient", "let a workflow-level retry policy retry this", non_retryable: false)
+    def run(_input),
+      do: fail("Transient", "let a workflow-level retry policy retry this", non_retryable: false)
   end
 
   # Proves a redelivered activation does not re-execute the body: run/1
@@ -511,14 +512,25 @@ defmodule Hourglass.Workflow.EvaluatorTest do
     {:ok, completion, state1} =
       Evaluator.evaluate(FailNoOptsWorkflow, activation([init_job(nil)]), state0)
 
-    assert {:successful, %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, fwe}}]}} =
+    assert {:successful,
+            %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, fwe}}]}} =
              completion.status
 
-    assert {:application_failure_info, %ApplicationFailureInfo{} = info} = fwe.failure.failure_info
+    assert {:application_failure_info, %ApplicationFailureInfo{} = info} =
+             fwe.failure.failure_info
+
     assert info.type == "Boom"
     assert info.non_retryable == true
     assert info.details == nil
-    assert state1.result == {:failed, %{type: "Boom", message: "no details or overrides supplied", details: nil, non_retryable: true}}
+
+    assert state1.result ==
+             {:failed,
+              %{
+                type: "Boom",
+                message: "no details or overrides supplied",
+                details: nil,
+                non_retryable: true
+              }}
   end
 
   test "fail/3 :non_retryable override reaches ApplicationFailureInfo.non_retryable" do
@@ -527,10 +539,12 @@ defmodule Hourglass.Workflow.EvaluatorTest do
     {:ok, completion, _state1} =
       Evaluator.evaluate(FailRetryableWorkflow, activation([init_job(nil)]), state0)
 
-    assert {:successful, %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, fwe}}]}} =
+    assert {:successful,
+            %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, fwe}}]}} =
              completion.status
 
-    assert {:application_failure_info, %ApplicationFailureInfo{non_retryable: false}} = fwe.failure.failure_info
+    assert {:application_failure_info, %ApplicationFailureInfo{non_retryable: false}} =
+             fwe.failure.failure_info
   end
 
   test "fail/2's outcome is structurally distinct from an uncaught raise's park — same activation shape, different wire result" do
@@ -539,13 +553,22 @@ defmodule Hourglass.Workflow.EvaluatorTest do
     # diverge on protocol (status variant / command variant), not merely that
     # "the workflow stopped" in both cases.
     {:ok, fail_completion, fail_state} =
-      Evaluator.evaluate(FailingWorkflow, activation([init_job(nil)]), fresh_state("r-distinct-fail"))
+      Evaluator.evaluate(
+        FailingWorkflow,
+        activation([init_job(nil)]),
+        fresh_state("r-distinct-fail")
+      )
 
     {:ok, raise_completion, raise_state} =
-      Evaluator.evaluate(RaiseInBody, activation([init_job(nil)]), fresh_state("r-distinct-raise"))
+      Evaluator.evaluate(
+        RaiseInBody,
+        activation([init_job(nil)]),
+        fresh_state("r-distinct-raise")
+      )
 
     # fail/2: successful completion, fail_workflow_execution command, result cached as {:failed, _}.
-    assert {:successful, %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, _fwe}}]}} =
+    assert {:successful,
+            %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, _fwe}}]}} =
              fail_completion.status
 
     assert match?({:failed, _}, fail_state.result)
@@ -566,7 +589,8 @@ defmodule Hourglass.Workflow.EvaluatorTest do
     {:ok, completion1, state1} =
       Evaluator.evaluate(FailOnceWorkflow, activation([init_job(nil)]), state0)
 
-    assert {:successful, %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, fwe1}}]}} =
+    assert {:successful,
+            %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, fwe1}}]}} =
              completion1.status
 
     assert match?({:failed, _}, state1.result)
@@ -578,7 +602,8 @@ defmodule Hourglass.Workflow.EvaluatorTest do
     {:ok, completion2, state2} =
       Evaluator.evaluate(FailOnceWorkflow, activation([init_job(nil)]), state1)
 
-    assert {:successful, %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, fwe2}}]}} =
+    assert {:successful,
+            %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, fwe2}}]}} =
              completion2.status
 
     assert fwe1 == fwe2
@@ -590,7 +615,11 @@ defmodule Hourglass.Workflow.EvaluatorTest do
 
   test "fail/2 requires a binary type and message — a caller mistake parks like any other bug" do
     {:ok, completion, state1} =
-      Evaluator.evaluate(BadFailArgWorkflow, activation([init_job(nil)]), fresh_state("r-fail-badarg"))
+      Evaluator.evaluate(
+        BadFailArgWorkflow,
+        activation([init_job(nil)]),
+        fresh_state("r-fail-badarg")
+      )
 
     assert {:failed, %Failure{}} = completion.status
     refute match?({:completed, _}, state1.result)

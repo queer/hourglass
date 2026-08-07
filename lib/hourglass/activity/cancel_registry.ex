@@ -35,7 +35,7 @@ defmodule Hourglass.Activity.CancelRegistry do
   def cancelled?(task_token) when is_binary(task_token) do
     case :ets.lookup(@table, task_token) do
       [{^task_token, reason, _ts}] -> reason
-      _ -> nil
+      _no_entry -> nil
     end
   rescue
     ArgumentError -> nil
@@ -49,14 +49,14 @@ defmodule Hourglass.Activity.CancelRegistry do
     ArgumentError -> :ok
   end
 
-  @impl true
+  @impl GenServer
   def init(_opts) do
     :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
     schedule_sweep()
     {:ok, %{}}
   end
 
-  @impl true
+  @impl GenServer
   def handle_info(:sweep, state) do
     cutoff = now_ms() - @entry_ttl_ms
     :ets.select_delete(@table, [{{:_, :_, :"$1"}, [{:<, :"$1", cutoff}], [true]}])

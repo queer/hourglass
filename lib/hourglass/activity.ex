@@ -162,21 +162,7 @@ defmodule Hourglass.Activity do
   Liveness only: no `details` payload (Hourglass does not surface heartbeat details on retry).
   """
   @spec heartbeat() :: :ok | :cancel
-  def heartbeat do
-    case try_info() do
-      %Hourglass.Activity.Info{task_token: token, task_queue: q, workflow_id: wid, run_id: rid, activity_id: aid}
-      when is_binary(token) and token != "" ->
-        :telemetry.execute([:hourglass, :activity, :heartbeat], %{count: 1}, %{
-          task_queue: q, workflow_id: wid, run_id: rid, activity_id: aid
-        })
-        hb = %Coresdk.ActivityHeartbeat{task_token: token, details: []}
-        _ = safe_record(q, Protobuf.encode(hb))
-        if Hourglass.Activity.CancelRegistry.cancelled?(token), do: :cancel, else: :ok
-
-      _ ->
-        :ok
-    end
-  end
+  defdelegate heartbeat, to: Hourglass.Activity.Heartbeat
 
   @doc """
   Like `heartbeat/0`, but RAISES `Hourglass.Activity.Cancelled` when the activity has been
@@ -185,18 +171,7 @@ defmodule Hourglass.Activity do
   heartbeat; the body needs no other change.
   """
   @spec heartbeat!() :: :ok
-  def heartbeat! do
-    case heartbeat() do
-      :cancel -> raise(Hourglass.Activity.Cancelled, reason: :cancel_requested)
-      :ok -> :ok
-    end
-  end
-
-  defp safe_record(task_queue, bin) do
-    Hourglass.BridgeHolder.record_heartbeat(task_queue, bin)
-  catch
-    :exit, _ -> {:error, :holder_unavailable}
-  end
+  defdelegate heartbeat!, to: Hourglass.Activity.Heartbeat
 
   defmacro __using__(opts) do
     input_raw = Keyword.get(opts, :input, :map)

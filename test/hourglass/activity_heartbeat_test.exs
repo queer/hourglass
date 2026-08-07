@@ -58,7 +58,7 @@ defmodule Hourglass.ActivityHeartbeatTest do
     def execute(_args) do
       # ~5 s total, heartbeating every ~500 ms (10×). Each heartbeat resets the
       # 2 s heartbeat_timeout at Temporal, so the attempt outlives the window.
-      Enum.each(1..10, fn _ ->
+      Enum.each(1..10, fn _i ->
         Process.sleep(500)
         :ok = Hourglass.Activity.heartbeat()
       end)

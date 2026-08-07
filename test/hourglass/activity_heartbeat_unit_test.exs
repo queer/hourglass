@@ -5,8 +5,13 @@ defmodule Hourglass.ActivityHeartbeatUnitTest do
 
   defp put_info(token) do
     Process.put({Hourglass.Activity, :info}, %Hourglass.Activity.Info{
-      workflow_id: "w", run_id: "r", activity_id: "a", attempt: 1,
-      task_token: token, task_queue: "q"})
+      workflow_id: "w",
+      run_id: "r",
+      activity_id: "a",
+      attempt: 1,
+      task_token: token,
+      task_queue: "q"
+    })
   end
 
   setup do

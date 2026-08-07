@@ -31,7 +31,7 @@ defmodule Hourglass.ActivityCancellationTest do
   defmodule Marker do
     use Agent
 
-    def start_link(_), do: Agent.start_link(fn -> 0 end, name: __MODULE__)
+    def start_link(_opts), do: Agent.start_link(fn -> 0 end, name: __MODULE__)
     def bump, do: Agent.update(__MODULE__, &(&1 + 1))
     def count, do: Agent.get(__MODULE__, & &1)
   end
@@ -46,7 +46,7 @@ defmodule Hourglass.ActivityCancellationTest do
     def execute(_args) do
       # 1.5 s tick > 1 s heartbeat_timeout → the attempt heartbeat-times-out, Core delivers a
       # Cancel task, and the next heartbeat!/0 raises Cancelled → the loop stops.
-      Enum.each(1..200, fn _ ->
+      Enum.each(1..200, fn _i ->
         Process.sleep(1_500)
         Hourglass.ActivityCancellationTest.Marker.bump()
         Hourglass.Activity.heartbeat!()
@@ -69,7 +69,7 @@ defmodule Hourglass.ActivityCancellationTest do
   end
 
   test "a heartbeat-timed-out activity is cancelled and stops (no zombie)" do
-    {:ok, _} = start_supervised(Marker)
+    {:ok, _pid} = start_supervised(Marker)
 
     # Capture the cancel_received telemetry so we can tell "Core never delivered a Cancel" apart
     # from "delivered but the registry keying missed".
@@ -79,21 +79,22 @@ defmodule Hourglass.ActivityCancellationTest do
     :telemetry.attach(
       handler,
       [:hourglass, :activity, :cancel_received],
-      fn _e, _m, meta, _ -> send(me, {:cancel_received, meta}) end,
+      fn _e, _m, meta, _config -> send(me, {:cancel_received, meta}) end,
       nil
     )
 
     on_exit(fn -> :telemetry.detach(handler) end)
 
     queue = "cancel-#{System.unique_integer([:positive])}"
-    {:ok, _} = start_supervised({Hourglass.Worker, task_queue: queue})
+    {:ok, _worker} = start_supervised({Hourglass.Worker, task_queue: queue})
     workflow_id = "cancel:#{UUIDv7.generate()}"
 
     {:ok, %WorkflowHandle{}} =
       Hourglass.start(SlowHeartbeatWorkflow, %{}, id: workflow_id, task_queue: queue)
 
     # Core delivered a Cancel task for the timed-out attempt (proves the trigger fired at all).
-    assert_receive {:cancel_received, _}, 30_000,
+    assert_receive {:cancel_received, _},
+                   30_000,
                    "Core never delivered a Cancel activity task for the heartbeat-timed-out attempt"
 
     # Give the activity a couple more tick intervals to observe the mark and unwind.
