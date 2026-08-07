@@ -92,7 +92,69 @@ defmodule Hourglass.MixProject do
       #   ERL_FLAGS="+SDio 128" mix test.integration
       "test.integration": [
         "test --include temporal --include integration"
-      ]
+      ],
+      # Publish through this, never `mix hex.publish` directly. A version
+      # already on Hex is immutable after an hour — so republishing one is
+      # either rejected late, after docs have been built and a tarball
+      # uploaded, or, inside that window, SILENTLY REPLACES a release someone
+      # may already have resolved and locked. Forgetting the version bump is
+      # the ordinary way to arrive there, and it is not a mistake this repo
+      # should rely on catching by eye.
+      publish: [&refuse_republish/1, "hex.publish"]
     ]
+  end
+
+  defp refuse_republish(_args) do
+    version = Mix.Project.config()[:version]
+
+    case published_versions() do
+      {:ok, versions} ->
+        if version in versions do
+          Mix.raise("""
+          Refusing to publish: hourglass #{version} is already on Hex.
+
+          Published: #{Enum.join(versions, ", ")}
+
+          Bump `version:` in mix.exs (and the install snippet in README.md) \
+          before publishing.\
+          """)
+        end
+
+        Mix.shell().info("[hourglass] #{version} is not on Hex — publishing.")
+
+      {:error, reason} ->
+        # Fail closed. A publish that cannot establish what is already
+        # published is exactly the one that must not proceed unattended.
+        Mix.raise("""
+        Refusing to publish: could not read hourglass's published versions \
+        from Hex (#{reason}).
+
+        Check the version by hand at https://hex.pm/packages/hourglass and \
+        publish with `mix hex.publish` if #{version} is genuinely new.\
+        """)
+    end
+  end
+
+  defp published_versions do
+    {:ok, _} = Application.ensure_all_started([:inets, :ssl])
+    url = ~c"https://hex.pm/api/packages/hourglass"
+    headers = [{~c"user-agent", ~c"hourglass-publish-preflight"}]
+
+    case :httpc.request(:get, {url, headers}, [{:timeout, 15_000}], body_format: :binary) do
+      {:ok, {{_, 200, _}, _, body}} ->
+        # OTP's own JSON decoder, not Jason: an alias function runs before deps
+        # are loaded, so `Jason` is genuinely unavailable here.
+        {:ok, body |> :json.decode() |> Map.fetch!("releases") |> Enum.map(& &1["version"])}
+
+      {:ok, {{_, 404, _}, _, _}} ->
+        # Never published at all: nothing to collide with.
+        {:ok, []}
+
+      {:ok, {{_, status, _}, _, _}} ->
+        {:error, "HTTP #{status}"}
+
+      {:error, reason} ->
+        {:error, inspect(reason)}
+    end
   end
 end
