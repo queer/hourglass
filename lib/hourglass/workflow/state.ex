@@ -18,6 +18,18 @@ defmodule Hourglass.Workflow.State do
       command but resolves **twice** (start, then result); the result reuses the
       `resolved_results` slot for its seq, so the start phase needs its own map.
       `{:started, run_id} | {:start_failed, cause} | {:start_cancelled, failure}`.
+    * `notified_patches` — the set of patch ids **this execution's own
+      history** records, learned from `notify_has_patch` activation jobs.
+      Core sends those pre-emptively when the history it is replaying
+      contains a patch marker, and it sends each one on the activation that
+      replays the marker's own WFT — never again — so the set must
+      ACCUMULATE across activations rather than be rebuilt from the latest
+      one. It lives here, per run, rather than anywhere process- or
+      code-scoped: two executions of the same workflow on the same worker at
+      the same moment answer differently precisely because their histories
+      differ. A map keyed by patch id rather than a `MapSet`, because
+      `MapSet.t/1` is opaque and naming it in this struct's `t()` makes every
+      caller that merely passes a `State` a Dialyzer `call_without_opaque`.
     * `input` — the decoded `initialize_workflow` first argument; set once.
     * `workflow_module` — the workflow module bound to this run (e.g.
       `MyApp.Workflows.IngestSource`). Set by
@@ -73,7 +85,8 @@ defmodule Hourglass.Workflow.State do
           result: result(),
           child_count: non_neg_integer(),
           signals: %{optional(String.t()) => [term()]},
-          cancel_requested: boolean()
+          cancel_requested: boolean(),
+          notified_patches: %{optional(String.t()) => true}
         }
 
   defstruct run_id: nil,
@@ -89,7 +102,8 @@ defmodule Hourglass.Workflow.State do
             result: nil,
             child_count: 0,
             signals: %{},
-            cancel_requested: false
+            cancel_requested: false,
+            notified_patches: %{}
 
   @doc """
   Build the initial state for a fresh workflow (no prior activations).

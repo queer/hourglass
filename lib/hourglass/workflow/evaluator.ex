@@ -202,6 +202,29 @@ defmodule Hourglass.Workflow.Evaluator do
     do_ingest(rest, %{state | cancel_requested: true}, status)
   end
 
+  # Core sends `notify_has_patch` pre-emptively — with no command of ours
+  # preceding it — whenever the history it is replaying records a patch
+  # marker, and it sends each id once, on the activation that replays that
+  # marker's own WFT. So this ACCUMULATES into the run's state: an activation
+  # carrying no such job must not shrink what earlier ones established.
+  defp do_ingest([%{variant: {:notify_has_patch, %{patch_id: patch_id}}} | rest], state, status)
+       when is_binary(patch_id) and patch_id != "" do
+    do_ingest(
+      rest,
+      %{state | notified_patches: Map.put(state.notified_patches, patch_id, true)},
+      status
+    )
+  end
+
+  # A notify job we recognise but cannot read a patch id out of — an empty id,
+  # or a payload shape this SDK does not know. Recording `""` would make a
+  # `patched?("")` call answer true for a patch nobody ever declared, so the
+  # job is dropped. It is deliberately NOT left to the unhandled-variant
+  # clause below, which would report a variant we do in fact handle.
+  defp do_ingest([%{variant: {:notify_has_patch, _payload}} | rest], state, status) do
+    do_ingest(rest, state, status)
+  end
+
   defp do_ingest([%{variant: {variant_name, _payload}} | rest], state, status) do
     # Unsupported job variants are no-ops at runtime. Emit telemetry +
     # info-log so operators can see when Core sends a variant we don't

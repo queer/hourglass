@@ -294,6 +294,25 @@ defmodule Hourglass.Workflow do
     state.cancel_requested
   end
 
+  # The set of patch ids THIS EXECUTION'S OWN HISTORY records, as Core has
+  # reported them via `notify_has_patch` activation jobs.
+  #
+  # Internal: the answer a patch primitive is built from, not a workflow-facing
+  # API. It is a fact about one execution's history — two runs of the same
+  # workflow on the same worker at the same instant hold different sets — so
+  # nothing here consults the deployed code, a module attribute or config.
+  #
+  # Raises if called outside a workflow evaluator.
+  @doc false
+  @spec __notified_patches__() :: %{optional(String.t()) => true}
+  def __notified_patches__ do
+    state =
+      CommandAccumulator.evaluator_state() ||
+        raise "Hourglass.Workflow.__notified_patches__/0 called outside a workflow evaluator"
+
+    state.notified_patches
+  end
+
   @doc false
   @spec __duration_ms__(non_neg_integer() | {atom(), non_neg_integer()}) :: non_neg_integer()
   def __duration_ms__(ms) when is_integer(ms) and ms >= 0, do: ms
