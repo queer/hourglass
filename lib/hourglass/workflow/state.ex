@@ -30,6 +30,14 @@ defmodule Hourglass.Workflow.State do
       differ. A map keyed by patch id rather than a `MapSet`, because
       `MapSet.t/1` is opaque and naming it in this struct's `t()` makes every
       caller that merely passes a `State` a Dialyzer `call_without_opaque`.
+    * `patch_answers` — `%{patch_id => boolean}`, what
+      `Hourglass.Workflow.patched?/1` has already answered for this run. A
+      patch decision is made ONCE per execution and then held: the body
+      re-executes from the top on every activation, so an answer recomputed
+      each time would flip from `false` to `true` at the moment the run
+      caught up with its history — taking the new branch under commands
+      already issued by the old one, which is the nondeterminism the patch
+      exists to prevent.
     * `input` — the decoded `initialize_workflow` first argument; set once.
     * `workflow_module` — the workflow module bound to this run (e.g.
       `MyApp.Workflows.IngestSource`). Set by
@@ -49,6 +57,11 @@ defmodule Hourglass.Workflow.State do
     * `child_count` — counter that replaces the `expected_children` MapSet.
       The pure-function evaluator runs `async/1` inline, so it has no child
       pids to track; the counter only exists for diagnostics.
+    * `replaying` — the activation's own `is_replaying` flag, as Core reports
+      it. Core derives it from where in this execution's history the
+      activation sits, so it is a fact about the run rather than about the
+      deployed code. Only the patch primitive reads it, and only for a patch
+      id it has never answered before.
   """
 
   alias Coresdk.WorkflowCommands.WorkflowCommand
@@ -66,6 +79,7 @@ defmodule Hourglass.Workflow.State do
           | {:start_timer, %{duration_ms: non_neg_integer()}}
           | {:uuid, map()}
           | {:random, %{max: pos_integer()}}
+          | {:set_patch_marker, %{patch_id: String.t()}}
 
   @type command_entry :: {command_id(), command_term()}
 
@@ -86,7 +100,9 @@ defmodule Hourglass.Workflow.State do
           child_count: non_neg_integer(),
           signals: %{optional(String.t()) => [term()]},
           cancel_requested: boolean(),
-          notified_patches: %{optional(String.t()) => true}
+          notified_patches: %{optional(String.t()) => true},
+          patch_answers: %{optional(String.t()) => boolean()},
+          replaying: boolean()
         }
 
   defstruct run_id: nil,
@@ -103,7 +119,9 @@ defmodule Hourglass.Workflow.State do
             child_count: 0,
             signals: %{},
             cancel_requested: false,
-            notified_patches: %{}
+            notified_patches: %{},
+            patch_answers: %{},
+            replaying: false
 
   @doc """
   Build the initial state for a fresh workflow (no prior activations).

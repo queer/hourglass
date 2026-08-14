@@ -68,6 +68,7 @@ end
 | `continue_as_new/1` | Emit `ContinueAsNewWorkflowExecution` — reset history and continue |
 | `fail/2,3` | Emit `FailWorkflowExecution` — end the run as genuinely, terminally failed |
 | `info/0` | Per-activation context (`run_id`, `task_queue`) |
+| `patched?/1` | Ask whether this execution's history records a patch — change a body without wedging in-flight runs |
 | `uuid/0` | Deterministic UUID from the SDK |
 | `random/1` | Deterministic random integer from the SDK |
 
@@ -85,6 +86,43 @@ end
 ```
 
 `fail/2,3` emits `FailWorkflowExecution` inside a *successful* activation completion — the same command oneof as `complete_workflow_execution` — never the workflow-task-failure status a raise produces. `:details` (optional, a JSON-encodable map) and `:non_retryable` (default `true`) round out the same `ApplicationFailureInfo` shape an activity failure carries. The event `[:hourglass, :workflow, :failed]` is emitted on each terminal failure. A redelivered activation after a run has failed re-emits the cached `FailWorkflowExecution` command rather than re-running the body — same handling as a redelivery after a normal completion.
+
+### Changing a workflow body that has runs in flight
+
+Editing a workflow body is not free: an execution started under the old body
+replays its history against the new one, finds a command the history does not
+have, and fails the workflow task with `[TMPRL1100] Nondeterminism error`.
+Replay is deterministic, so it fails identically forever — and the wedged
+execution still reports `Running`, so nothing downstream notices.
+
+`patched?/1` is the way through. Guard the changed region with it:
+
+```elixir
+def run(input) do
+  if patched?(:validate_before_write) do
+    execute_activity!(MyApp.Activities.Validate, input, start_to_close_timeout: 30_000)
+  end
+
+  execute_activity!(MyApp.Activities.Write, input, start_to_close_timeout: 30_000)
+end
+```
+
+An execution reaching that call for the first time under the new body answers
+`true`, records a patch marker in its own history, and takes the new branch.
+One replaying a history written before the patch existed answers `false`,
+takes the old branch, and goes on answering `false` for the rest of its life —
+including after it has caught up and is running live. Two executions on the
+same worker at the same instant answer differently when their histories
+differ; the answer is a fact about the execution, never about the deployed
+code.
+
+The id is yours to choose — an atom or a string, spelled either way for the
+same patch — and yours to **keep stable**: it is the name the decision is
+written into history under, so renaming it later makes every execution that
+recorded the old name take the old branch again. Nothing polices uniqueness.
+
+Not offered yet: `deprecate_patch`, Temporal's companion for retiring a patch
+once no execution predates it.
 
 ### Signals, timers & cancellation
 

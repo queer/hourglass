@@ -14,6 +14,12 @@ defmodule Hourglass.Workflow.CommandAccumulator do
       child's path component within the current scope.
     * `:hourglass_temporal_local_seq` — local monotonic counter for the current
       scope; bumped by every `next_command_id/0`.
+    * `:hourglass_temporal_patch_answers` — `%{patch_id => boolean}`, the
+      answers `Hourglass.Workflow.patched?/1` has given during this
+      activation. Seeded from the run's `State` on entry (see
+      `seed_patch_answers/1`) and harvested back into it on the way out, so a
+      patch answered on activation N answers identically on N+1 instead of
+      being re-decided against a `replaying` flag that has since flipped.
   """
 
   alias Hourglass.Workflow.State
@@ -24,6 +30,7 @@ defmodule Hourglass.Workflow.CommandAccumulator do
   @local_seq_key :hourglass_temporal_local_seq
   @evaluator_state_key :hourglass_temporal_evaluator_state
   @signal_index_key :hourglass_temporal_signal_index
+  @patch_answers_key :hourglass_temporal_patch_answers
 
   @doc """
   Initialise the dict for the main workflow body. Wipes any prior state on
@@ -36,6 +43,7 @@ defmodule Hourglass.Workflow.CommandAccumulator do
     Process.put(@next_child_key, 0)
     Process.put(@local_seq_key, 0)
     Process.put(@signal_index_key, %{})
+    Process.put(@patch_answers_key, %{})
     :ok
   end
 
@@ -129,8 +137,50 @@ defmodule Hourglass.Workflow.CommandAccumulator do
     Process.delete(@next_child_key)
     Process.delete(@local_seq_key)
     Process.delete(@signal_index_key)
+    Process.delete(@patch_answers_key)
     :ok
   end
+
+  @doc """
+  Seed this activation's patch answers from the answers the run has already
+  given on earlier activations.
+
+  Unlike the signal index, this is NOT reset per activation: a patch decision
+  belongs to the execution, not to the activation that first made it.
+  """
+  @spec seed_patch_answers(%{optional(String.t()) => boolean()}) :: :ok
+  def seed_patch_answers(answers) when is_map(answers) do
+    Process.put(@patch_answers_key, answers)
+    :ok
+  end
+
+  @doc """
+  The answer this run has already given for `patch_id`, or `:error` if it has
+  never been asked. `:error` is what tells `patched?/1` that it is deciding
+  for the first time — and therefore that it must issue the marker command.
+  """
+  @spec patch_answer(String.t()) :: {:ok, boolean()} | :error
+  def patch_answer(patch_id) do
+    @patch_answers_key
+    |> Process.get(%{})
+    |> Map.fetch(patch_id)
+  end
+
+  @doc "Record a first-time patch decision for the rest of this execution."
+  @spec put_patch_answer(String.t(), boolean()) :: :ok
+  def put_patch_answer(patch_id, answer) when is_boolean(answer) do
+    answers = Process.get(@patch_answers_key, %{})
+    Process.put(@patch_answers_key, Map.put(answers, patch_id, answer))
+    :ok
+  end
+
+  @doc """
+  Every patch answer this run holds — the seeded ones plus any decided during
+  this activation. Harvested into the `State` so the next activation starts
+  from it.
+  """
+  @spec patch_answers() :: %{optional(String.t()) => boolean()}
+  def patch_answers, do: Process.get(@patch_answers_key, %{})
 
   @doc "Per-execution Nth-call index for await_signal(name); resets each activation via init/0."
   @spec next_signal_index(String.t()) :: non_neg_integer()

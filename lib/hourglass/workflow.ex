@@ -95,6 +95,7 @@ defmodule Hourglass.Workflow do
           fail: 2,
           fail: 3,
           info: 0,
+          patched?: 1,
           uuid: 0,
           random: 1,
           sleep: 1
@@ -673,6 +674,115 @@ defmodule Hourglass.Workflow do
     }
 
     throw({:hourglass_temporal_fail, failure_data})
+  end
+
+  @doc """
+  Ask whether **this execution's own history** records the patch `patch_id`,
+  so a workflow body can change while executions started under the old body
+  are still running.
+
+      def run(input) do
+        if patched?(:validate_before_write) do
+          execute_activity!(Validate, input)
+        end
+
+        execute_activity!(Write, input)
+      end
+
+  An execution that reaches this call for the first time under the new body
+  answers `true`, records a patch marker in its history, and takes the new
+  branch. An execution replaying a history written before the patch existed
+  answers `false` and takes the old one — and keeps answering `false` for the
+  rest of its life, including after it has caught up and is running live.
+  Without that, changing a long-running workflow's body wedges every
+  in-flight execution on `[TMPRL1100] Nondeterminism error` and leaves it
+  reporting `Running` while it retries the same failing task forever.
+
+  Two executions of the same workflow, on the same worker, at the same
+  instant, will answer differently if their histories differ. That is the
+  point: the answer is a fact about the execution, never about the deployed
+  code, so nothing here reads a module attribute or config.
+
+  ## Choosing a patch id
+
+  The id is yours — an atom or a string, the two spelled the same way (`:x`
+  and `"x"` are one patch). It has to be **unique within the workflow** and
+  **stable forever after**: it is the name under which the decision is
+  written into history, so renaming it in a later deploy makes every
+  execution that recorded the old name answer `false` again and take the old
+  branch. Nothing polices uniqueness, because nothing can tell a reused id
+  from a deliberately shared one, and a false refusal would be worse than the
+  collision. An empty id is refused — that names no patch at all.
+
+  ## What it is not
+
+  This is a **command**, ordered with timers, activities and child workflows.
+  Its position in the body decides where the marker lands in the sequence, so
+  it must be reached on the same path on every re-execution — do not call it
+  from inside a branch whose condition can itself change between activations.
+
+  `deprecate_patch` — Temporal's companion for retiring a patch once no
+  execution predates it — is deliberately not offered yet.
+
+  Raises if called outside a workflow evaluator, or if `patch_id` is not a
+  non-empty atom or string.
+  """
+  @spec patched?(atom() | String.t()) :: boolean()
+  def patched?(patch_id) when is_atom(patch_id) or is_binary(patch_id) do
+    patch_id
+    |> to_string()
+    |> ask_patch()
+  end
+
+  def patched?(patch_id) do
+    raise ArgumentError, "invalid patch id #{inspect(patch_id)}; expected an atom or a binary"
+  end
+
+  defp ask_patch("") do
+    raise ArgumentError,
+          "Hourglass.Workflow.patched?/1 needs a patch id; got an empty one. " <>
+            "The id is written into the execution's history as the name of this " <>
+            "decision, so it has to name something."
+  end
+
+  defp ask_patch(id) do
+    state =
+      CommandAccumulator.evaluator_state() ||
+        raise "Hourglass.Workflow.patched?/1 called outside a workflow evaluator"
+
+    # Allocated on EVERY call, before anything is decided, so the command_ids
+    # that follow in this scope sit at the same positions whether the patch is
+    # taken or skipped. A skipped patch still costs the wire nothing: nothing
+    # is accumulated under this id, so no global seq is assigned to it and the
+    # commands are the pre-patch body's byte for byte.
+    command_id = CommandAccumulator.next_command_id()
+
+    case CommandAccumulator.patch_answer(id) do
+      # Already decided — on an earlier activation of this run, or an earlier
+      # call in this one. Held rather than re-derived: `state.replaying` has
+      # flipped by the time an execution catches up with its history, and
+      # re-deriving from it there would switch branches mid-execution.
+      {:ok, answer} ->
+        answer
+
+      # First time this run has been asked. Core has told us, via
+      # `notify_has_patch`, every patch the history being replayed records;
+      # anything not in that set is recorded only if this activation is not a
+      # replay, i.e. if the execution is reaching this point for real.
+      :error ->
+        decide_patch(id, command_id, notified?(id) or not state.replaying)
+    end
+  end
+
+  defp notified?(id), do: Map.has_key?(__notified_patches__(), id)
+
+  defp decide_patch(id, command_id, answer) do
+    if answer do
+      CommandAccumulator.append_command(command_id, {:set_patch_marker, %{patch_id: id}})
+    end
+
+    CommandAccumulator.put_patch_answer(id, answer)
+    answer
   end
 
   @spec uuid() :: String.t()

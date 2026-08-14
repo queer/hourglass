@@ -29,6 +29,7 @@ defmodule Hourglass.Workflow.Evaluator do
   alias Coresdk.WorkflowCommands.ContinueAsNewWorkflowExecution
   alias Coresdk.WorkflowCommands.FailWorkflowExecution
   alias Coresdk.WorkflowCommands.ScheduleActivity
+  alias Coresdk.WorkflowCommands.SetPatchMarker
   alias Coresdk.WorkflowCommands.StartChildWorkflowExecution
   alias Coresdk.WorkflowCommands.StartTimer
   alias Coresdk.WorkflowCommands.WorkflowCommand
@@ -53,7 +54,7 @@ defmodule Hourglass.Workflow.Evaluator do
     # Bind the workflow module to the cached state so subsequent activations
     # (which may not carry `initialize_workflow`) can route via
     # `Hourglass.Worker.WorkflowTypeResolver`, then apply the per-activation reset.
-    prepared = reset_per_activation(%{state | workflow_module: workflow_module})
+    prepared = reset_per_activation(%{state | workflow_module: workflow_module}, activation)
 
     {ingest_status, ingested} = ingest_jobs(activation, prepared)
 
@@ -93,10 +94,22 @@ defmodule Hourglass.Workflow.Evaluator do
   # so a fresh body re-execution starts from `nil`; the prior value is
   # captured before reset and consulted in `evaluate/3` above for cached
   # terminal-completion re-emit.
+  #
+  # `replaying` is per-activation too, which is why it is (re)assigned here
+  # rather than carried: Core sets `is_replaying` from where in THIS
+  # execution's history the activation sits. Tests build activations as plain
+  # maps, some of which predate the field; `== true` maps a missing flag to
+  # "not replaying", the shape every activation built before this epic had.
   # ---------------------------------------------------------------------------
 
-  defp reset_per_activation(%State{} = state) do
-    %{state | commands: [], result: nil, child_count: 0}
+  defp reset_per_activation(%State{} = state, activation) do
+    %{
+      state
+      | commands: [],
+        result: nil,
+        child_count: 0,
+        replaying: Map.get(activation, :is_replaying) == true
+    }
   end
 
   # ---------------------------------------------------------------------------
@@ -261,6 +274,7 @@ defmodule Hourglass.Workflow.Evaluator do
   defp run_body(workflow_module, %State{} = state) do
     CommandAccumulator.init()
     CommandAccumulator.mark_evaluator_active(state)
+    CommandAccumulator.seed_patch_answers(state.patch_answers)
 
     try do
       input = cast_workflow_input(workflow_module.__workflow_input_type__(), state.input)
@@ -321,8 +335,29 @@ defmodule Hourglass.Workflow.Evaluator do
   # Step 3 — finish: build a completion proto + updated state.
   # ---------------------------------------------------------------------------
 
+  # A terminal completion ships the run's patch markers ahead of the terminal
+  # command and DROPS every other accumulated command. The asymmetry is the
+  # point: an unresolved schedule/timer is an operation the body abandoned, so
+  # issuing it after deciding to stop would be wrong — but a patch marker is
+  # not an operation, it is the record of a decision the body already acted
+  # on. Drop it and the history no longer says which branch ran, so a later
+  # replay of that history answers `patched?/1` differently from the run it is
+  # replaying.
+  defp accumulated_patch_markers do
+    CommandAccumulator.take_commands()
+    |> Enum.sort_by(fn {command_id, _cmd} -> command_id end)
+    |> Enum.flat_map(fn
+      {_command_id, {:set_patch_marker, %{patch_id: patch_id}}} ->
+        [patch_marker_command(patch_id)]
+
+      _other ->
+        []
+    end)
+  end
+
   defp finish_completed(%State{} = state, return_value) do
-    completion = build_success_completion(state, [build_complete_command(return_value)])
+    commands = accumulated_patch_markers() ++ [build_complete_command(return_value)]
+    completion = build_success_completion(state, commands)
     {:ok, completion, %{state | result: {:completed, return_value}}}
   end
 
@@ -346,7 +381,8 @@ defmodule Hourglass.Workflow.Evaluator do
         "type=#{failure_data.type}: #{failure_data.message}"
     )
 
-    completion = build_success_completion(state, [build_fail_command(failure_data)])
+    commands = accumulated_patch_markers() ++ [build_fail_command(failure_data)]
+    completion = build_success_completion(state, commands)
     {:ok, completion, %{state | result: {:failed, failure_data}}}
   end
 
@@ -368,7 +404,8 @@ defmodule Hourglass.Workflow.Evaluator do
          }}
     }
 
-    {:ok, build_success_completion(state, [cmd]), %{state | result: :continue_as_new}}
+    commands = accumulated_patch_markers() ++ [cmd]
+    {:ok, build_success_completion(state, commands), %{state | result: :continue_as_new}}
   end
 
   defp finish_task_failed(%State{} = state, reason) do
@@ -392,9 +429,21 @@ defmodule Hourglass.Workflow.Evaluator do
           {acc_protos ++ new_protos, [{seq, command_id, command_term} | acc_assigns], seq + 1}
       end)
 
+    # Harvest the run's patch decisions. Only this finisher does: it is the
+    # only one the execution continues past. `finish_completed`/`finish_failed`
+    # end the run (later activations re-emit the cached terminal command
+    # without re-running the body), `finish_continue_as_new` starts a fresh
+    # run with fresh history, and `finish_task_failed` parks — Core redelivers
+    # the identical activation, which re-decides identically from the state it
+    # already had.
     new_state =
       State.register_assignments(
-        %{state | commands: sorted, next_global_seq: next_seq},
+        %{
+          state
+          | commands: sorted,
+            next_global_seq: next_seq,
+            patch_answers: CommandAccumulator.patch_answers()
+        },
         Enum.reverse(assignments)
       )
 
@@ -552,6 +601,12 @@ defmodule Hourglass.Workflow.Evaluator do
     }
   end
 
+  defp patch_marker_command(patch_id) do
+    %WorkflowCommand{
+      variant: {:set_patch_marker, %SetPatchMarker{patch_id: patch_id, deprecated: false}}
+    }
+  end
+
   defp build_complete_command(return_value) do
     %WorkflowCommand{
       variant:
@@ -605,6 +660,17 @@ defmodule Hourglass.Workflow.Evaluator do
         }
       }
     ]
+  end
+
+  # `SetPatchMarker` carries no seq — it is not an operation that resolves, so
+  # Core identifies it by `patch_id` alone. The global seq the reduce assigns
+  # it is still consumed, which keeps the mapping from command_id to seq
+  # dense and identical between the original run and its replay.
+  #
+  # `deprecated: false` is not a placeholder: `deprecate_patch` is a separate
+  # primitive this SDK does not offer, so no caller can set it.
+  defp command_to_proto(_seq, {:set_patch_marker, %{patch_id: patch_id}}, _task_queue) do
+    [patch_marker_command(patch_id)]
   end
 
   defp command_to_proto(seq, {:start_timer, %{duration_ms: ms}}, _task_queue) do
