@@ -264,9 +264,19 @@ defmodule Hourglass.Workflow do
 
   # Cast the signal payload through the declared schema if present; otherwise
   # return the raw decoded value.
+  #
+  # `Code.ensure_loaded?/1` for `resolve_retry_policy/2`'s reason exactly: a
+  # bare `function_exported?/3` reports a module the VM has not loaded as
+  # declaring nothing, and here that means a signal payload delivered RAW
+  # instead of cast through its declared schema. Reaching this with the
+  # workflow module unloaded ought to be impossible — the module's own body is
+  # what is executing — but "ought to be impossible" is all the retry-policy
+  # site had going for it too, and a wrong answer here is indistinguishable
+  # from a workflow that declared no signals at all.
   defp cast_signal(state, name_str, raw) do
     schema =
-      if function_exported?(state.workflow_module, :__workflow_signal_types__, 0) do
+      if Code.ensure_loaded?(state.workflow_module) and
+           function_exported?(state.workflow_module, :__workflow_signal_types__, 0) do
         Map.get(state.workflow_module.__workflow_signal_types__(), name_str)
       end
 
@@ -817,6 +827,36 @@ defmodule Hourglass.Workflow do
   # named by string/atom rather than module ref), the module default isn't
   # available; we use the library default retry policy plus the per-call
   # override.
+  #
+  # ## The module must be LOADED before it is asked what it declares
+  #
+  # `function_exported?/3` reads the module's export table, and a module the
+  # VM has not loaded yet has none — so it answers `false` for a declaration
+  # that is right there in the source. Under `:interactive` code loading
+  # (every `mix` invocation: `mix test`, `mix coffee.serve`) modules load on
+  # first CALL, and naming one in `execute_activity/3` is not a call. So on a
+  # fresh worker every activity module is unloaded, this branch fell through
+  # to `Activity.default_retry_policy()` — `[max_attempts: 1]`, no retry —
+  # and the policy the activity declared never reached Temporal at all.
+  #
+  # That is not a near-miss: it was measured against a live worker with the
+  # whole application started, and ALL FIVE activity modules sampled resolved
+  # to `[max_attempts: 1]`. The Temporal history of the run that found it
+  # records `attempt: 1` and `retry_state: MAXIMUM_ATTEMPTS_REACHED` on an
+  # activity declaring `max_attempts: 0` (unlimited), whose refusal its own
+  # classifier had ruled RETRYABLE. A transient condition designed to heal by
+  # retry killed the run on first sight.
+  #
+  # It is a load-order lottery rather than a constant, which is why it read as
+  # a rare flake: the first schedule of an activity in a VM gets no retry, and
+  # every schedule after the activity has once RUN gets the declared policy —
+  # the run itself being what loads the module. The line below this branch
+  # (`module.__activity_input_type__/0`) is that load, one line too late.
+  #
+  # It also made the resolved policy differ between an original execution and
+  # a replay in a warmer VM. `Code.ensure_loaded?/1` is idempotent and decides
+  # on the code path rather than on VM history, so the resolved policy is now
+  # a function of the declaration alone.
   # ---------------------------------------------------------------------------
 
   @allowed_override_keys [
@@ -835,7 +875,7 @@ defmodule Hourglass.Workflow do
   @spec resolve_retry_policy(module() | atom() | String.t(), keyword()) :: keyword()
   def resolve_retry_policy(activity_module, opts) when is_atom(activity_module) do
     default =
-      if function_exported?(activity_module, :__activity_retry_policy__, 0) do
+      if declares_retry_policy?(activity_module) do
         activity_module.__activity_retry_policy__()
       else
         Activity.default_retry_policy()
@@ -850,6 +890,16 @@ defmodule Hourglass.Workflow do
     override = Keyword.get(opts, :retry_policy, [])
     validate_override!(override)
     Keyword.merge(Activity.default_retry_policy(), override)
+  end
+
+  # `Code.ensure_loaded?/1` FIRST — see the section above for what a bare
+  # `function_exported?/3` here silently did to every declared retry policy.
+  # It is a no-op for an already-loaded module and stays `false` for a name
+  # that is an atom but not a module, so the string/atom sidecar clause above
+  # keeps answering the library default.
+  defp declares_retry_policy?(activity_module) do
+    Code.ensure_loaded?(activity_module) and
+      function_exported?(activity_module, :__activity_retry_policy__, 0)
   end
 
   defp validate_override!(override) when is_list(override) do
