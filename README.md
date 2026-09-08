@@ -44,7 +44,7 @@ defmodule MyApp.Workflows.Hello do
   def run(%MyApp.Hello.Args{name: name}) do
     greeting =
       execute_activity!(MyApp.Activities.Greet, %MyApp.Greet.In{name: name},
-        start_to_close: {:sec, 10})
+        start_to_close_timeout: 10_000)
 
     %MyApp.Hello.Result{greeting: greeting}
   end
