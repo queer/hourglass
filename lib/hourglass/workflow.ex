@@ -338,7 +338,7 @@ defmodule Hourglass.Workflow do
 
   Returns a `%Info{}` carrying the workflow's `run_id` + `task_queue`.
   Reads from the evaluator state stamped on the process dict by
-  `Hourglass.Workflow.Evaluator.run_body/2`. Raises if no
+  `Hourglass.Workflow.Evaluator` before it runs the body. Raises if no
   evaluator is active on the calling process — `info/0` is only
   meaningful inside a workflow body during evaluation.
   """

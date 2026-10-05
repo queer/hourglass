@@ -28,7 +28,7 @@ defmodule Hourglass.Workflow.State do
       code-scoped: two executions of the same workflow on the same worker at
       the same moment answer differently precisely because their histories
       differ. A map keyed by patch id rather than a `MapSet`, because
-      `MapSet.t/1` is opaque and naming it in this struct's `t()` makes every
+      `t:MapSet.t/1` is opaque and naming it in this struct's `t()` makes every
       caller that merely passes a `State` a Dialyzer `call_without_opaque`.
     * `patch_answers` — `%{patch_id => boolean}`, what
       `Hourglass.Workflow.patched?/1` has already answered for this run. A

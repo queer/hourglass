@@ -52,7 +52,7 @@ defmodule Hourglass.Worker.WorkflowStateCache do
   ## Non-goal
 
   This module is data-only. It does not own the ETS table's lifecycle —
-  `ensure_table/0` is called from `Hourglass.Application.start/2` at boot
+  `ensure_table/0` is called from the application's `start/2` at boot
   and may also be called from test setup; it is idempotent and safe to
   invoke more than once. No GenServer mailbox in the hot path; readers +
   writers go directly through ETS.
@@ -67,7 +67,7 @@ defmodule Hourglass.Worker.WorkflowStateCache do
 
   @doc """
   Create the shared ETS table if it does not already exist. Idempotent:
-  safe to call from both `Hourglass.Application.start/2` and test setup
+  safe to call from both the application's `start/2` and test setup
   without raising. Returns `:ok` regardless of whether the table was
   just created or was already present.
   """

@@ -190,7 +190,7 @@ defmodule Hourglass.Client do
   the `TEMPORAL_NAMESPACE` env var, or `"default"`.
 
   Public so call sites that build their own gRPC requests outside
-  `connect/1` (e.g. `Hourglass.BridgeHolder.build_worker_config/2`)
+  `connect/1` (e.g. the worker config the bridge holder builds)
   can share the same source of truth — preventing
   worker-vs-workflow-namespace skew where one side uses the configured
   namespace and the other falls back to `"default"`.

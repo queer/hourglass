@@ -14,6 +14,7 @@ defmodule Hourglass.MixProject do
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
       deps: deps(),
+      docs: docs(),
       # `:mix` (Mix.Tasks.Hourglass.Proto) and `:credo` (the packaged
       # Hourglass.Check.WorkflowDeterminism check) are dev/build-time-only
       # apps not in the runtime PLT; add them so dialyzer sees their modules.
@@ -31,6 +32,31 @@ defmodule Hourglass.MixProject do
     [
       mod: {Hourglass.Application, []},
       extra_applications: [:logger]
+    ]
+  end
+
+  defp docs do
+    [
+      # Protobuf structs are hidden from docs: `Coresdk.*` (lib/proto) and
+      # `Temporal.Api.*` (the temporalio dep) are both generated
+      # `@moduledoc false`. Prose still names them, since they are what the
+      # bridge decodes; render those names as plain code, not dead links.
+      skip_code_autolink_to: &String.starts_with?(&1, ["Temporal.Api.", "Coresdk."]),
+      # Typespecs ignore skip_code_autolink_to, so a spec returning one of
+      # those structs warns that its target is hidden — a target no config
+      # here can unhide. Skip exactly the docs whose specs do that. A new
+      # entry belongs here only for the same reason; any other warning is
+      # a real broken reference and must be fixed in the doc instead.
+      skip_undefined_reference_warnings_on: [
+        "Hourglass.history/1",
+        "Hourglass.Failure.application_failure/1",
+        "t:Hourglass.WorkflowStatus.failure_event/0",
+        "t:Hourglass.WorkflowStatus.pending_activity/0",
+        "c:Hourglass.Client.Backend.describe_workflow_execution/1",
+        "c:Hourglass.Client.Backend.fetch_history/1",
+        "Hourglass.Worker.WorkflowTypeResolver.resolve/2",
+        "Hourglass.Workflow.Evaluator.evaluate/3"
+      ]
     ]
   end
 

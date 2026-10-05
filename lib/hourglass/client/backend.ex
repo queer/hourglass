@@ -32,8 +32,8 @@ defmodule Hourglass.Client.Backend do
 
     * **`connect`** — connection management is per-impl, not part of
       the contract.
-    * **`await_workflow`** — `Hourglass.await/2` is a polling loop
-      on `status/2`; it doesn't need a separate cluster hook. Mock-
+    * **`await_workflow`** — `Hourglass.result/2` is a polling loop
+      on `Hourglass.status/2`; it doesn't need a separate cluster hook. Mock-
       backed `describe_workflow_execution` covers it.
     * **`query_workflow`, `terminate_workflow`** —
       not used by Hourglass today. Add when needed.
@@ -72,7 +72,7 @@ defmodule Hourglass.Client.Backend do
   Returns the workflow's full event history. Maps to
   `GetWorkflowExecutionHistory` (with `wait_new_event: false` semantics).
   Used by `Hourglass.status/2` (when `failures: :include`) and by
-  `Hourglass.await/2`'s test-only completed-result extraction.
+  `Hourglass.result/2`'s completed-result extraction.
   """
   @callback fetch_history(handle :: WorkflowHandle.t()) ::
               {:ok, History.t()} | {:error, Error.t()}
