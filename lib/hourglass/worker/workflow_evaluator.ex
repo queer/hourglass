@@ -162,6 +162,9 @@ defmodule Hourglass.Worker.WorkflowEvaluator do
     end
   end
 
+  # An eviction drops the run's state whatever it held, a cached terminal
+  # result included: Core replays the run from history after evicting it, and
+  # the replay must be built from that history alone.
   defp persist_state(task_queue, run_id, %State{result: :evict}) do
     WorkflowStateCache.delete(task_queue, run_id)
   end

@@ -7,11 +7,13 @@ defmodule Hourglass.Worker.WorkflowEvaluatorTest do
   use ExUnit.Case, async: true
 
   alias Coresdk.WorkflowActivation.InitializeWorkflow
+  alias Coresdk.WorkflowActivation.RemoveFromCache
   alias Coresdk.WorkflowActivation.WorkflowActivation
   alias Coresdk.WorkflowActivation.WorkflowActivationJob
   alias Coresdk.WorkflowCompletion.WorkflowActivationCompletion
 
   alias Hourglass.Worker.WorkflowEvaluator
+  alias Hourglass.Worker.WorkflowStateCache
   alias Hourglass.WorkflowEvaluator.DynamicSupervisor
 
   # ---------------------------------------------------------------------------
@@ -190,6 +192,50 @@ defmodule Hourglass.Worker.WorkflowEvaluatorTest do
             }} = completion.status
 
     assert msg =~ "workflow body explodes"
+  end
+
+  # ---------------------------------------------------------------------------
+  # 2b. Eviction drops the run's cached state, terminal or not
+  # ---------------------------------------------------------------------------
+
+  test "an eviction after a terminal result drops the cached state" do
+    task_queue = "tq-test-evict-#{System.unique_integer([:positive])}"
+    run_id = "evict-terminal-run-1"
+
+    base = %{
+      run_id: run_id,
+      task_queue: task_queue,
+      workflow_module_resolver: constant_resolver(ImmediateWorkflow),
+      complete_fn: send_complete_fn(self())
+    }
+
+    :ok =
+      base
+      |> Map.put(:activation_bytes, activation_bytes([init_job(nil)], run_id: run_id))
+      |> WorkflowEvaluator.run()
+
+    assert %Hourglass.Workflow.State{result: {:completed, _value}} =
+             WorkflowStateCache.fetch(task_queue, run_id)
+
+    # Core evicts a run whose terminal command the server rejected, then
+    # replays its history from the start. Nothing cached from before the
+    # eviction may survive into that replay.
+    evict = %WorkflowActivationJob{
+      variant: {:remove_from_cache, %RemoveFromCache{reason: :UNHANDLED_COMMAND}}
+    }
+
+    :ok =
+      base
+      |> Map.put(:activation_bytes, activation_bytes([evict], run_id: run_id))
+      |> WorkflowEvaluator.run()
+
+    assert WorkflowStateCache.fetch(task_queue, run_id) == nil
+
+    assert_received {:completion_shipped, ^task_queue, _terminal}
+    assert_received {:completion_shipped, ^task_queue, ack}
+
+    assert {:successful, %Coresdk.WorkflowCompletion.Success{commands: []}} =
+             WorkflowActivationCompletion.decode(ack).status
   end
 
   # ---------------------------------------------------------------------------

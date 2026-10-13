@@ -172,15 +172,23 @@ defmodule Hourglass.Workflow.EvaluatorTest do
   end
 
   # Proves a redelivered activation does not re-execute the body: run/1
-  # raises if invoked a second time. Process.get/put is safe here only
-  # because the pure-function evaluator runs run/1 inline in the calling
-  # process (no Task spawn — see Evaluator's moduledoc), so the counter is
-  # scoped to whichever ExUnit test process calls Evaluator.evaluate/3.
+  # raises if it reaches its terminal decision a second time. Process.get/put
+  # is safe here only because the pure-function evaluator runs run/1 inline in
+  # the calling process (no Task spawn — see Evaluator's moduledoc), so the
+  # counter is scoped to whichever ExUnit test process calls
+  # Evaluator.evaluate/3.
+  #
+  # It waits for a signal first so the terminal decision lands on an activation
+  # that is NOT the run's first: the first activation carries
+  # `initialize_workflow`, which begins the run's history again and so rebuilds
+  # it from scratch (see the replay tests below) rather than redelivering.
   defmodule FailOnceWorkflow do
     use Hourglass.Workflow
 
     @impl Hourglass.Workflow.Behaviour
     def run(_input) do
+      _go = await_signal("go")
+
       key = {__MODULE__, :run_count}
       count = Process.get(key, 0)
       Process.put(key, count + 1)
@@ -191,6 +199,14 @@ defmodule Hourglass.Workflow.EvaluatorTest do
 
       fail("DecomposeFailed", "decomposition failed on first attempt")
     end
+  end
+
+  # Ends on a signal and reports whether a cancel had arrived by then.
+  defmodule CancelAwareSignalWorkflow do
+    use Hourglass.Workflow
+
+    @impl Hourglass.Workflow.Behaviour
+    def run(_input), do: %{"got" => await_signal("go"), "cancelled" => cancelled?()}
   end
 
   defmodule BadFailArgWorkflow do
@@ -584,10 +600,16 @@ defmodule Hourglass.Workflow.EvaluatorTest do
   end
 
   test "a redelivered activation after fail/2 re-emits the cached FailWorkflowExecution WITHOUT re-running the body" do
-    state0 = fresh_state("r-fail-redeliver")
+    {:ok, _suspended, state0} =
+      Evaluator.evaluate(
+        FailOnceWorkflow,
+        activation([init_job(nil)]),
+        fresh_state("r-fail-redeliver")
+      )
 
-    {:ok, completion1, state1} =
-      Evaluator.evaluate(FailOnceWorkflow, activation([init_job(nil)]), state0)
+    go = activation([signal_job("go", %{})])
+
+    {:ok, completion1, state1} = Evaluator.evaluate(FailOnceWorkflow, go, state0)
 
     assert {:successful,
             %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, fwe1}}]}} =
@@ -595,12 +617,13 @@ defmodule Hourglass.Workflow.EvaluatorTest do
 
     assert match?({:failed, _}, state1.result)
 
-    # Redelivery: same workflow module, a fresh activation, the ALREADY-FAILED
-    # state. If the body re-ran, FailOnceWorkflow's second invocation raises
-    # (which would park, not re-emit) — so a non-parked, identical-failure
-    # result here proves the cached branch short-circuited before run_body/2.
-    {:ok, completion2, state2} =
-      Evaluator.evaluate(FailOnceWorkflow, activation([init_job(nil)]), state1)
+    # Redelivery: the SAME activation, over the ALREADY-FAILED state. If the
+    # body re-ran, FailOnceWorkflow's second terminal decision raises (which
+    # would park, not re-emit) — so a non-parked, identical-failure result here
+    # proves the cached branch short-circuited before run_body/2. A redelivered
+    # signal job would also be ingested a second time, which is exactly the
+    # different input a re-run must never decide from.
+    {:ok, completion2, state2} = Evaluator.evaluate(FailOnceWorkflow, go, state1)
 
     assert {:successful,
             %Success{commands: [%WorkflowCommand{variant: {:fail_workflow_execution, fwe2}}]}} =
@@ -609,8 +632,83 @@ defmodule Hourglass.Workflow.EvaluatorTest do
     assert fwe1 == fwe2
     assert state2.result == state1.result
 
-    # Direct proof the body ran exactly once, from the fixture's own counter.
+    # Any later non-evicting activation re-emits the same decision too.
+    {:ok, completion3, _state3} =
+      Evaluator.evaluate(FailOnceWorkflow, activation([update_random_seed_job(7)]), state2)
+
+    assert completion3.status == completion2.status
+
+    # Direct proof the body reached its terminal decision exactly once.
     assert Process.get({FailOnceWorkflow, :run_count}) == 1
+  end
+
+  # -------------------------------------------------------------------------
+  # Eviction and replay after a terminal result
+  #
+  # When the server rejects a terminal command (UnhandledCommand: an event
+  # landed on the run while the task was in flight), Core evicts the run and
+  # replays its whole history. The rejected terminal decision is not in that
+  # history, so nothing about it may survive into the replay.
+  # -------------------------------------------------------------------------
+
+  test "an eviction after a terminal result evicts instead of re-emitting the terminal command" do
+    {:ok, _completion, failed} =
+      Evaluator.evaluate(
+        FailingWorkflow,
+        activation([init_job(nil)]),
+        fresh_state("r-evict-term")
+      )
+
+    assert match?({:failed, _}, failed.result)
+
+    {:ok, completion, evicted} =
+      Evaluator.evaluate(FailingWorkflow, activation([evict_job()]), failed)
+
+    assert commands_of(completion) == []
+    assert evicted.result == :evict
+  end
+
+  test "an initialize_workflow activation replays from history, not from a cached terminal result" do
+    # The original execution: the signal and a cancel arrive, and the body
+    # completes on them.
+    {:ok, _completion, completed} =
+      Evaluator.evaluate(
+        CancelAwareSignalWorkflow,
+        activation([init_job(nil), signal_job("go", %{"v" => 1}), cancel_job("stop")]),
+        fresh_state("r-replay-term")
+      )
+
+    assert {:completed, %{"cancelled" => true}} = completed.result
+
+    # A replay of the run's history begins again at `initialize_workflow`, over
+    # whatever state is still cached for the run id. That history has, so far,
+    # neither the signal nor the cancel — the body must wait for the signal,
+    # exactly as the original execution did at this point.
+    {:ok, replayed, state} =
+      Evaluator.evaluate(
+        CancelAwareSignalWorkflow,
+        activation([init_job(nil)], is_replaying: true),
+        completed
+      )
+
+    assert commands_of(replayed) == []
+    assert state.result == nil
+    assert state.signals == %{}
+    refute state.cancel_requested
+
+    # The replay then reaches the signal alone: cancelled?/0 is false here, as
+    # it was at this point in the history being replayed.
+    {:ok, at_signal, _state} =
+      Evaluator.evaluate(
+        CancelAwareSignalWorkflow,
+        activation([signal_job("go", %{"v" => 1})], is_replaying: true),
+        state
+      )
+
+    assert [%WorkflowCommand{variant: {:complete_workflow_execution, cwe}}] =
+             commands_of(at_signal)
+
+    assert Jason.decode!(cwe.result.data) == %{"got" => %{"v" => 1}, "cancelled" => false}
   end
 
   test "fail/2 requires a binary type and message — a caller mistake parks like any other bug" do

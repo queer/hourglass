@@ -45,9 +45,13 @@ defmodule Hourglass.Worker.WorkflowStateCache do
 
   Terminal states (`{:completed, _}` / `{:failed, _}`) are still cached so
   redelivered terminal activations can re-emit the same completion proto;
-  Temporal Server treats the duplicate as a no-op. Entries also clear when
-  Core sends `remove_from_cache` (the evaluator returns `:evict` and the
-  poll loop deletes the entry).
+  Temporal Server treats the duplicate as a no-op. Entries clear when Core
+  sends `remove_from_cache` — terminal or not, since Core replays an evicted
+  run from its history and a terminal decision the server rejected is not in
+  that history (the evaluator returns `:evict` and the evaluator Task deletes
+  the entry). An entry that outlives Core's own copy of the run anyway — a
+  worker restart, say — is never read back into a replay: an activation
+  carrying `initialize_workflow` starts the run from a fresh state.
 
   ## Non-goal
 

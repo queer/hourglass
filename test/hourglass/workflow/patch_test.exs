@@ -539,8 +539,11 @@ defmodule Hourglass.Workflow.PatchTest do
     {:ok, completion, _state} =
       Evaluator.evaluate(
         StringIdWorkflow,
-        activation([init_job(%{})], is_replaying: true),
-        %{fresh_state("r-patch-string") | notified_patches: %{"extra_step" => true}}
+        # The history records the patch: Core says so on the activation that
+        # replays its WFT, which for the first WFT is the one that initializes
+        # the run.
+        activation([init_job(%{}), notify_has_patch_job("extra_step")], is_replaying: true),
+        fresh_state("r-patch-string")
       )
 
     assert completed_value(completion) == %{"atom" => true, "string" => true}

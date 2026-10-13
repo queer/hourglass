@@ -295,6 +295,15 @@ defmodule Hourglass.Workflow do
   safe points and decides what to do (e.g. skip remaining work and complete
   gracefully). The flag is set during job ingestion and persists across
   activations once set — once a cancel arrives it stays `true`.
+
+  The answer belongs to the activation being evaluated, not to the call site:
+  the body re-executes from the top on every activation, so a check that
+  answered `false` before the cancel arrived answers `true` when the body
+  re-runs after it — which is what lets a body blocked on an await notice the
+  cancel at all. It is replay-safe: a replay delivers the cancel at the same
+  place in the history, and a run Core evicts and replays rebuilds the flag
+  from that history alone, so every activation answers exactly as it did in
+  the original execution.
   """
   @spec cancelled?() :: boolean()
   def cancelled? do

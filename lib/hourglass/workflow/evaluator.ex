@@ -49,6 +49,7 @@ defmodule Hourglass.Workflow.Evaluator do
           state :: State.t()
         ) :: {:ok, WorkflowActivationCompletion.t(), State.t()}
   def evaluate(workflow_module, activation, %State{} = state) do
+    state = from_history_start(activation, state)
     prior_result = state.result
 
     # Bind the workflow module to the cached state so subsequent activations
@@ -59,24 +60,46 @@ defmodule Hourglass.Workflow.Evaluator do
     {ingest_status, ingested} = ingest_jobs(activation, prepared)
 
     cond do
+      # Eviction comes first, whatever the run had decided. Core evicts a run
+      # it is about to replay from history — notably after the server rejects
+      # a terminal command with UnhandledCommand because an event landed on
+      # the run while the task was in flight. That rejected decision is not in
+      # the history the replay rebuilds from, so it must not outlive the
+      # eviction: ack with an empty Success and signal eviction so the caller
+      # drops the run's state.
+      ingest_status == :evict ->
+        {:ok, empty_success_completion(ingested), %{ingested | result: :evict}}
+
       # Once the workflow has previously reached a terminal outcome —
       # completed OR failed (via `fail/2,3`) — every subsequent activation
-      # re-emits the cached terminal completion rather than re-deciding.
-      # Matches GenServer-runner semantics for :completed; required for
-      # :failed too, so a redelivered activation cannot re-run the body and
-      # reach a *different* terminal outcome. Temporal Server treats the
-      # duplicate as a no-op once it has already observed the terminal state.
+      # that is neither an eviction nor a fresh start of the history re-emits
+      # the cached terminal completion rather than re-deciding. Matches
+      # GenServer-runner semantics for :completed; required for :failed too,
+      # so a redelivered activation cannot re-run the body over twice-ingested
+      # jobs and reach a *different* terminal outcome. Temporal Server treats
+      # the duplicate as a no-op once it has already observed the terminal
+      # state.
       terminal_result?(prior_result) ->
         completion = build_success_completion(ingested, [terminal_command(prior_result)])
         {:ok, completion, %{ingested | result: prior_result}}
 
-      ingest_status == :evict ->
-        # Pure cache-eviction activation with no prior terminal state — ack
-        # with empty Success and signal eviction in the returned state.
-        {:ok, empty_success_completion(ingested), %{ingested | result: :evict}}
-
       true ->
         run_body(workflow_module, ingested)
+    end
+  end
+
+  # `initialize_workflow` is the first job of a run's history, and Core sends
+  # it exactly when it is (re)starting that history from the beginning: a new
+  # run, or a replay after the run left Core's cache — an eviction, or a worker
+  # restart that left this worker's state behind while Core's went. Either
+  # way, nothing decided before it belongs to the history being built, so the
+  # run starts again from a fresh state rather than from whatever is cached
+  # for its run id. This does not rely on an eviction having been seen first.
+  defp from_history_start(%{jobs: jobs}, %State{} = state) when is_list(jobs) do
+    if Enum.any?(jobs, &match?(%{variant: {:initialize_workflow, _init}}, &1)) do
+      %State{run_id: state.run_id, task_queue: state.task_queue}
+    else
+      state
     end
   end
 
