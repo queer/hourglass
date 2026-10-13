@@ -29,7 +29,7 @@ defmodule Hourglass.Test.UnloadedRetryActivity do
       max_interval: 60_000
     ]
 
-  @impl true
+  @impl Hourglass.Activity.Behaviour
   @spec execute(map(), keyword()) :: map()
   def execute(input, _opts \\ []), do: input
 end
