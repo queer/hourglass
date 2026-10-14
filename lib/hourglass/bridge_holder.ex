@@ -196,6 +196,20 @@ defmodule Hourglass.BridgeHolder do
   `pollers` map when the holder processes the `:DOWN`, triggering the
   recycle.
 
+  ## Handle recycle and the work it handed out
+
+  An activity the old handle handed out is outstanding in the OLD Core
+  worker, and only that worker can report its outcome: sent to the
+  fresh one, a completion or heartbeat names a task Core never handed
+  out, and is dropped. So the holder remembers which handle handed each
+  activity task out — the poll Task tells it, by task token
+  (`:activity_handed_out`), before the poll's caller sees the task — and
+  `complete_activity_task/2` and `record_heartbeat/2` go to that handle,
+  recycled or not. The route goes with the activity's completion, so a
+  retired handle is kept exactly as long as something it handed out is
+  still running, then released. Releasing a queue (`unregister_worker/1`)
+  drops its routes: nothing of a released handle reports.
+
   Recycle is async (`worker_shutdown` + `worker_new` together are
   100s of ms) — the DOWN handler returns `{:noreply, state}`
   immediately after dispatching a recycle Task under `task_sup`.
@@ -291,6 +305,9 @@ defmodule Hourglass.BridgeHolder do
           register_opts: %{optional(String.t()) => register_opts()},
           pollers: %{optional(pid()) => {String.t(), reference()}},
           recycling: MapSet.t(String.t()),
+          # The handle each outstanding activity task was handed out from, by
+          # task token (see "Handle recycle and the work it handed out").
+          activity_routes: %{optional(binary()) => {String.t(), reference()}},
           # Task queues whose handle `initiate_shutdown/1` has shut down but
           # which are still held, so their work can finish and report.
           draining: MapSet.t(String.t()),
@@ -453,6 +470,7 @@ defmodule Hourglass.BridgeHolder do
        register_opts: %{},
        pollers: %{},
        recycling: MapSet.new(),
+       activity_routes: %{},
        draining: MapSet.new(),
        owners: %{},
        task_sup: task_sup,
@@ -550,7 +568,7 @@ defmodule Hourglass.BridgeHolder do
 
   @impl GenServer
   def handle_call({:poll_activity_task, task_queue}, from, state) do
-    dispatch_poll(state, task_queue, from, &Bridge.worker_poll_activity_task/1)
+    dispatch_poll(state, task_queue, from, &poll_and_route_activity_task(&1, task_queue))
   end
 
   @impl GenServer
@@ -585,8 +603,12 @@ defmodule Hourglass.BridgeHolder do
 
   @impl GenServer
   def handle_call({:complete_activity_task, task_queue, bytes}, _from, state) do
-    case Map.fetch(state.handles, task_queue) do
-      {:ok, handle} ->
+    # The activity is done with its route: pop it, so a retired handle is
+    # released once nothing it handed out is still running.
+    {handle, state} = pop_activity_handle(state, task_queue, completion_token(bytes))
+
+    case handle do
+      handle when is_reference(handle) ->
         reply =
           try do
             Bridge.worker_complete_activity_task(handle, bytes)
@@ -609,7 +631,7 @@ defmodule Hourglass.BridgeHolder do
 
         {:reply, reply, state}
 
-      :error ->
+      nil ->
         # In-flight Task tried to ship a completion after the Worker was
         # unregistered. The result is "lost" from this Task's perspective —
         # Core will redeliver on the next poll, and the LLM cache absorbs
@@ -628,8 +650,8 @@ defmodule Hourglass.BridgeHolder do
 
   @impl GenServer
   def handle_call({:record_heartbeat, task_queue, bytes}, _from, state) do
-    case Map.fetch(state.handles, task_queue) do
-      {:ok, handle} ->
+    case activity_handle(state, task_queue, heartbeat_token(bytes)) do
+      handle when is_reference(handle) ->
         reply =
           try do
             Bridge.worker_record_activity_heartbeat(handle, bytes)
@@ -651,8 +673,23 @@ defmodule Hourglass.BridgeHolder do
 
         {:reply, reply, state}
 
-      :error ->
+      nil ->
         {:reply, {:error, :worker_not_registered}, state}
+    end
+  end
+
+  # A poll Task handed an activity task out from `handle`: route the task's
+  # completion and heartbeats back to that handle, even if it is recycled
+  # meanwhile. Sent BEFORE the poll's reply, so it is in the mailbox before
+  # any call the activity's executor can make. A queue released meanwhile is
+  # not routed: nothing of a released handle may report.
+  @impl GenServer
+  def handle_info({:activity_handed_out, task_queue, token, handle}, state) do
+    if Map.has_key?(state.handles, task_queue) do
+      routes = Map.put(state.activity_routes, token, {task_queue, handle})
+      {:noreply, %{state | activity_routes: routes}}
+    else
+      {:noreply, state}
     end
   end
 
@@ -851,6 +888,46 @@ defmodule Hourglass.BridgeHolder do
     end
   end
 
+  # Poll `handle` for an activity task, and tell the holder which handle
+  # handed it out before the caller sees it (`:activity_handed_out`). Runs in
+  # the poll Task.
+  defp poll_and_route_activity_task(handle, task_queue) do
+    case Bridge.worker_poll_activity_task(handle) do
+      {:ok, bytes} = result ->
+        send(__MODULE__, {:activity_handed_out, task_queue, task_token(bytes), handle})
+        result
+
+      error ->
+        error
+    end
+  end
+
+  # The handle to report an activity through: the one that handed it out, if
+  # the holder routed it, else the queue's current handle. nil if neither.
+  defp activity_handle(state, task_queue, token) do
+    case Map.fetch(state.activity_routes, token) do
+      {:ok, {_task_queue, handle}} -> handle
+      :error -> Map.get(state.handles, task_queue)
+    end
+  end
+
+  defp pop_activity_handle(state, task_queue, token) do
+    handle = activity_handle(state, task_queue, token)
+    {handle, %{state | activity_routes: Map.delete(state.activity_routes, token)}}
+  end
+
+  # Task tokens, read from the encoded protos. Bytes that do not decode are
+  # left for the NIF to refuse (InvalidProto); they route by task queue.
+  defp task_token(bytes), do: decoded_token(Coresdk.ActivityTask.ActivityTask, bytes)
+  defp completion_token(bytes), do: decoded_token(Coresdk.ActivityTaskCompletion, bytes)
+  defp heartbeat_token(bytes), do: decoded_token(Coresdk.ActivityHeartbeat, bytes)
+
+  defp decoded_token(module, bytes) do
+    module.decode(bytes).task_token
+  rescue
+    _error -> nil
+  end
+
   # Forget every trace of `task_queue`'s handle. Dropping register_opts too
   # means a recycle in flight detects the missing handle entry and discards
   # its new handle.
@@ -858,9 +935,15 @@ defmodule Hourglass.BridgeHolder do
     {owner_ref, owners} = Map.pop(state.owners, task_queue)
     if owner_ref, do: Process.demonitor(owner_ref, [:flush])
 
+    routes =
+      state.activity_routes
+      |> Enum.reject(fn {_token, {routed_queue, _handle}} -> routed_queue == task_queue end)
+      |> Map.new()
+
     %{
       state
       | handles: Map.delete(state.handles, task_queue),
+        activity_routes: routes,
         register_opts: Map.delete(state.register_opts, task_queue),
         draining: MapSet.delete(state.draining, task_queue),
         owners: owners
