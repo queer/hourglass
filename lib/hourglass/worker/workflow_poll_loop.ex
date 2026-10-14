@@ -19,14 +19,18 @@ defmodule Hourglass.Worker.WorkflowPollLoop do
 
   When `BridgeHolder.poll_workflow_activation/1` returns
   `{:error, %Bridge.Error{kind: :shutdown}}` the loop disambiguates
-  via `BridgeHolder.registered?/1`:
+  via `BridgeHolder.handle_state/1`:
 
-    * `registered?` → false: the Worker is being torn down (graceful
-      `Worker.terminate/2` already called `unregister_worker`). Exit
-      `:normal` and let the inner Supervisor reap the loop.
-    * `registered?` → true: the holder recycled the bridge handle
-      mid-flight (poll-caller DOWN). Sleep briefly + retry
-      against the new handle.
+    * `:draining` → the Worker is stopping gracefully, and Core has
+      handed out — and been sent the completion of — every workflow
+      task it held: the workflow side has drained. Exit `:normal`.
+      Until then a draining handle's polls go on returning activations,
+      which this loop dispatches as usual (`Hourglass.Worker`'s
+      "Graceful stop").
+    * `:none` → the handle is gone (the Worker is being torn down).
+      Exit `:normal` and let the inner Supervisor reap the loop.
+    * `:active` → the holder recycled the bridge handle mid-flight
+      (poll-caller DOWN). Sleep briefly + retry against the new handle.
 
   If the call returns `{:error, :worker_not_registered}` the loop
   treats it as a transient retry condition (sleep + retry) —
@@ -130,15 +134,17 @@ defmodule Hourglass.Worker.WorkflowPollLoop do
         loop(state)
 
       {:error, %Bridge.Error{kind: :shutdown}} ->
-        # Recycle vs. graceful-shutdown disambiguation: if BridgeHolder
-        # still holds a handle for this task queue, the :shutdown came
-        # from a recycle — sleep briefly + retry against the
-        # new handle. Otherwise the Worker is being torn down — exit.
-        if BridgeHolder.registered?(state.task_queue) do
-          Process.sleep(50)
-          loop(state)
-        else
-          :ok
+        # Recycle vs. shutdown disambiguation: an :active handle means the
+        # :shutdown came from a recycle — sleep briefly + retry against the
+        # new handle. A draining handle has finished its workflow work, and
+        # a missing one is gone — exit either way.
+        case BridgeHolder.handle_state(state.task_queue) do
+          :active ->
+            Process.sleep(50)
+            loop(state)
+
+          _draining_or_none ->
+            :ok
         end
 
       {:error, :worker_not_registered} ->

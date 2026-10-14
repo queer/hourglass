@@ -275,9 +275,9 @@ defmodule Hourglass.EvictionReplayIntegrationTest do
 
     # A new worker on the same queue gets a new Core with an empty cache, so it
     # replays the run from the start of its history. The old worker's state
-    # for the run is still cached in this VM — a stopping worker unregisters
-    # its bridge before Core can drain its cache, so no eviction reaches it.
-    # Put it back regardless, so the test does not depend on that.
+    # for the run is still cached in this VM — Core does not evict a stopping
+    # worker's idle cached runs, so no eviction reaches it. Put it back
+    # regardless, so the test does not depend on that.
     :ok = stop_supervised(Hourglass.Worker)
     :ok = WorkflowStateCache.put(queue, handle.run_id, stale)
     {:ok, _worker} = start_supervised({Hourglass.Worker, task_queue: queue})

@@ -10,11 +10,14 @@ defmodule Hourglass.ActivityRunner do
 
   Activities are plain Elixir — no determinism constraint, no special
   process model. They do NOT hold a raw bridge `reference()`; they
-  call the BridgeHolder API with their `task_queue`. If the holder no
-  longer has the task queue registered (Worker is shutting down) the
-  call returns `{:error, :worker_not_registered}` and is logged but
-  not raised — the activity result is lost from this dispatch and
-  Core will redeliver via heartbeat / start-to-close timeout.
+  call the BridgeHolder API with their `task_queue`. A Worker that is
+  stopping gracefully keeps the task queue registered until its
+  running activities have reported (`Hourglass.Worker`'s "Graceful
+  stop"). If the holder no longer has the task queue registered (a
+  holder restart, or a Worker that stopped without draining) the call
+  returns `{:error, :worker_not_registered}` and is logged but not
+  raised — the activity result is lost from this dispatch and Temporal
+  retries the activity after its heartbeat / start-to-close timeout.
 
   ## Failure handling
 
@@ -153,10 +156,13 @@ defmodule Hourglass.ActivityRunner do
 
   defp invoke(%{variant: {:cancel, %{reason: reason}}, task_token: task_token}, _task_queue) do
     # Temporal sends a Cancel variant when a workflow is terminated, an activity heartbeat times
-    # out, or completion races a cancellation request. Mark the token so the (still-heartbeating)
-    # running activity observes the cancel at its next Hourglass.Activity.heartbeat/0 and stops,
-    # then acknowledge the cancel back to Core via a Cancellation completion. The Start task's
-    # `after` block clears the token once it finishes.
+    # out, or completion races a cancellation request; Core sends one with reason WORKER_SHUTDOWN
+    # once a stopping worker's grace has run out (Hourglass.Worker, "Graceful stop"). Mark the
+    # token so the (still-heartbeating) running activity observes the cancel at its next
+    # Hourglass.Activity.heartbeat/0 and stops, then acknowledge the cancel back to Core via a
+    # Cancellation completion — which Core reports to the server as a retryable "WorkerShutdown"
+    # failure when the reason was WORKER_SHUTDOWN. The Start task's `after` block clears the token
+    # once it finishes.
     Hourglass.Activity.CancelRegistry.mark(task_token, reason)
 
     :telemetry.execute([:hourglass, :activity, :cancel_received], %{count: 1}, %{reason: reason})

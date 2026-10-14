@@ -19,12 +19,17 @@ defmodule Hourglass.Application do
 
   ## Local singletons (always-on)
 
-  `local_singletons/0` returns two DynamicSupervisors started
-  unconditionally because they are cheap, hold no cluster resources, and
-  are needed the moment any Worker (default or per-test) spins up:
+  `local_singletons/0` returns the processes started unconditionally
+  because they are cheap, hold no cluster resources, and are needed the
+  moment any Worker (default or per-test) spins up:
 
+    * `Hourglass.Activity.CancelRegistry` — cancellation flags read by
+      `Hourglass.Activity.heartbeat/0`.
     * `Hourglass.WorkflowEvaluator.DynamicSupervisor` — shared DynSup
       for per-activation evaluator Tasks.
+    * `Hourglass.ActivityExecutor.Registry` — a duplicate-key `Registry`
+      of activity executors by task queue, which a stopping Worker reads
+      to find its own (`Hourglass.ActivityExecutor.DynamicSupervisor`).
     * `Hourglass.ActivityExecutor.DynamicSupervisor` — shared DynSup
       for ephemeral activity-executor Tasks.
 
@@ -83,6 +88,7 @@ defmodule Hourglass.Application do
     [
       Hourglass.Activity.CancelRegistry,
       Hourglass.WorkflowEvaluator.DynamicSupervisor,
+      Hourglass.ActivityExecutor.DynamicSupervisor.registry_child_spec(),
       Hourglass.ActivityExecutor.DynamicSupervisor
     ]
   end

@@ -20,4 +20,9 @@ defmodule Hourglass.Proto.WorkerConfig do
   field :max_outstanding_local_activities, 7,
     type: :uint32,
     json_name: "maxOutstandingLocalActivities"
+
+  field :graceful_shutdown_period_ms, 8,
+    proto3_optional: true,
+    type: :uint32,
+    json_name: "gracefulShutdownPeriodMs"
 end

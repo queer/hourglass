@@ -22,11 +22,23 @@ defmodule Hourglass.ActivityExecutor.DynamicSupervisor do
   `restart: :temporary` — activity completion (success or failure) is
   shipped back to Core inside `run/3`, so OTP-level restart is not
   appropriate. Core owns activity-level retry.
+
+  ## Executors by task queue
+
+  Each executor registers under its task queue in
+  `Hourglass.ActivityExecutor.Registry` (a duplicate-key `Registry`
+  started next to this supervisor), so a stopping `Hourglass.Worker`
+  can find the executors of its own queue with `running/1`. A Worker
+  stops only the executors still running once its drain is over, whose
+  outcome either was already reported to Temporal or can never be
+  (`Hourglass.Worker`'s "Graceful stop").
   """
 
   use DynamicSupervisor
 
   alias Hourglass.ActivityRunner
+
+  @registry Hourglass.ActivityExecutor.Registry
 
   @typedoc "Args passed to `start_child/1`."
   @type child_args :: %{
@@ -57,11 +69,32 @@ defmodule Hourglass.ActivityExecutor.DynamicSupervisor do
       }) do
     spec = %{
       id: __MODULE__.Child,
-      start: {Task, :start_link, [fn -> ActivityRunner.run(activity_task, task_queue) end]},
+      start: {Task, :start_link, [fn -> execute(activity_task, task_queue) end]},
       restart: :temporary,
       type: :worker
     }
 
     DynamicSupervisor.start_child(__MODULE__, spec)
+  end
+
+  @doc """
+  The executors running for `task_queue`.
+  """
+  @spec running(String.t()) :: [pid()]
+  def running(task_queue) when is_binary(task_queue) do
+    for {pid, _value} <- Registry.lookup(@registry, task_queue), do: pid
+  end
+
+  @doc """
+  Child spec for `Hourglass.ActivityExecutor.Registry`, the duplicate-key
+  `Registry` each executor registers in under its task queue. Started by
+  `Hourglass.Application` just before this supervisor.
+  """
+  @spec registry_child_spec() :: Supervisor.child_spec()
+  def registry_child_spec, do: Registry.child_spec(keys: :duplicate, name: @registry)
+
+  defp execute(activity_task, task_queue) do
+    {:ok, _owner} = Registry.register(@registry, task_queue, nil)
+    ActivityRunner.run(activity_task, task_queue)
   end
 end

@@ -36,9 +36,44 @@ defmodule Hourglass.BridgeHolder do
   Worker child crashes can no longer destroy the handle. Poll loops,
   evaluators, and executors call this module's API instead of holding
   raw refs. Graceful shutdown of a Worker is ordered by
-  `Worker.terminate/2` calling `unregister_worker/1` BEFORE its poll
-  loops are killed (so in-flight long-polls return `:shutdown`
-  cleanly).
+  `Worker.terminate/2`: `initiate_shutdown/1` first, then the drain,
+  then `unregister_worker/1` (see "Shutting a handle down" below).
+
+  ## Shutting a handle down: initiate, drain, release
+
+  A handle goes through three states, which `handle_state/1` reports:
+
+    * `:active` — registered and polling the server for new tasks.
+    * `:draining` — `initiate_shutdown/1` has called
+      `Bridge.worker_shutdown/1` (Core's `initiate_shutdown`), so Core no
+      longer polls the server, but the handle is still held: polls,
+      completions and heartbeats go on working through it. Core keeps
+      handing out what it already holds — activations, activity cancels,
+      and any task a poll already in flight received — and a poll returns
+      `{:error, %Bridge.Error{kind: :shutdown}}` only once every workflow
+      task and activity Core handed out has been completed. A poll loop
+      that sees `:shutdown` while the handle is draining is done, and
+      exits. `registered?/1` is still true.
+    * gone — `unregister_worker/1` has dropped the handle. A completion
+      for it now returns `{:error, :worker_not_registered}` and never
+      reaches Temporal.
+
+  `Hourglass.Worker` drives the three in that order, so the work a
+  stopping worker holds reports its outcome before the handle goes. The
+  grace that bounds the drain is Core's `graceful_shutdown_period`, set
+  from the `:graceful_shutdown_period` register option: once it has
+  elapsed since `initiate_shutdown/1`, Core cancels every activity still
+  outstanding with reason `WORKER_SHUTDOWN`, and reports each one the
+  runner acknowledges to the server as a retryable `"WorkerShutdown"`
+  failure. See `Hourglass.Worker`'s "Graceful stop".
+
+  A draining handle is never recycled (see "Poll-caller DOWN ⇒ handle
+  recycle"): a fresh handle would poll the server for new tasks again.
+
+  The process that registered a handle owns it: if it dies without
+  unregistering — a Worker killed outright, say — the holder drops the
+  handle itself, so the task queue can be registered again and no handle
+  is leaked.
 
   ## Async-reply dispatch via Task.Supervisor (polls + register + unregister)
 
@@ -67,14 +102,12 @@ defmodule Hourglass.BridgeHolder do
       the result back via an internal `:store_handle` message; a
       `pending_registrations` MapSet guards against duplicate-register
       races during the in-flight window.
-    * `unregister_worker/1` — `worker_shutdown` (50–500ms). The
-      handle is popped from state synchronously (so subsequent
-      `registered?/1` calls see the unregister immediately); the
-      `worker_shutdown` runs in the Task and replies once it returns.
-      `Worker.terminate/2` relies on this contract: when the
-      `unregister_worker` reply lands, in-flight poll NIFs on the
-      handle have already begun returning `:shutdown`, so the inner
-      Supervisor stop that follows can reap the poll loops cleanly.
+    * `initiate_shutdown/1` and `unregister_worker/1` —
+      `worker_shutdown` (50–500ms). `initiate_shutdown/1` marks the
+      handle draining and keeps it; `unregister_worker/1` pops it from
+      state synchronously (so subsequent `registered?/1` calls see the
+      unregister immediately). Either way the `worker_shutdown` runs in
+      the Task, which replies once it returns.
 
   ## Serialised workflow-activation completions
 
@@ -117,10 +150,13 @@ defmodule Hourglass.BridgeHolder do
 
   Evaluator and activity-executor Tasks live under shared
   Application-level DynSups, NOT under per-Worker subtrees. They
-  survive Worker child crashes. When they try to ship a completion
-  after a transient registry hiccup, the call returns
-  `{:error, :worker_not_registered}` — the Task exits — Core
-  redelivers the activation/task on the next poll on a fresh consumer.
+  survive Worker child crashes, and a gracefully stopping Worker keeps
+  its handle until they have reported (see above). When one tries to
+  ship a completion after the handle is gone — a holder restart, or a
+  Worker that stopped without draining — the call returns
+  `{:error, :worker_not_registered}`, the Task exits, and Temporal
+  hears nothing of that task until its timeout (a workflow task's, or
+  an activity's heartbeat or start-to-close timeout), then retries it.
   Idempotency for activities that have already done expensive work
   is the caller's responsibility — Hourglass provides no built-in
   deduplication cache.
@@ -199,6 +235,44 @@ defmodule Hourglass.BridgeHolder do
   @spec default_max_cached_workflows() :: pos_integer()
   def default_max_cached_workflows, do: @default_max_cached_workflows
 
+  # How long a stopping worker lets its running activities finish before
+  # Core reports each as failed by the shutdown, when neither the worker's
+  # options nor `config :hourglass, Hourglass.Worker` set
+  # `:graceful_shutdown_period`. Twenty seconds, plus the drain's margin
+  # (`Hourglass.Worker`), stays inside the thirty seconds an orchestrator
+  # commonly allows a stopping node before it kills it.
+  @default_graceful_shutdown_period 20_000
+
+  @doc false
+  @spec default_graceful_shutdown_period() :: non_neg_integer()
+  def default_graceful_shutdown_period, do: @default_graceful_shutdown_period
+
+  # Core takes the grace as a uint32 of milliseconds.
+  @max_graceful_shutdown_period 4_294_967_295
+
+  # The grace a Worker started with `opts` gives its running activities when it
+  # stops: the option, else `config :hourglass, Hourglass.Worker`, else the
+  # default. Public as `Hourglass.Worker.graceful_shutdown_period/1`; it lives
+  # here, next to the default and the wire field it fills.
+  @doc false
+  @spec graceful_shutdown_period(keyword()) :: non_neg_integer()
+  def graceful_shutdown_period(opts) do
+    grace =
+      Keyword.get_lazy(opts, :graceful_shutdown_period, fn ->
+        :hourglass
+        |> Application.get_env(Hourglass.Worker, [])
+        |> Keyword.get(:graceful_shutdown_period, @default_graceful_shutdown_period)
+      end)
+
+    if is_integer(grace) and grace >= 0 and grace <= @max_graceful_shutdown_period do
+      grace
+    else
+      raise ArgumentError,
+            ":graceful_shutdown_period must be a non-negative integer of milliseconds " <>
+              "(at most #{@max_graceful_shutdown_period}), got: #{inspect(grace)}"
+    end
+  end
+
   @typedoc "Options accepted by `register_worker/2`."
   @type register_opts :: [
           namespace: String.t(),
@@ -206,7 +280,8 @@ defmodule Hourglass.BridgeHolder do
           target_url: String.t(),
           max_outstanding_workflow_tasks: non_neg_integer(),
           max_outstanding_activities: non_neg_integer(),
-          max_outstanding_local_activities: non_neg_integer()
+          max_outstanding_local_activities: non_neg_integer(),
+          graceful_shutdown_period: non_neg_integer()
         ]
 
   @typedoc "Internal state."
@@ -216,6 +291,11 @@ defmodule Hourglass.BridgeHolder do
           register_opts: %{optional(String.t()) => register_opts()},
           pollers: %{optional(pid()) => {String.t(), reference()}},
           recycling: MapSet.t(String.t()),
+          # Task queues whose handle `initiate_shutdown/1` has shut down but
+          # which are still held, so their work can finish and report.
+          draining: MapSet.t(String.t()),
+          # The monitor on each handle's owner (the process that registered it).
+          owners: %{optional(String.t()) => reference()},
           task_sup: pid(),
           # Per-task-queue FIFO queues for serialised workflow-activation completions.
           # `completion_active` holds task_queues with an in-flight Task.
@@ -246,12 +326,28 @@ defmodule Hourglass.BridgeHolder do
   end
 
   @doc """
+  Stop the handle for `task_queue` polling the server for new tasks,
+  and keep it, so the work it already handed out can finish and report
+  through it. Calls `Bridge.worker_shutdown/1` (Core's
+  `initiate_shutdown`) and marks the handle `:draining` (see "Shutting a
+  handle down" in the moduledoc). Returns `:ok` once Core has stopped
+  polling, and at once for a handle already draining. Returns
+  `{:error, :worker_not_registered}` if `task_queue` has no handle, so
+  there is nothing to drain.
+  """
+  @spec initiate_shutdown(String.t()) :: :ok | {:error, :worker_not_registered}
+  def initiate_shutdown(task_queue) when is_binary(task_queue) do
+    GenServer.call(__MODULE__, {:initiate_shutdown, task_queue}, 30_000)
+  end
+
+  @doc """
   Drop the handle for `task_queue` (calling `Bridge.worker_shutdown/1`
   on the way out). Idempotent: unknown task_queue returns `:ok`.
 
-  After this call any in-flight `Bridge.worker_poll_*` against the
-  shutdown handle will return `{:error, %Bridge.Error{kind: :shutdown}}`,
-  which is the contract the poll loops use to exit `:normal`.
+  Whatever the handle handed out and has not yet been completed can no
+  longer report: a completion for it returns
+  `{:error, :worker_not_registered}`. `Hourglass.Worker` therefore calls
+  `initiate_shutdown/1` and drains before it calls this.
   """
   @spec unregister_worker(String.t()) :: :ok
   def unregister_worker(task_queue) when is_binary(task_queue) do
@@ -259,13 +355,24 @@ defmodule Hourglass.BridgeHolder do
   end
 
   @doc """
-  Returns true iff a handle is currently registered for `task_queue`.
-  Used by poll loops to distinguish "registration in flight" (transient
-  retry) from "no worker should be polling" (exit).
+  Returns true iff a handle is currently registered for `task_queue`,
+  draining or not.
   """
   @spec registered?(String.t()) :: boolean()
   def registered?(task_queue) when is_binary(task_queue) do
     GenServer.call(__MODULE__, {:registered?, task_queue})
+  end
+
+  @doc """
+  The state of the handle for `task_queue`: `:active` (polling for new
+  tasks), `:draining` (`initiate_shutdown/1` has been called, the handle
+  is still held), or `:none`. A poll loop that sees `:shutdown` from a
+  poll uses this to tell a recycle (`:active`: poll again) from the end
+  of its work (`:draining` or `:none`: exit).
+  """
+  @spec handle_state(String.t()) :: :active | :draining | :none
+  def handle_state(task_queue) when is_binary(task_queue) do
+    GenServer.call(__MODULE__, {:handle_state, task_queue})
   end
 
   # ---------------------------------------------------------------------------
@@ -346,6 +453,8 @@ defmodule Hourglass.BridgeHolder do
        register_opts: %{},
        pollers: %{},
        recycling: MapSet.new(),
+       draining: MapSet.new(),
+       owners: %{},
        task_sup: task_sup,
        completion_active: MapSet.new(),
        completion_queue: %{}
@@ -383,39 +492,55 @@ defmodule Hourglass.BridgeHolder do
   end
 
   @impl GenServer
+  def handle_call({:initiate_shutdown, task_queue}, from, state) do
+    case Map.fetch(state.handles, task_queue) do
+      {:ok, handle} ->
+        if MapSet.member?(state.draining, task_queue) do
+          {:reply, :ok, state}
+        else
+          # Same throughput rationale as unregister: worker_shutdown runs in a
+          # Task, which replies once Core has stopped polling. The handle stays
+          # in `handles`, so the work Core already handed out completes through
+          # it.
+          shutdown_in_task(state, handle, task_queue, from)
+          {:noreply, %{state | draining: MapSet.put(state.draining, task_queue)}}
+        end
+
+      :error ->
+        {:reply, {:error, :worker_not_registered}, state}
+    end
+  end
+
+  @impl GenServer
   def handle_call({:unregister_worker, task_queue}, from, state) do
     case Map.pop(state.handles, task_queue) do
       {nil, _handles} ->
         {:reply, :ok, state}
 
-      {handle, handles} when is_reference(handle) ->
+      {handle, _handles} when is_reference(handle) ->
         # Run worker_shutdown in a Task — same throughput rationale as
-        # register. Caller blocks on GenServer.call until the Task replies,
-        # so the contract "after unregister returns :ok the handle is
-        # drained" is preserved (Worker.terminate/2 relies on this:
-        # in-flight poll NIFs return :shutdown before the inner
-        # Supervisor stops the poll loops).
-        Task.Supervisor.start_child(state.task_sup, fn ->
-          _result = Bridge.worker_shutdown(handle)
-          GenServer.reply(from, :ok)
-        end)
-
-        # Drop register_opts too — a recycle in flight will detect the
-        # missing handle entry and discard its new handle. No need to
-        # also key on register_opts presence.
-        new_state = %{
-          state
-          | handles: handles,
-            register_opts: Map.delete(state.register_opts, task_queue)
-        }
-
-        {:noreply, new_state}
+        # register. The caller blocks on GenServer.call until the Task
+        # replies.
+        shutdown_in_task(state, handle, task_queue, from)
+        {:noreply, release(state, task_queue)}
     end
   end
 
   @impl GenServer
   def handle_call({:registered?, task_queue}, _from, state) do
     {:reply, Map.has_key?(state.handles, task_queue), state}
+  end
+
+  @impl GenServer
+  def handle_call({:handle_state, task_queue}, _from, state) do
+    reply =
+      cond do
+        not Map.has_key?(state.handles, task_queue) -> :none
+        MapSet.member?(state.draining, task_queue) -> :draining
+        true -> :active
+      end
+
+    {:reply, reply, state}
   end
 
   @impl GenServer
@@ -545,11 +670,16 @@ defmodule Hourglass.BridgeHolder do
   # replies to the original GenServer.call from.
   @impl GenServer
   def handle_info({:store_handle, task_queue, handle, opts, from}, state) do
+    # The registering process owns the handle: monitor it, so a handle whose
+    # owner dies without unregistering is dropped rather than leaked.
+    {owner, _tag} = from
+
     new_state = %{
       state
       | handles: Map.put(state.handles, task_queue, handle),
         register_opts: Map.put(state.register_opts, task_queue, opts),
-        pending_registrations: MapSet.delete(state.pending_registrations, task_queue)
+        pending_registrations: MapSet.delete(state.pending_registrations, task_queue),
+        owners: Map.put(state.owners, task_queue, Process.monitor(owner))
     }
 
     GenServer.reply(from, :ok)
@@ -599,17 +729,19 @@ defmodule Hourglass.BridgeHolder do
         pollers = Map.delete(state.pollers, caller_pid)
         new_state = %{state | pollers: pollers}
 
-        if MapSet.member?(state.recycling, task_queue) do
+        if MapSet.member?(state.recycling, task_queue) or
+             MapSet.member?(state.draining, task_queue) do
           # Recycle for this task queue is already in flight (another
-          # poll caller died first). Just drop this caller from pollers.
+          # poll caller died first), or the handle is draining, which a
+          # fresh handle polling for new tasks would undo. Just drop this
+          # caller from pollers.
           {:noreply, new_state}
         else
           maybe_dispatch_recycle(new_state, task_queue, caller_pid)
         end
 
       _other ->
-        # Stale DOWN (already cleaned up) or unrelated monitor — ignore.
-        {:noreply, state}
+        {:noreply, owner_down(state, ref)}
     end
   end
 
@@ -624,6 +756,8 @@ defmodule Hourglass.BridgeHolder do
       Logger.warning(
         "BridgeHolder recycled handle for task_queue=#{task_queue} after poll-caller DOWN"
       )
+
+      shutdown_if_draining(state, task_queue, new_handle)
 
       {:noreply,
        %{state | handles: Map.put(state.handles, task_queue, new_handle), recycling: recycling}}
@@ -655,12 +789,8 @@ defmodule Hourglass.BridgeHolder do
         "dropping handle entry"
     )
 
-    new_state = %{
-      state
-      | handles: Map.delete(state.handles, task_queue),
-        register_opts: Map.delete(state.register_opts, task_queue),
-        recycling: MapSet.delete(state.recycling, task_queue)
-    }
+    new_state =
+      release(%{state | recycling: MapSet.delete(state.recycling, task_queue)}, task_queue)
 
     {:noreply, new_state}
   end
@@ -700,6 +830,67 @@ defmodule Hourglass.BridgeHolder do
   # ---------------------------------------------------------------------------
   # Internals
   # ---------------------------------------------------------------------------
+
+  # Run `Bridge.worker_shutdown/1` on the holder's Task.Supervisor and reply
+  # `:ok` to `from` once it returns. A stale handle (NIF reload) still
+  # replies, so the caller never waits out its call timeout.
+  defp shutdown_in_task(state, handle, task_queue, from) do
+    Task.Supervisor.start_child(state.task_sup, fn ->
+      _result = safe_worker_shutdown(handle, task_queue)
+      GenServer.reply(from, :ok)
+    end)
+  end
+
+  # `initiate_shutdown` landed while a recycle was in flight: it shut the old
+  # handle down, and the recycled one must not poll for new tasks either.
+  defp shutdown_if_draining(state, task_queue, handle) do
+    if MapSet.member?(state.draining, task_queue) do
+      Task.Supervisor.start_child(state.task_sup, fn ->
+        _result = safe_worker_shutdown(handle, task_queue)
+      end)
+    end
+  end
+
+  # Forget every trace of `task_queue`'s handle. Dropping register_opts too
+  # means a recycle in flight detects the missing handle entry and discards
+  # its new handle.
+  defp release(state, task_queue) do
+    {owner_ref, owners} = Map.pop(state.owners, task_queue)
+    if owner_ref, do: Process.demonitor(owner_ref, [:flush])
+
+    %{
+      state
+      | handles: Map.delete(state.handles, task_queue),
+        register_opts: Map.delete(state.register_opts, task_queue),
+        draining: MapSet.delete(state.draining, task_queue),
+        owners: owners
+    }
+  end
+
+  # The owner of a handle died without unregistering it (a Worker killed
+  # outright, so its terminate/2 never ran): drop the handle, so the task
+  # queue can be registered again and the handle is not leaked. A DOWN that
+  # matches no owner is stale or unrelated, and ignored.
+  defp owner_down(state, ref) do
+    case Enum.find(state.owners, fn {_task_queue, owner_ref} -> owner_ref == ref end) do
+      {task_queue, ^ref} ->
+        Logger.warning(
+          "BridgeHolder dropping the handle for task_queue=#{task_queue}: " <>
+            "its owner exited without unregistering it"
+        )
+
+        handle = Map.fetch!(state.handles, task_queue)
+
+        Task.Supervisor.start_child(state.task_sup, fn ->
+          _result = safe_worker_shutdown(handle, task_queue)
+        end)
+
+        release(state, task_queue)
+
+      nil ->
+        state
+    end
+  end
 
   defp dispatch_poll(state, task_queue, from, poll_fn) do
     case Map.fetch(state.handles, task_queue) do
@@ -842,7 +1033,7 @@ defmodule Hourglass.BridgeHolder do
         gs_pid = self()
 
         Task.Supervisor.start_child(state.task_sup, fn ->
-          _shutdown_result = recycle_shutdown(old_handle, task_queue)
+          _shutdown_result = safe_worker_shutdown(old_handle, task_queue)
           result = recycle_new(runtime, config_bin, task_queue)
           send(gs_pid, {:handle_recycled, task_queue, result})
         end)
@@ -857,10 +1048,13 @@ defmodule Hourglass.BridgeHolder do
     end
   end
 
-  # `worker_shutdown` on the old handle makes every in-flight poll return
-  # :shutdown — the orphan from the dead caller AND any healthy parallel poll.
-  defp recycle_shutdown(old_handle, task_queue) do
-    Bridge.worker_shutdown(old_handle)
+  # `worker_shutdown` stops a handle polling the server. On a recycle's old
+  # handle it makes every in-flight poll return :shutdown — the orphan from
+  # the dead caller AND any healthy parallel poll — since nothing is
+  # outstanding on it that Core waits for. A stale handle (NIF reload)
+  # signals the cascade instead of raising into the caller.
+  defp safe_worker_shutdown(handle, task_queue) do
+    Bridge.worker_shutdown(handle)
   rescue
     err in ArgumentError ->
       :telemetry.execute(
@@ -869,7 +1063,7 @@ defmodule Hourglass.BridgeHolder do
         %{failure_class: :nif_reload, task_queue: task_queue, detail: Exception.message(err)}
       )
 
-      signal_nif_reload!("worker_shutdown/recycle")
+      signal_nif_reload!("worker_shutdown")
       :nif_reloaded
   end
 
@@ -949,7 +1143,9 @@ defmodule Hourglass.BridgeHolder do
       client_target_url: Keyword.get(opts, :target_url, Client.default_target_url()),
       max_outstanding_workflow_tasks: Keyword.get(opts, :max_outstanding_workflow_tasks, 0),
       max_outstanding_activities: Keyword.get(opts, :max_outstanding_activities, 0),
-      max_outstanding_local_activities: Keyword.get(opts, :max_outstanding_local_activities, 0)
+      max_outstanding_local_activities: Keyword.get(opts, :max_outstanding_local_activities, 0),
+      graceful_shutdown_period_ms:
+        Keyword.get(opts, :graceful_shutdown_period, @default_graceful_shutdown_period)
     })
   end
 end

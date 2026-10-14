@@ -33,11 +33,16 @@ defmodule Hourglass.Worker.Supervisor do
 
   @doc """
   Stop the Worker for `task_queue`. Looks the Worker pid up via
-  `WorkerRegistry`, terminates its child entry under this DynSup
-  (which runs `Worker.terminate/2`, calling
-  `BridgeHolder.unregister_worker/1` along the way). If the Worker
-  isn't registered, defensively unregister the bridge handle anyway
-  (idempotent) and return `{:error, :not_found}`.
+  `WorkerRegistry` and terminates its child entry under this DynSup,
+  which runs the Worker's graceful stop (`Hourglass.Worker`'s "Graceful
+  stop"): it returns once the work the Worker held has finished and
+  reported, or the grace has run out, and the handle is released. That
+  can take up to the Worker's `:graceful_shutdown_period` plus fifteen
+  seconds, and this supervisor starts or stops no other Worker
+  meanwhile. If the Worker isn't registered, defensively unregister the
+  bridge handle anyway (idempotent) and return `{:error, :not_found}` —
+  as a second stop of a Worker already stopping does, once the first
+  has finished.
   """
   @spec stop_worker(String.t()) :: :ok | {:error, :not_found}
   def stop_worker(task_queue) when is_binary(task_queue) do

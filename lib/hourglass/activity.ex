@@ -155,8 +155,9 @@ defmodule Hourglass.Activity do
     * Swallows a BridgeHolder `:exit` (holder absent or mid-recycle) — a heartbeat must never
       crash or fail the activity.
 
-  Returns `:cancel` iff Core has cancelled this activity (heartbeat timeout, workflow cancel, or
-  terminate) — the runner's Cancel-task handler marked the token in `CancelRegistry`. Long
+  Returns `:cancel` iff Core has cancelled this activity (heartbeat timeout, workflow cancel,
+  terminate, or its worker stopping and the grace running out — see `Hourglass.Worker`'s
+  "Graceful stop") — the runner's Cancel-task handler marked the token in `CancelRegistry`. Long
   activities check the return at their heartbeat points and stop cleanly; or use `heartbeat!/0`.
 
   Liveness only: no `details` payload (Hourglass does not surface heartbeat details on retry).

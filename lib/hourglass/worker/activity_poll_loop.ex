@@ -15,11 +15,18 @@ defmodule Hourglass.Worker.ActivityPollLoop do
   ## Shutdown
 
   Same shape as `WorkflowPollLoop`: `:shutdown` from the bridge is
-  disambiguated against `BridgeHolder.registered?/1` — exit `:normal`
-  if the holder no longer has a handle (graceful Worker teardown),
-  sleep + retry if it still does (handle recycle).
-  `:worker_not_registered` → brief sleep + retry; other errors → log
-  + sleep + retry.
+  disambiguated against `BridgeHolder.handle_state/1` — exit `:normal`
+  if the handle is draining or gone, sleep + retry if it is still
+  active (handle recycle). `:worker_not_registered` → brief sleep +
+  retry; other errors → log + sleep + retry.
+
+  While a Worker stops gracefully its handle drains, and this loop keeps
+  polling it: Core hands out the cancels it issues (the
+  `WORKER_SHUTDOWN` cancels among them, once the grace has elapsed) and
+  any task a poll already in flight received, and returns `:shutdown`
+  only once every activity it handed out has been completed — which is
+  when the activity side has drained (`Hourglass.Worker`'s "Graceful
+  stop").
   """
 
   alias Coresdk.ActivityTask.ActivityTask
@@ -68,13 +75,15 @@ defmodule Hourglass.Worker.ActivityPollLoop do
         loop(state)
 
       {:error, %Bridge.Error{kind: :shutdown}} ->
-        # Recycle vs. graceful-shutdown disambiguation; see
-        # WorkflowPollLoop for the rationale.
-        if BridgeHolder.registered?(state.task_queue) do
-          Process.sleep(50)
-          loop(state)
-        else
-          :ok
+        # Recycle vs. shutdown disambiguation; see WorkflowPollLoop for the
+        # rationale.
+        case BridgeHolder.handle_state(state.task_queue) do
+          :active ->
+            Process.sleep(50)
+            loop(state)
+
+          _draining_or_none ->
+            :ok
         end
 
       {:error, :worker_not_registered} ->

@@ -11,6 +11,10 @@ defmodule Hourglass.Telemetry do
   @events [
     [:hourglass, :connection, :failed],
     [:hourglass, :worker, :registration_failed],
+    # a stopping worker has stopped taking new tasks (Hourglass.Worker, "Graceful stop")
+    [:hourglass, :worker, :stopping],
+    # a stopping worker has released its handle; measurements: duration, abandoned_activities
+    [:hourglass, :worker, :stopped],
     [:hourglass, :activity, :heartbeat],
     # reserved — not currently emitted; placeholder for future heartbeat tracking
     [:hourglass, :activity, :heartbeat_lost],

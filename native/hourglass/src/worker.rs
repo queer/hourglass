@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use prost::Message;
 use rustler::{Binary, ResourceArc};
@@ -48,6 +49,11 @@ pub struct HourglassWorkerConfig {
     pub max_outstanding_activities: u32,
     #[prost(uint32, tag = "7")]
     pub max_outstanding_local_activities: u32,
+    // How long a worker that has begun to shut down lets its running
+    // activities finish before Core cancels each with reason WORKER_SHUTDOWN
+    // (reported to the server as a retryable failure). None = never cancel.
+    #[prost(uint32, optional, tag = "8")]
+    pub graceful_shutdown_period_ms: Option<u32>,
 }
 
 // Historical hardcoded value used when the Elixir caller leaves the
@@ -95,6 +101,10 @@ pub fn worker_new(
         .max_outstanding_workflow_tasks(max_wf)
         .max_outstanding_activities(max_act)
         .max_outstanding_local_activities(max_local_act)
+        .maybe_graceful_shutdown_period(
+            cfg.graceful_shutdown_period_ms
+                .map(|ms| Duration::from_millis(u64::from(ms))),
+        )
         .task_types(WorkerTaskTypes::all())
         .versioning_strategy(WorkerVersioningStrategy::default())
         .build()
@@ -225,9 +235,14 @@ pub fn worker_shutdown(
     worker: ResourceArc<WorkerResource>,
 ) -> OkOrError {
     // initiate_shutdown signals shutdown (cancels the CancellationToken) and returns
-    // immediately. Subsequent polls will return PollError::ShutDown. The full async
-    // `shutdown()` waits for pollers to drain and requires the lang layer to call poll
-    // until ShutDown — that is the workflow execution loop, not a lifecycle NIF.
+    // immediately. Core stops polling the server for new tasks, but keeps handing out
+    // what it already holds: polls go on returning activations, activity cancels (among
+    // them the WORKER_SHUTDOWN cancels issued once graceful_shutdown_period elapses) and
+    // tasks a poll already in flight received, and return PollError::ShutDown only once
+    // every outstanding workflow task and activity has been completed through this
+    // handle. Hourglass.Worker keeps polling and completing until then (its graceful
+    // stop); the full async `shutdown()` waits for the same thing, so it is not a
+    // lifecycle NIF. Calling this again is a no-op.
     //
     // Both initiate_shutdown and shutdown call tokio::spawn internally, so they must run
     // within the tokio runtime context. We use block_on with a trivial async block so the

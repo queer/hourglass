@@ -4,6 +4,19 @@ defmodule Hourglass.Worker do
   registration for one task queue and runs a small inner Supervisor
   hosting the two poll loops driving Temporal Core.
 
+  ## Options
+
+    * `:task_queue` (required) — the task queue to serve.
+    * `:graceful_shutdown_period` — milliseconds a stopping worker lets
+      the activities it is running finish (see "Graceful stop"). Falls
+      back to `config :hourglass, Hourglass.Worker,
+      graceful_shutdown_period: ms`, then to 20 seconds. `0` reports
+      every running activity as failed by the shutdown at once.
+    * `:namespace`, `:target_url`, `:max_cached_workflows`,
+      `:max_outstanding_workflow_tasks`, `:max_outstanding_activities`,
+      `:max_outstanding_local_activities` — passed to the bridge
+      worker; see `Hourglass.BridgeHolder.register_worker/2`.
+
   ## Why a GenServer + inner Supervisor (not just `use Supervisor`)
 
   This module needs `init/1` and `terminate/2` callbacks so it can
@@ -20,18 +33,72 @@ defmodule Hourglass.Worker do
        The poll loops call `BridgeHolder.poll_*` against the now-live
        handle.
 
-  Sequence on graceful stop:
+  ## Graceful stop
 
-    1. Caller invokes `Worker.Supervisor.stop_worker(task_queue)` —
-       OR — Application shutdown reverse-walks children and stops
-       this GenServer.
-    2. `terminate/2` runs (we trap exits) and calls
-       `BridgeHolder.unregister_worker(task_queue)`. The bridge handle
-       is destroyed; any in-flight long-poll on it returns
-       `{:error, %Bridge.Error{kind: :shutdown}}`.
-    3. The poll loops see `:shutdown` and exit `:normal`. The inner
-       Supervisor reaps them and exits `:normal`.
-    4. `terminate/2` returns. The GenServer exits.
+  A Worker is stopped gracefully when its supervisor stops it — by
+  `Worker.Supervisor.stop_worker/1`, by `stop_supervised/1`, or as the
+  application or the node shuts down. It then:
+
+    1. **Stops taking new tasks.** `terminate/2` calls
+       `BridgeHolder.initiate_shutdown/1`: Core stops polling the
+       server, and the server stops handing this worker tasks. The
+       handle stays registered. `[:hourglass, :worker, :stopping]` is
+       emitted.
+    2. **Lets the work it holds finish and report.** The poll loops keep
+       polling the draining handle. Workflow tasks already handed out
+       are evaluated and completed as usual, and so are tasks a poll
+       already in flight received as the stop began. Running activities
+       go on running, and report their outcome — completion or failure
+       — to Temporal through the still-held handle, exactly as they
+       would have. Each loop exits once Core says its side has drained:
+       every workflow task and activity it handed out has been
+       completed.
+    3. **Bounds the wait with the grace.** Once `:graceful_shutdown_period`
+       has passed since step 1, Core cancels every activity still
+       running with reason `WORKER_SHUTDOWN`. The runner marks each
+       cancelled, so an activity that heartbeats with
+       `Hourglass.Activity.heartbeat!/0` stops at its next heartbeat,
+       and acknowledges the cancel at once; Core reports the activity
+       to Temporal as a **retryable failure of type `"WorkerShutdown"`**
+       ("Worker is shutting down and this activity did not complete in
+       time"). Temporal retries it right away, on whichever worker
+       serves the queue, as its retry policy allows — it does not wait
+       out the activity's start-to-close timeout. (Under the default
+       policy, `max_attempts: 1`, the activity fails at once, and the
+       workflow sees the failure at once.)
+    4. **Stops what is left.** With both loops gone — or once the grace
+       and a five-second margin have passed — the inner Supervisor is
+       stopped, and every activity executor still running for the queue
+       is stopped: sent a `:shutdown` exit, and killed two seconds later
+       if it traps exits. Its outcome was reported in step 3, so nothing
+       it could still do would reach Temporal, and stopping it keeps it
+       from racing its own retry.
+    5. **Lets go of Temporal.** `BridgeHolder.unregister_worker/1` drops
+       the handle. `[:hourglass, :worker, :stopped]` is emitted, with
+       the stop's `duration` and the number of `abandoned_activities`
+       stopped in step 4, and `drained: false` if step 4 came at the
+       margin's end rather than when Core had drained.
+
+  Stopping is therefore quick when nothing is running, and otherwise
+  takes as long as the longest running activity, up to the grace (plus
+  the moment Core takes to report the cancelled ones). `child_spec/1`
+  gives the Worker a shutdown timeout of the grace plus fifteen seconds,
+  so its supervisor waits for all of it.
+
+  Workflow tasks are not cut off by the grace: evaluating one is quick
+  and deterministic, so one in flight is completed in step 2. One that
+  has still not been completed when the margin runs out (a completion
+  stuck on the network, say) is lost with the handle, and the server
+  retries it after the workflow task timeout (ten seconds by default).
+  The same goes for an activity whose report is stuck: it is left to
+  its timeout.
+
+  A Worker that is not stopped gracefully — killed outright, or a node
+  that crashes — cannot do any of this: its activities' outcomes wait
+  out their timeouts. `BridgeHolder` still drops a killed Worker's
+  handle, so the queue can be served again. A Worker that stops
+  because its inner Supervisor crashed has no poll loops left to drain
+  with, and goes straight to step 4.
 
   ## Children of the inner Supervisor (`:one_for_one`)
 
@@ -67,9 +134,10 @@ defmodule Hourglass.Worker do
   this Worker's tree. A Worker child crash never destroys those
   Tasks. They survive, finish their work, and ship completions via
   `BridgeHolder` (which they reach by name, not by holding a
-  reference). If the Worker exits between dispatch and completion,
-  the in-flight Tasks see `{:error, :worker_not_registered}` and
-  Core redelivers via heartbeat / start-to-close timeout.
+  reference). If the handle is gone by the time one completes — a
+  `BridgeHolder` restart — the Task sees
+  `{:error, :worker_not_registered}` and Temporal retries the task
+  after its timeout.
 
   ## Naming
 
@@ -83,6 +151,7 @@ defmodule Hourglass.Worker do
 
   alias Hourglass.BridgeHolder
   alias Hourglass.Worker.ActivityPollLoop
+  alias Hourglass.Worker.GracefulStop
   alias Hourglass.Worker.WorkflowPollLoop
   alias Hourglass.WorkerRegistry
 
@@ -90,7 +159,11 @@ defmodule Hourglass.Worker do
           task_queue: String.t(),
           namespace: String.t(),
           max_cached_workflows: pos_integer(),
-          target_url: String.t()
+          target_url: String.t(),
+          max_outstanding_workflow_tasks: non_neg_integer(),
+          max_outstanding_activities: non_neg_integer(),
+          max_outstanding_local_activities: non_neg_integer(),
+          graceful_shutdown_period: non_neg_integer()
         ]
 
   @spec start_link(opts()) :: GenServer.on_start()
@@ -99,7 +172,11 @@ defmodule Hourglass.Worker do
     GenServer.start_link(__MODULE__, opts, name: WorkerRegistry.via(task_queue))
   end
 
-  @doc false
+  @doc """
+  Child spec for a Worker. Its `:shutdown` is the grace
+  (`:graceful_shutdown_period`) plus fifteen seconds, so a supervisor
+  stopping it waits for the whole graceful stop (see "Graceful stop").
+  """
   @spec child_spec(opts()) :: Supervisor.child_spec()
   def child_spec(opts) do
     %{
@@ -107,9 +184,20 @@ defmodule Hourglass.Worker do
       start: {__MODULE__, :start_link, [opts]},
       type: :worker,
       restart: :permanent,
-      shutdown: 10_000
+      shutdown: graceful_shutdown_period(opts) + GracefulStop.margins()
     }
   end
+
+  @doc """
+  The grace a Worker started with `opts` gives its running activities
+  when it stops, in milliseconds: the `:graceful_shutdown_period`
+  option, else `config :hourglass, Hourglass.Worker,
+  graceful_shutdown_period: ms`, else 20 seconds. Raises
+  `ArgumentError` unless it is a non-negative integer that fits in 32
+  bits.
+  """
+  @spec graceful_shutdown_period(keyword()) :: non_neg_integer()
+  defdelegate graceful_shutdown_period(opts), to: BridgeHolder
 
   @doc """
   Returns the inner Supervisor pid for `task_queue`, primarily for
@@ -130,7 +218,10 @@ defmodule Hourglass.Worker do
   # `WorkerLauncher` from `:hourglass, Hourglass.Worker` config) into
   # `BridgeHolder.register_worker/2` and ultimately the proto wire.
   # If a key isn't here, it's silently stripped — production app-config
-  # values stop reaching the Rust worker.
+  # values stop reaching the Rust worker. `:graceful_shutdown_period` is
+  # not listed: `init/1` always passes it, resolved by
+  # `graceful_shutdown_period/1`, so Core's grace is the one this Worker's
+  # stop waits on.
   @register_opts_keys [
     :namespace,
     :max_cached_workflows,
@@ -149,11 +240,16 @@ defmodule Hourglass.Worker do
     Process.flag(:trap_exit, true)
 
     task_queue = Keyword.fetch!(opts, :task_queue)
-    register_opts = Keyword.take(opts, @register_opts_keys)
+    grace = graceful_shutdown_period(opts)
+
+    register_opts =
+      opts
+      |> Keyword.take(@register_opts_keys)
+      |> Keyword.put(:graceful_shutdown_period, grace)
 
     with :ok <- BridgeHolder.register_worker(task_queue, register_opts),
          {:ok, sup_pid} <- start_inner_supervisor(task_queue) do
-      {:ok, %{task_queue: task_queue, sup_pid: sup_pid}}
+      {:ok, %{task_queue: task_queue, sup_pid: sup_pid, graceful_shutdown_period: grace}}
     else
       {:error, reason} ->
         # Roll back the bridge allocation if the inner Supervisor
@@ -179,35 +275,10 @@ defmodule Hourglass.Worker do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
+  # The graceful stop: see the moduledoc's "Graceful stop".
   @impl GenServer
-  def terminate(_reason, %{task_queue: task_queue, sup_pid: sup_pid}) do
-    # CRITICAL: unregister BEFORE the inner Supervisor's children are
-    # killed. Destroying the bridge handle here is what makes the
-    # poll loops' in-flight long-polls return :shutdown, so they exit
-    # :normal instead of being brutal-killed by the Supervisor.
-    #
-    # `:noproc` exit means BridgeHolder is already gone — typically a
-    # `:rest_for_one` cascade in `Hourglass.Subsystem` killed the
-    # holder first; its own terminate already called
-    # `Bridge.worker_shutdown` on every handle on the way out, so by
-    # the time we're here the bridge is already drained and there's
-    # nothing for `unregister_worker` to do. Treat as success rather
-    # than letting the :noproc propagate (which would log a noisy
-    # `[error] GenServer ... terminating` line on every Worker during
-    # the cascade — exit-reason logging is suppressed as expected).
-    try do
-      BridgeHolder.unregister_worker(task_queue)
-    catch
-      :exit, {:noproc, _call} -> :ok
-    end
-
-    # Now stop the inner Supervisor, which reverse-walks the now-quiet
-    # poll loops and reaps them. `Supervisor.stop/3` handles dead pids
-    # cleanly (the `_ =` swallows :noproc), so no `Process.alive?`
-    # guard — that check would be racy anyway.
-    _result = Supervisor.stop(sup_pid, :shutdown, 5_000)
-
-    :ok
+  def terminate(_reason, %{task_queue: task_queue, sup_pid: sup_pid} = state) do
+    GracefulStop.run(task_queue, sup_pid, state.graceful_shutdown_period)
   end
 
   # ---------------------------------------------------------------------------

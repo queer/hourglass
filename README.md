@@ -241,7 +241,8 @@ end
 to `:ok`).
 
 > **Scope:** cancellation is delivered by Temporal Core as a Cancel activity task — currently on
-> **heartbeat timeout** and server-side activity cancellation. Requesting cancellation of the parent
+> **heartbeat timeout**, server-side activity cancellation, and a stopping worker's grace running
+> out (see [Stopping a worker](#stopping-a-worker)). Requesting cancellation of the parent
 > *workflow* (`Hourglass.cancel/2`) does not yet propagate to in-flight activities (the evaluator
 > flags the workflow cancelled but issues no activity-cancel command).
 
@@ -267,6 +268,40 @@ config :hourglass, Hourglass.Worker,
   max_outstanding_activities: 100,
   max_outstanding_local_activities: 100
 ```
+
+### Stopping a worker
+
+A worker stopped gracefully — by its supervisor, by
+`Hourglass.Worker.Supervisor.stop_worker/1`, or as the application or node shuts
+down — finishes the work it holds before it lets go of Temporal:
+
+1. It stops polling, so Temporal hands it no new workflow or activity tasks.
+2. The workflow tasks and activities it is already running finish and report
+   their outcome (completion or failure) to Temporal as usual.
+3. An activity still running once the **grace** has passed is cancelled
+   (`heartbeat!/0` raises `Hourglass.Activity.Cancelled` at its next heartbeat)
+   and reported to Temporal as a **retryable failure of type `"WorkerShutdown"`**,
+   so Temporal retries it at once — on another worker, as its retry policy allows —
+   instead of waiting out its start-to-close timeout. Its process is then stopped.
+4. Only then is the worker's handle on Temporal released.
+
+So a stop takes as long as the longest running activity, up to the grace (and is
+immediate when nothing is running). The grace defaults to 20 seconds; set it per
+worker, or for every worker:
+
+```elixir
+# per worker
+{Hourglass.Worker, task_queue: "my-queue", graceful_shutdown_period: 30_000}
+
+# every worker
+config :hourglass, Hourglass.Worker, graceful_shutdown_period: 30_000
+```
+
+`Hourglass.Worker.child_spec/1` sets the worker's shutdown timeout to the grace plus
+fifteen seconds, so a supervisor waits for the whole stop. Keep the grace inside
+whatever your platform allows a stopping node before it kills it. A worker that is
+killed, or a node that crashes, cannot do any of this: its activities' outcomes wait
+out their timeouts. See `Hourglass.Worker`'s "Graceful stop" for the details.
 
 ### Dirty-IO schedulers
 
@@ -326,6 +361,8 @@ Hourglass emits the following `:telemetry` events:
 |---|---|
 | `[:hourglass, :connection, :failed]` | Temporal connection failed |
 | `[:hourglass, :worker, :registration_failed]` | Worker registration failed |
+| `[:hourglass, :worker, :stopping]` | A stopping worker has stopped taking new tasks; metadata includes `task_queue` and `graceful_shutdown_period` |
+| `[:hourglass, :worker, :stopped]` | A stopping worker has released its handle; measurements `duration` (ms) and `abandoned_activities`, metadata `task_queue` and `drained` |
 | `[:hourglass, :activity, :failure]` | Activity returned `{:error, _}` or raised; metadata includes classification |
 | `[:hourglass, :activity, :exception]` | Unhandled exception in activity dispatch |
 | `[:hourglass, :activity, :dispatch_failed]` | Activity could not be dispatched |

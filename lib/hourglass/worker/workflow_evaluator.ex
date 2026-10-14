@@ -31,9 +31,12 @@ defmodule Hourglass.Worker.WorkflowEvaluator do
 
   Evaluators do NOT hold a raw bridge `reference()`. They call
   `BridgeHolder.complete_workflow_activation(task_queue, bytes)`,
-  which mediates the NIF call. If the holder has been unregistered
-  for this task queue (e.g. Worker is shutting down between dispatch
-  and completion), the call returns `{:error, _reason}`; the evaluator
+  which mediates the NIF call. A Worker that is stopping gracefully
+  keeps the task queue registered until its evaluations have completed
+  (`Hourglass.Worker`'s "Graceful stop"). If the holder has been
+  unregistered for this task queue anyway (a holder restart, or a
+  Worker that stopped without draining), the call returns
+  `{:error, _reason}`; the evaluator
   logs and exits `:normal`. The completion never reached Core, so
   Core's per-activation watchdog timeout fires and Core redelivers
   the same activation. A fresh evaluator runs and produces a
