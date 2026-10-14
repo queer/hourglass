@@ -70,13 +70,25 @@ defmodule Hourglass.Worker.WorkflowPollLoop do
   poll loop never crashes: `dispatch/2` ships the failure inline and
   keeps polling. Workflow tasks retry indefinitely on the server (they do
   not fail the workflow), so this is safe and self-correcting.
+
+  ## An eviction is never a miss
+
+  An eviction (`remove_from_cache`, always the activation's only job) for
+  a run the worker holds no state for is not a miss: there is nothing to
+  drop and nothing to replay. Core sends one after every run it sees end,
+  and the worker drops a continued-as-new run's state when the run
+  continues; Core also evicts runs it never had cached. `dispatch/2` acks
+  such an eviction with an empty success, as Core expects of every
+  eviction, without logging.
   """
 
   alias Coresdk.WorkflowActivation.WorkflowActivation
   alias Coresdk.WorkflowCompletion.Failure
+  alias Coresdk.WorkflowCompletion.Success
   alias Coresdk.WorkflowCompletion.WorkflowActivationCompletion
   alias Hourglass.Bridge
   alias Hourglass.BridgeHolder
+  alias Hourglass.Worker.WorkflowStateCache
   alias Hourglass.Worker.WorkflowTypeResolver
   alias Hourglass.WorkflowEvaluator.DynamicSupervisor
 
@@ -174,7 +186,37 @@ defmodule Hourglass.Worker.WorkflowPollLoop do
         start_evaluator(bytes, activation, module, state)
 
       {:error, :sticky_cache_miss} ->
-        fail_sticky_task(activation, state)
+        if eviction?(activation),
+          do: ack_eviction(activation, state),
+          else: fail_sticky_task(activation, state)
+    end
+  end
+
+  defp eviction?(%WorkflowActivation{jobs: jobs}) do
+    Enum.any?(jobs, &match?(%{variant: {:remove_from_cache, _details}}, &1))
+  end
+
+  # See moduledoc "An eviction is never a miss". Whatever is still cached
+  # for the run (a state no workflow module was bound to) goes with it.
+  defp ack_eviction(activation, state) do
+    :ok = WorkflowStateCache.delete(state.task_queue, activation.run_id)
+
+    completion = %WorkflowActivationCompletion{
+      run_id: activation.run_id,
+      status: {:successful, %Success{commands: []}}
+    }
+
+    case state.complete_fn.(state.task_queue, Protobuf.encode(completion)) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "eviction ack could not be shipped " <>
+            "(task_queue=#{state.task_queue}, run_id=#{activation.run_id}): #{inspect(reason)}"
+        )
+
+        :ok
     end
   end
 

@@ -30,7 +30,9 @@ defmodule Hourglass.Worker.WorkflowTypeResolver do
   bug in the activation — a non-sticky full-history redelivery of the
   same run always carries `initialize_workflow` (tier 1), so the caller
   recovers by failing the sticky workflow task to force that redelivery.
-  See `Hourglass.Worker.WorkflowPollLoop` for the recovery.
+  An eviction of an uncached run returns it too; that needs no module and
+  is no miss, and the caller acks it instead. See
+  `Hourglass.Worker.WorkflowPollLoop` for both.
 
   A workflow-type name that IS present but cannot be turned into a
   loaded Hourglass workflow (bad format / unknown atom / not a workflow
