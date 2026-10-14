@@ -106,10 +106,10 @@ defmodule Hourglass.Worker.WorkflowEvaluatorTest do
     {:ok, pid} = WorkflowEvaluator.start_link(args)
     ref = Process.monitor(pid)
 
-    assert_receive {:completion_shipped, ^task_queue, bytes}, 1_000
+    assert_receive {:completion_shipped, ^task_queue, bytes}
     # :normal or :noproc — both indicate the evaluator finished cleanly
     # (Process.monitor synthesises :noproc if the pid already exited).
-    assert_receive {:DOWN, ^ref, :process, ^pid, reason}, 1_000
+    assert_receive {:DOWN, ^ref, :process, ^pid, reason}
     assert reason in [:normal, :noproc]
 
     completion = WorkflowActivationCompletion.decode(bytes)
@@ -150,10 +150,10 @@ defmodule Hourglass.Worker.WorkflowEvaluatorTest do
         {:ok, pid} = WorkflowEvaluator.start_link(args)
         ref = Process.monitor(pid)
 
-        assert_receive :complete_called, 1_000
+        assert_receive :complete_called
         # :normal or :noproc — both indicate the evaluator finished cleanly
         # (Process.monitor synthesises :noproc if the pid already exited).
-        assert_receive {:DOWN, ^ref, :process, ^pid, reason}, 1_000
+        assert_receive {:DOWN, ^ref, :process, ^pid, reason}
         assert reason in [:normal, :noproc]
       end)
 
@@ -177,10 +177,10 @@ defmodule Hourglass.Worker.WorkflowEvaluatorTest do
     {:ok, pid} = WorkflowEvaluator.start_link(args)
     ref = Process.monitor(pid)
 
-    assert_receive {:completion_shipped, ^task_queue, bytes}, 1_000
+    assert_receive {:completion_shipped, ^task_queue, bytes}
     # :normal or :noproc — both indicate the evaluator finished cleanly
     # (Process.monitor synthesises :noproc if the pid already exited).
-    assert_receive {:DOWN, ^ref, :process, ^pid, reason}, 1_000
+    assert_receive {:DOWN, ^ref, :process, ^pid, reason}
     assert reason in [:normal, :noproc]
 
     completion = WorkflowActivationCompletion.decode(bytes)
@@ -257,7 +257,7 @@ defmodule Hourglass.Worker.WorkflowEvaluatorTest do
     {:ok, pid} = DynamicSupervisor.start_child(args)
     assert is_pid(pid)
 
-    assert_receive {:completion_shipped, ^task_queue, bytes}, 1_000
+    assert_receive {:completion_shipped, ^task_queue, bytes}
 
     completion = WorkflowActivationCompletion.decode(bytes)
     assert %WorkflowActivationCompletion{run_id: "dynsup-run-1"} = completion

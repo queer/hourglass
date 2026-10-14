@@ -5,6 +5,7 @@ defmodule Hourglass.ClientBridgeTest do
 
   alias Hourglass.Bridge
   alias Hourglass.Runtime
+  alias Hourglass.TestSupport.Patience
 
   @moduletag :temporal
 
@@ -21,11 +22,11 @@ defmodule Hourglass.ClientBridgeTest do
         namespace: "default"
       })
 
-    {:ok, client} = Bridge.client_new(runtime, config_bin)
+    {:ok, client} = Patience.retry(fn -> Bridge.client_new(runtime, config_bin) end)
 
     # Ensure the "default" namespace exists; register_namespace is idempotent —
     # already-exists is a tonic_error which we ignore here.
-    Bridge.client_register_namespace(client, "default")
+    Patience.retry(fn -> Bridge.client_register_namespace(client, "default") end)
 
     [client: client]
   end
@@ -35,7 +36,9 @@ defmodule Hourglass.ClientBridgeTest do
   end
 
   test "describe_namespace returns proto bytes for the default namespace", %{client: client} do
-    assert {:ok, info_bin} = Bridge.client_describe_namespace(client, "default")
+    assert {:ok, info_bin} =
+             Patience.retry(fn -> Bridge.client_describe_namespace(client, "default") end)
+
     assert is_binary(info_bin)
     refute info_bin == <<>>
   end
@@ -43,7 +46,9 @@ defmodule Hourglass.ClientBridgeTest do
   test "describe_namespace on missing namespace returns tonic error", %{client: client} do
     name = "missing-#{System.unique_integer([:positive])}"
 
-    assert {:error, %Bridge.Error{kind: :tonic_error}} =
-             Bridge.client_describe_namespace(client, name)
+    assert {:error, %Bridge.Error{kind: :tonic_error, detail: detail}} =
+             Patience.retry(fn -> Bridge.client_describe_namespace(client, name) end)
+
+    assert detail =~ "not found"
   end
 end

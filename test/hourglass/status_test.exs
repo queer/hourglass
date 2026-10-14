@@ -20,12 +20,13 @@ defmodule Hourglass.StatusTest do
   alias Hourglass.Client
   alias Hourglass.Error
   alias Hourglass.TestSupport.EchoWorkflow
+  alias Hourglass.TestSupport.Patience
   alias Hourglass.WorkflowHandle
   alias Hourglass.WorkflowStatus
   alias Temporal.Api.Failure.V1.Failure
 
   @moduletag :temporal
-  @moduletag timeout: 60_000
+  @moduletag timeout: Patience.test_timeout(4)
   # Several tests intentionally trigger workflow exceptions (FailingWorkflow,
   # RetryingFailingWorkflow). capture_log keeps that noise out of test
   # output unless a test fails.
@@ -141,7 +142,7 @@ defmodule Hourglass.StatusTest do
     queue = "status-completed-#{System.unique_integer([:positive])}"
 
     {:ok, _worker_pid} =
-      start_supervised({Hourglass.Worker, task_queue: queue})
+      Patience.start_worker(task_queue: queue)
 
     nonce = UUIDv7.generate()
     workflow_id = "status-completed-#{nonce}"
@@ -152,7 +153,7 @@ defmodule Hourglass.StatusTest do
         task_queue: queue
       )
 
-    {:ok, _result} = Hourglass.result(handle, timeout: 30_000)
+    {:ok, _result} = Hourglass.result(handle, timeout: Patience.ms())
 
     assert {:ok, %WorkflowStatus{} = status} = Hourglass.status(handle)
 
@@ -171,7 +172,7 @@ defmodule Hourglass.StatusTest do
     queue = "status-failed-#{System.unique_integer([:positive])}"
 
     {:ok, _worker_pid} =
-      start_supervised({Hourglass.Worker, task_queue: queue})
+      Patience.start_worker(task_queue: queue)
 
     workflow_id = "status-failed-#{UUIDv7.generate()}"
 
@@ -181,9 +182,9 @@ defmodule Hourglass.StatusTest do
         task_queue: queue
       )
 
-    _result = Hourglass.result(handle, timeout: 30_000)
+    _result = Hourglass.result(handle, timeout: Patience.ms())
 
-    status = poll_until_closed(handle, 30_000)
+    status = poll_until_closed(handle, Patience.ms())
 
     assert status.state == :completed
     assert %DateTime{} = status.close_time
@@ -224,7 +225,7 @@ defmodule Hourglass.StatusTest do
     queue = "status-include-fail-#{System.unique_integer([:positive])}"
 
     {:ok, _worker_pid} =
-      start_supervised({Hourglass.Worker, task_queue: queue})
+      Patience.start_worker(task_queue: queue)
 
     workflow_id = "status-include-fail-#{UUIDv7.generate()}"
 
@@ -234,8 +235,8 @@ defmodule Hourglass.StatusTest do
         task_queue: queue
       )
 
-    _result = Hourglass.result(handle, timeout: 30_000)
-    _status = poll_until_closed(handle, 30_000)
+    _result = Hourglass.result(handle, timeout: Patience.ms())
+    _status = poll_until_closed(handle, Patience.ms())
 
     assert {:ok, %WorkflowStatus{} = status} =
              Hourglass.status(handle, failures: :include)
@@ -261,7 +262,7 @@ defmodule Hourglass.StatusTest do
     queue = "status-include-ok-#{System.unique_integer([:positive])}"
 
     {:ok, _worker_pid} =
-      start_supervised({Hourglass.Worker, task_queue: queue})
+      Patience.start_worker(task_queue: queue)
 
     nonce = UUIDv7.generate()
     workflow_id = "status-include-ok-#{nonce}"
@@ -272,7 +273,7 @@ defmodule Hourglass.StatusTest do
         task_queue: queue
       )
 
-    {:ok, _result} = Hourglass.result(handle, timeout: 30_000)
+    {:ok, _result} = Hourglass.result(handle, timeout: Patience.ms())
 
     assert {:ok, %WorkflowStatus{} = status} =
              Hourglass.status(handle, failures: :include)
@@ -290,7 +291,7 @@ defmodule Hourglass.StatusTest do
     queue = "status-retry-#{System.unique_integer([:positive])}"
 
     {:ok, _worker_pid} =
-      start_supervised({Hourglass.Worker, task_queue: queue})
+      Patience.start_worker(task_queue: queue)
 
     workflow_id = "status-retry-#{UUIDv7.generate()}"
 
@@ -300,8 +301,8 @@ defmodule Hourglass.StatusTest do
         task_queue: queue
       )
 
-    _result = Hourglass.result(handle, timeout: 30_000)
-    _status = poll_until_closed(handle, 30_000)
+    _result = Hourglass.result(handle, timeout: Patience.ms())
+    _status = poll_until_closed(handle, Patience.ms())
 
     assert {:ok, %WorkflowStatus{recent_failures: failures}} =
              Hourglass.status(handle, failures: :include)
@@ -325,7 +326,7 @@ defmodule Hourglass.StatusTest do
   # Sanity: Bridge.client_describe_workflow_execution is a valid, loaded NIF.
   # Catches accidental bridge regressions.
   test "Bridge.client_describe_workflow_execution/3 is loaded" do
-    {:ok, client} = Client.connect()
+    {:ok, client} = Patience.retry(fn -> Client.connect() end)
 
     workflow_id = "bridge-describe-#{UUIDv7.generate()}"
 
@@ -336,7 +337,9 @@ defmodule Hourglass.StatusTest do
       )
 
     assert {:ok, bytes} =
-             Bridge.client_describe_workflow_execution(client, workflow_id, "")
+             Patience.retry(fn ->
+               Bridge.client_describe_workflow_execution(client, workflow_id, "")
+             end)
 
     assert is_binary(bytes)
     assert byte_size(bytes) > 0

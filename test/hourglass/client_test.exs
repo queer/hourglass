@@ -8,6 +8,7 @@ defmodule Hourglass.ClientTest do
   alias Hourglass.Client.Backend
   alias Hourglass.Client.Real
   alias Hourglass.Error
+  alias Hourglass.TestSupport.Patience
   alias Hourglass.WorkflowHandle
 
   @moduletag :temporal
@@ -21,52 +22,55 @@ defmodule Hourglass.ClientTest do
   end
 
   test "Client.connect/0 returns a usable client" do
-    assert {:ok, _client} = Client.connect()
+    assert {:ok, _client} = Patience.retry(fn -> Client.connect() end)
   end
 
   test "Client.health/1 returns :ok" do
-    {:ok, client} = Client.connect()
+    {:ok, client} = Patience.retry(fn -> Client.connect() end)
     assert :ok = Client.health(client)
   end
 
   test "Client.ensure_namespace/2 creates if missing" do
-    {:ok, client} = Client.connect()
+    {:ok, client} = Patience.retry(fn -> Client.connect() end)
     name = "ensure-test-#{UUIDv7.generate()}"
-    assert :ok = Client.ensure_namespace(client, name)
+    assert :ok = Patience.retry(fn -> Client.ensure_namespace(client, name) end)
     # Re-running should still return :ok (already-exists is fine)
-    assert :ok = Client.ensure_namespace(client, name)
+    assert :ok = Patience.retry(fn -> Client.ensure_namespace(client, name) end)
   end
 
   test "Client.start_workflow returns a %WorkflowHandle{}" do
-    {:ok, client} = Client.connect()
+    {:ok, client} = Patience.retry(fn -> Client.connect() end)
     workflow_id = "facade-test-#{UUIDv7.generate()}"
 
     # Temporal accepts the start regardless of whether a worker is registered
     # for the workflow_type — the workflow won't run, but the start call
     # itself succeeds and returns a handle.
     assert {:ok, %WorkflowHandle{id: ^workflow_id, run_id: run_id}} =
-             Client.start_workflow(client, FacadeTest.NoSuchWorkflow, %{},
-               workflow_id: workflow_id,
-               task_queue: "facade-test-queue"
+             Patience.start(
+               fn ->
+                 Client.start_workflow(client, FacadeTest.NoSuchWorkflow, %{},
+                   workflow_id: workflow_id,
+                   task_queue: "facade-test-queue"
+                 )
+               end,
+               workflow_id
              )
 
     assert is_binary(run_id)
   end
 
   test "Client.start_workflow on duplicate workflow_id returns :already_started" do
-    {:ok, client} = Client.connect()
+    {:ok, client} = Patience.retry(fn -> Client.connect() end)
     workflow_id = "dupe-test-#{UUIDv7.generate()}"
 
-    {:ok, _handle} =
+    start = fn ->
       Client.start_workflow(client, FacadeTest.NoSuchWorkflow, %{},
         workflow_id: workflow_id,
         task_queue: "facade-test-queue"
       )
+    end
 
-    assert {:error, %Error{reason: :already_started}} =
-             Client.start_workflow(client, FacadeTest.NoSuchWorkflow, %{},
-               workflow_id: workflow_id,
-               task_queue: "facade-test-queue"
-             )
+    {:ok, _handle} = Patience.start(start, workflow_id)
+    assert {:error, %Error{reason: :already_started}} = Patience.retry(start)
   end
 end

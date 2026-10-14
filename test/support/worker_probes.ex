@@ -5,6 +5,7 @@ defmodule Hourglass.TestSupport.WorkerProbes do
 
   import ExUnit.Assertions
 
+  alias Hourglass.TestSupport.Patience
   alias Hourglass.Worker
   alias Hourglass.Worker.ActivityPollLoop
 
@@ -45,16 +46,24 @@ defmodule Hourglass.TestSupport.WorkerProbes do
         do: pid
   end
 
-  @spec poll_until(String.t(), (-> boolean()), non_neg_integer()) :: :ok
-  def poll_until(what, fun, retries \\ 100)
-  def poll_until(what, _fun, 0), do: flunk("timed out waiting for #{what}")
+  # Wait until `fun` holds, for up to `timeout` ms: by default as long as the
+  # suite waits on Temporal (`Hourglass.TestSupport.Patience`).
+  @spec poll_until(String.t(), (-> boolean()), pos_integer()) :: :ok
+  def poll_until(what, fun, timeout \\ Patience.ms()) do
+    await(what, fun, System.monotonic_time(:millisecond) + timeout, timeout)
+  end
 
-  def poll_until(what, fun, retries) do
-    if fun.() do
-      :ok
-    else
-      Process.sleep(100)
-      poll_until(what, fun, retries - 1)
+  defp await(what, fun, deadline, timeout) do
+    cond do
+      fun.() ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("timed out waiting #{timeout} ms for #{what}")
+
+      true ->
+        Process.sleep(100)
+        await(what, fun, deadline, timeout)
     end
   end
 

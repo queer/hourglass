@@ -31,8 +31,10 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
   alias Hourglass.Client.Real
   alias Hourglass.TestSupport.GatedDecision
   alias Hourglass.TestSupport.GatedWork
+  alias Hourglass.TestSupport.Patience
   alias Hourglass.TestSupport.RaceGate
   alias Hourglass.TestSupport.RetriedWork
+  alias Hourglass.TestSupport.WorkerProbes
   alias Hourglass.Worker.WorkflowStateCache
   # credo:disable-for-next-line Credo.Check.Readability.AliasAs
   alias Hourglass.Worker.Supervisor, as: WorkerSupervisor
@@ -42,14 +44,14 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
 
   @moduletag :temporal
   @moduletag :integration
-  @moduletag timeout: 120_000
+  @moduletag timeout: Patience.test_timeout(4)
   @moduletag capture_log: true
 
   setup do
     n = System.unique_integer([:positive])
     control = "stop-control-#{n}"
     queue = "stop-#{n}"
-    {:ok, _control} = start_supervised({Hourglass.Worker, task_queue: control})
+    {:ok, _control} = Patience.start_worker(task_queue: control)
 
     :telemetry.attach(
       {__MODULE__, queue},
@@ -94,7 +96,7 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
     # and only then does the stop return.
     :ok = RaceGate.disarm({id, :activity})
     :ok = RaceGate.release(running)
-    assert Task.await(stopper, 30_000) == :ok
+    assert Task.await(stopper, Patience.ms()) == :ok
 
     assert [%{result: result}] = activity_completions(id)
     assert result.payloads != []
@@ -105,7 +107,8 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
     assert pending_state(handle, "EchoActivity") == :PENDING_ACTIVITY_STATE_SCHEDULED
     start_worker!(queue)
 
-    assert {:ok, %{"echoed" => %{"nonce" => ^id}}} = Hourglass.result(handle, timeout: 30_000)
+    assert {:ok, %{"echoed" => %{"nonce" => ^id}}} =
+             Hourglass.result(handle, timeout: Patience.ms())
   end
 
   test "an activity still running when the grace runs out is reported to Temporal as failed by the worker's shutdown, and its process is stopped",
@@ -161,7 +164,7 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
     :ok = Hourglass.signal(handle, "more", %{})
 
     assert {:ok, %{"gated" => gated, "echoed" => %{"nonce" => ^id}}} =
-             Hourglass.result(handle, timeout: 30_000)
+             Hourglass.result(handle, timeout: Patience.ms())
 
     # Both activities completed; the first attempt's shutdown failure was
     # retried rather than recorded as the activity's outcome.
@@ -182,12 +185,12 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
 
     :ok = RaceGate.disarm(id)
     :ok = RaceGate.release(held)
-    assert Task.await(stopper, 30_000) == :ok
+    assert Task.await(stopper, Patience.ms()) == :ok
 
     # The task's completion — which closes the run — reached Temporal before
     # the stop returned.
     assert {:ok, %WorkflowStatus{state: :completed}} = Hourglass.status(handle)
-    assert {:ok, %{"decided" => ^id}} = Hourglass.result(handle, timeout: 5_000)
+    assert {:ok, %{"decided" => ^id}} = Hourglass.result(handle, timeout: Patience.ms())
   end
 
   test "a worker with nothing to finish stops at once", %{queue: queue} do
@@ -300,7 +303,7 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
     # The run carries on, from its history, on the next worker.
     start_worker!(queue)
     :ok = Hourglass.signal(handle, "go", %{"n" => 1})
-    assert {:ok, %{"go" => %{"n" => 1}}} = Hourglass.result(handle, timeout: 30_000)
+    assert {:ok, %{"go" => %{"n" => 1}}} = Hourglass.result(handle, timeout: Patience.ms())
   end
 
   # ---------------------------------------------------------------------------
@@ -322,7 +325,7 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
     :ok = RaceGate.disarm({id, :activity})
     :ok = RaceGate.release(running)
 
-    assert Enum.sort([Task.await(first, 30_000), Task.await(second, 30_000)]) ==
+    assert Enum.sort([Task.await(first, Patience.ms()), Task.await(second, Patience.ms())]) ==
              Enum.sort([:ok, {:error, :not_found}])
 
     assert [_completed] = activity_completions(id)
@@ -346,7 +349,7 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
     assert System.monotonic_time(:millisecond) - started < 5_000
 
     start_worker!(queue)
-    assert {:ok, %{"attempt" => 2}} = Hourglass.result(handle, timeout: 30_000)
+    assert {:ok, %{"attempt" => 2}} = Hourglass.result(handle, timeout: Patience.ms())
   end
 
   test "a grace of zero reports a running activity as failed by the shutdown at once",
@@ -419,17 +422,7 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  defp poll_until(what, fun, retries \\ 100)
-  defp poll_until(what, _fun, 0), do: flunk("timed out waiting for #{what}")
-
-  defp poll_until(what, fun, retries) do
-    if fun.() do
-      :ok
-    else
-      Process.sleep(100)
-      poll_until(what, fun, retries - 1)
-    end
-  end
+  defp poll_until(what, fun), do: WorkerProbes.poll_until(what, fun)
 
   # Processes in the VM parked in a poll NIF, each holding a dirty-IO
   # scheduler thread while it waits on Core.
@@ -451,7 +444,9 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
   end
 
   defp start_worker!(queue, opts \\ []) do
-    {:ok, _pid} = WorkerSupervisor.start_worker([task_queue: queue] ++ opts)
+    {:ok, _pid} =
+      Patience.retry(fn -> WorkerSupervisor.start_worker([task_queue: queue] ++ opts) end)
+
     on_exit(fn -> _result = WorkerSupervisor.stop_worker(queue) end)
   end
 
@@ -460,22 +455,14 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
     handle
   end
 
-  defp await_pending_activity(handle, type_suffix, state, retries \\ 100)
-
-  defp await_pending_activity(_handle, type_suffix, state, 0),
-    do: flunk("no #{type_suffix} activity reached #{state}")
-
-  defp await_pending_activity(handle, type_suffix, state, retries) do
-    if pending_state(handle, type_suffix) == state do
-      :ok
-    else
-      Process.sleep(100)
-      await_pending_activity(handle, type_suffix, state, retries - 1)
-    end
+  defp await_pending_activity(handle, type_suffix, state) do
+    poll_until("a #{type_suffix} activity to reach #{state}", fn ->
+      pending_state(handle, type_suffix) == state
+    end)
   end
 
   defp pending_state(handle, type_suffix) do
-    {:ok, description} = Real.describe_workflow_execution(handle)
+    {:ok, description} = Patience.retry(fn -> Real.describe_workflow_execution(handle) end)
 
     Enum.find_value(description.pending_activities, fn pending ->
       if String.ends_with?(pending.activity_type.name, type_suffix), do: pending.state

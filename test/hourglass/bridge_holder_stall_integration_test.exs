@@ -25,6 +25,7 @@ defmodule Hourglass.BridgeHolderStallIntegrationTest do
   alias Hourglass.BridgeHolder
   alias Hourglass.Client.Real
   alias Hourglass.TestSupport.GatedWork
+  alias Hourglass.TestSupport.Patience
   alias Hourglass.TestSupport.RaceGate
   alias Hourglass.TestSupport.StallableBridge
   alias Hourglass.WorkflowHandle
@@ -32,12 +33,12 @@ defmodule Hourglass.BridgeHolderStallIntegrationTest do
 
   @moduletag :temporal
   @moduletag :integration
-  @moduletag timeout: 120_000
+  @moduletag timeout: Patience.test_timeout(4)
   @moduletag capture_log: true
 
   setup do
     queue = "stall-#{System.unique_integer([:positive])}"
-    {:ok, _worker} = start_supervised({Hourglass.Worker, task_queue: queue})
+    {:ok, _worker} = Patience.start_worker(task_queue: queue)
     %{queue: queue}
   end
 
@@ -102,7 +103,12 @@ defmodule Hourglass.BridgeHolderStallIntegrationTest do
     grace = 500
 
     {:ok, _worker} =
-      Hourglass.Worker.Supervisor.start_worker(task_queue: queue, graceful_shutdown_period: grace)
+      Patience.retry(fn ->
+        Hourglass.Worker.Supervisor.start_worker(
+          task_queue: queue,
+          graceful_shutdown_period: grace
+        )
+      end)
 
     on_exit(fn -> _result = Hourglass.Worker.Supervisor.stop_worker(queue) end)
 
@@ -159,7 +165,7 @@ defmodule Hourglass.BridgeHolderStallIntegrationTest do
   end
 
   defp last_heartbeat(handle) do
-    {:ok, description} = Real.describe_workflow_execution(handle)
+    {:ok, description} = Patience.retry(fn -> Real.describe_workflow_execution(handle) end)
     [pending] = description.pending_activities
     pending.last_heartbeat_time
   end

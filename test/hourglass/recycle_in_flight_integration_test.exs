@@ -27,20 +27,20 @@ defmodule Hourglass.RecycleInFlightIntegrationTest do
   alias Hourglass.BridgeHolder
   alias Hourglass.Client.Real
   alias Hourglass.TestSupport.GatedWork
+  alias Hourglass.TestSupport.Patience
   alias Hourglass.TestSupport.RaceGate
   alias Hourglass.TestSupport.WorkerProbes
-  alias Hourglass.Worker
   alias Hourglass.WorkflowHandle
   alias Temporal.Api.History.V1.History
 
   @moduletag :temporal
   @moduletag :integration
-  @moduletag timeout: 120_000
+  @moduletag timeout: Patience.test_timeout(4)
   @moduletag capture_log: true
 
   setup do
     queue = "recycle-#{System.unique_integer([:positive])}"
-    {:ok, _worker} = start_supervised({Worker, task_queue: queue})
+    {:ok, _worker} = Patience.start_worker(task_queue: queue)
     %{queue: queue, id: "recycle-#{UUIDv7.generate()}"}
   end
 
@@ -72,7 +72,9 @@ defmodule Hourglass.RecycleInFlightIntegrationTest do
 
     # The fresh handle serves the queue: the rest of the run completes on it.
     :ok = Hourglass.signal(handle, "more", %{})
-    assert {:ok, %{"echoed" => %{"nonce" => ^id}}} = Hourglass.result(handle, timeout: 30_000)
+
+    assert {:ok, %{"echoed" => %{"nonce" => ^id}}} =
+             Hourglass.result(handle, timeout: Patience.ms())
   end
 
   test "an activity running when its handle is recycled can still heartbeat through it",
@@ -119,7 +121,7 @@ defmodule Hourglass.RecycleInFlightIntegrationTest do
   end
 
   defp last_heartbeat(handle) do
-    {:ok, description} = Real.describe_workflow_execution(handle)
+    {:ok, description} = Patience.retry(fn -> Real.describe_workflow_execution(handle) end)
     [pending] = description.pending_activities
     pending.last_heartbeat_time
   end

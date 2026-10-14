@@ -1,6 +1,12 @@
 ExUnit.start()
 ExUnit.configure(exclude: [:temporal])
 
+# A message a test waits for comes within this by default. It catches a hang,
+# and is no promise of how soon: on a machine busy with other suites, work
+# the default 100 ms would cover takes seconds. A test that asserts how soon
+# something happens says so with its own timeout.
+ExUnit.configure(assert_receive_timeout: 5_000)
+
 # Tolerate {:error, {:already_started, _}} so a re-run / partial-boot harness
 # does not crash the whole suite.
 ensure_started = fn start_fun ->

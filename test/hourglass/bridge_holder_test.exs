@@ -10,6 +10,9 @@ defmodule Hourglass.BridgeHolderTest do
   alias Hourglass.Bridge
   alias Hourglass.BridgeHolder
   alias Hourglass.Client
+  alias Hourglass.TestSupport.FreezableProxy
+  alias Hourglass.TestSupport.Patience
+  alias Hourglass.TestSupport.WorkerProbes
 
   @moduletag :temporal
   # Bridge-NIF contract test — exercises real BridgeHolder.register_worker /
@@ -42,7 +45,12 @@ defmodule Hourglass.BridgeHolderTest do
       on_exit(fn -> _result = BridgeHolder.unregister_worker(queue) end)
 
       refute BridgeHolder.registered?(queue)
-      :ok = BridgeHolder.register_worker(queue, target_url: Client.default_target_url())
+
+      :ok =
+        Patience.retry(fn ->
+          BridgeHolder.register_worker(queue, target_url: Client.default_target_url())
+        end)
+
       assert BridgeHolder.registered?(queue)
 
       :ok = BridgeHolder.unregister_worker(queue)
@@ -53,7 +61,11 @@ defmodule Hourglass.BridgeHolderTest do
       queue = "bh-double-#{System.unique_integer([:positive])}"
       on_exit(fn -> _result = BridgeHolder.unregister_worker(queue) end)
 
-      :ok = BridgeHolder.register_worker(queue, target_url: Client.default_target_url())
+      :ok =
+        Patience.retry(fn ->
+          BridgeHolder.register_worker(queue, target_url: Client.default_target_url())
+        end)
+
       assert {:error, :already_registered} = BridgeHolder.register_worker(queue, [])
 
       :ok = BridgeHolder.unregister_worker(queue)
@@ -62,6 +74,23 @@ defmodule Hourglass.BridgeHolderTest do
     test "unregister of an unknown task queue is idempotent (returns :ok)" do
       :ok =
         BridgeHolder.unregister_worker("never-registered-#{System.unique_integer([:positive])}")
+    end
+
+    # Core gives up on Temporal's GetSystemInfo after 30 s. A Temporal that
+    # slow must reach the caller as the error worker_new returns, not as the
+    # caller's call timing out first.
+    @tag timeout: 120_000
+    test "a Temporal that never answers is an error from register, not an exit" do
+      queue = "bh-silent-#{System.unique_integer([:positive])}"
+      on_exit(fn -> _result = BridgeHolder.unregister_worker(queue) end)
+      proxy = start_supervised!(FreezableProxy)
+      :ok = FreezableProxy.freeze(proxy)
+
+      assert {:error, %Bridge.Error{kind: :tonic_error, detail: detail}} =
+               BridgeHolder.register_worker(queue, target_url: FreezableProxy.url(proxy))
+
+      assert detail =~ "Timeout expired"
+      refute BridgeHolder.registered?(queue)
     end
   end
 
@@ -118,13 +147,15 @@ defmodule Hourglass.BridgeHolderTest do
       # can continue and trigger the unregister.
       test_pid = self()
 
+      parked = WorkerProbes.parked_polls()
+
       spawn_link(fn ->
         result = BridgeHolder.poll_workflow_activation(queue)
         send(test_pid, {:poll_returned, result})
       end)
 
-      # Give the poll a moment to enter the NIF, then drop the bridge.
-      Process.sleep(50)
+      # Once the poll is in the NIF, drop the bridge.
+      await_parked(parked)
       :ok = BridgeHolder.unregister_worker(queue)
 
       assert_receive {:poll_returned, {:error, %Bridge.Error{kind: :shutdown}}}, 5_000
@@ -140,6 +171,7 @@ defmodule Hourglass.BridgeHolderTest do
       # settles the task queue must still have a handle so the parent
       # Worker keeps polling.
       assert BridgeHolder.registered?(queue)
+      before = handle(queue)
 
       # Spawn a process that calls the long-poll then immediately gets
       # killed. The dirty-NIF call cannot be cancelled, so an orphan
@@ -159,7 +191,7 @@ defmodule Hourglass.BridgeHolderTest do
 
       # The DOWN handler dispatches an async recycle Task — give it a
       # window for both worker_shutdown + worker_new to land.
-      assert_eventually(fn -> BridgeHolder.registered?(queue) end, 10_000)
+      await_new_handle(queue, before)
 
       # Subsequent polls should succeed against the new handle.
       # Validate by spawning a fresh poller and unregistering — the
@@ -167,12 +199,14 @@ defmodule Hourglass.BridgeHolderTest do
       # to the NIF (not :worker_not_registered).
       test_pid = self()
 
+      parked = WorkerProbes.parked_polls()
+
       spawn_link(fn ->
         result = BridgeHolder.poll_workflow_activation(queue)
         send(test_pid, {:fresh_poll, result})
       end)
 
-      Process.sleep(100)
+      await_parked(parked)
       :ok = BridgeHolder.unregister_worker(queue)
       assert_receive {:fresh_poll, {:error, %Bridge.Error{kind: :shutdown}}}, 5_000
     end
@@ -180,6 +214,7 @@ defmodule Hourglass.BridgeHolderTest do
     test "healthy parallel poller sees :shutdown during recycle and can retry",
          %{queue: queue} do
       test_pid = self()
+      parked = WorkerProbes.parked_polls()
 
       # Healthy poller (we control its lifecycle).
       healthy =
@@ -202,15 +237,27 @@ defmodule Hourglass.BridgeHolderTest do
           _result = BridgeHolder.poll_workflow_activation(queue)
         end)
 
-      Process.sleep(50)
+      # Both polls in the NIF before one of their callers dies.
+      WorkerProbes.poll_until("both polls to park", fn ->
+        length(WorkerProbes.parked_polls() -- parked) >= 2
+      end)
+
       Process.exit(doomed, :kill)
 
       # Healthy poller sees :shutdown from the recycle's worker_shutdown.
-      assert_receive {:healthy_first, {:error, %Bridge.Error{kind: :shutdown}}}, 10_000
+      assert_receive {:healthy_first, {:error, %Bridge.Error{kind: :shutdown}}}, Patience.ms()
 
       # Wait for recycle to finish + healthy to re-poll, then drop the
       # new handle to unblock its second poll.
-      Process.sleep(200)
+      await_recycled(queue)
+
+      WorkerProbes.poll_until("the healthy poller to poll again", fn ->
+        Process.info(healthy, :current_function) in [
+          nil,
+          {:current_function, {:gen, :do_call, 4}}
+        ]
+      end)
+
       :ok = BridgeHolder.unregister_worker(queue)
 
       assert_receive {:healthy_second, {:error, %Bridge.Error{kind: :shutdown}}}, 5_000
@@ -222,6 +269,7 @@ defmodule Hourglass.BridgeHolderTest do
 
     test "recycle works for activity poll callers as well", %{queue: queue} do
       assert BridgeHolder.registered?(queue)
+      before = handle(queue)
 
       poll_pid =
         spawn(fn ->
@@ -233,16 +281,18 @@ defmodule Hourglass.BridgeHolderTest do
       Process.exit(poll_pid, :kill)
       assert_receive {:DOWN, ^ref, :process, ^poll_pid, :killed}, 1_000
 
-      assert_eventually(fn -> BridgeHolder.registered?(queue) end, 10_000)
+      await_new_handle(queue, before)
 
       test_pid = self()
+
+      parked = WorkerProbes.parked_polls()
 
       spawn_link(fn ->
         result = BridgeHolder.poll_activity_task(queue)
         send(test_pid, {:fresh_poll, result})
       end)
 
-      Process.sleep(100)
+      await_parked(parked)
       :ok = BridgeHolder.unregister_worker(queue)
       assert_receive {:fresh_poll, {:error, %Bridge.Error{kind: :shutdown}}}, 5_000
     end
@@ -267,7 +317,7 @@ defmodule Hourglass.BridgeHolderTest do
       # The end state must be unregistered. Even after the recycle's
       # worker_new completes (which may take a few hundred ms), the
       # holder must NOT install the new handle.
-      Process.sleep(500)
+      await_recycled(queue)
       refute BridgeHolder.registered?(queue)
     end
   end
@@ -276,27 +326,38 @@ defmodule Hourglass.BridgeHolderTest do
   # worker handle: register a fresh queue and guarantee its teardown.
   defp registered_queue(_context) do
     queue = "bh-#{System.unique_integer([:positive])}"
-    :ok = BridgeHolder.register_worker(queue, target_url: Client.default_target_url())
+
+    :ok =
+      Patience.retry(fn ->
+        BridgeHolder.register_worker(queue, target_url: Client.default_target_url())
+      end)
+
     on_exit(fn -> _result = BridgeHolder.unregister_worker(queue) end)
     %{queue: queue}
   end
 
-  defp assert_eventually(fun, timeout) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_assert_eventually(fun, deadline)
+  # Wait for the holder to finish recycling `queue`'s handle: worker_new
+  # asks Temporal, so this waits as long as the suite waits on Temporal.
+  defp await_recycled(queue) do
+    WorkerProbes.poll_until("the holder to finish recycling #{queue}", fn ->
+      state = :sys.get_state(BridgeHolder)
+      not MapSet.member?(state.recycling, queue)
+    end)
   end
 
-  defp do_assert_eventually(fun, deadline) do
-    cond do
-      fun.() ->
-        :ok
+  # Wait for the holder to install a handle for `queue` other than `before`.
+  defp await_new_handle(queue, before) do
+    WorkerProbes.poll_until("the holder to install a new handle for #{queue}", fn ->
+      handle(queue) not in [nil, before]
+    end)
+  end
 
-      System.monotonic_time(:millisecond) >= deadline ->
-        flunk("condition did not become true within budget")
+  defp handle(queue), do: :sys.get_state(BridgeHolder).handles[queue]
 
-      true ->
-        Process.sleep(25)
-        do_assert_eventually(fun, deadline)
-    end
+  # Wait for a poll to park in the NIF beyond those `parked` before.
+  defp await_parked(parked) do
+    WorkerProbes.poll_until("a poll to park in the NIF", fn ->
+      WorkerProbes.parked_polls() -- parked != []
+    end)
   end
 end

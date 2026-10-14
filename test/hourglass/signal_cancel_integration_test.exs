@@ -30,12 +30,14 @@ defmodule Hourglass.SignalCancelIntegrationTest do
   use ExUnit.Case, async: true
   use Hourglass.Test.UseRealTemporalBackend
 
+  alias Hourglass.TestSupport.Patience
+  alias Hourglass.TestSupport.WorkerProbes
   alias Hourglass.WorkflowHandle
   alias Hourglass.WorkflowStatus
 
   @moduletag :temporal
   @moduletag :integration
-  @moduletag timeout: 60_000
+  @moduletag timeout: Patience.test_timeout(4)
 
   # ---------------------------------------------------------------------------
   # Fixture: a workflow that blocks on a "proceed" signal and returns its value
@@ -83,7 +85,7 @@ defmodule Hourglass.SignalCancelIntegrationTest do
     queue = "signal-integration-#{System.unique_integer([:positive])}"
 
     {:ok, _worker_pid} =
-      start_supervised({Hourglass.Worker, task_queue: queue})
+      Patience.start_worker(task_queue: queue)
 
     nonce = UUIDv7.generate()
     workflow_id = "signal-int-#{nonce}"
@@ -97,15 +99,15 @@ defmodule Hourglass.SignalCancelIntegrationTest do
 
     # Poll until the workflow is running (ensures the first activation has landed
     # before we send the signal, so await_signal is in the buffered-signals path).
-    assert_eventually(fn ->
-      {:ok, %WorkflowStatus{state: :running}} = Hourglass.status(handle)
+    WorkerProbes.poll_until("the workflow to be running", fn ->
+      match?({:ok, %WorkflowStatus{state: :running}}, Hourglass.status(handle))
     end)
 
     # Signal through the real NIF path.
     assert :ok = Hourglass.signal(handle, "proceed", %{"value" => 42})
 
     # Wait for the workflow to complete; result should carry the signalled payload.
-    assert {:ok, result} = Hourglass.result(handle, timeout: 30_000)
+    assert {:ok, result} = Hourglass.result(handle, timeout: Patience.ms())
     assert result["signalled"] == true
     assert get_in(result, ["payload", "value"]) == 42
   end
@@ -114,21 +116,26 @@ defmodule Hourglass.SignalCancelIntegrationTest do
     queue = "cancel-integration-#{System.unique_integer([:positive])}"
 
     {:ok, _worker_pid} =
-      start_supervised({Hourglass.Worker, task_queue: queue})
+      Patience.start_worker(task_queue: queue)
 
     nonce = UUIDv7.generate()
     workflow_id = "cancel-int-#{nonce}"
 
     # Start the looping workflow.
-    {:ok, %WorkflowHandle{} = handle} =
+    {:ok, %WorkflowHandle{}} =
       Hourglass.start(LoopUntilCancelledWorkflow, %{},
         id: workflow_id,
         task_queue: queue
       )
 
+    # The workflow continues as new on every activation, so its first run may
+    # be over by the time it is looked at: everything below names the
+    # workflow, whose current run is the one to cancel and to watch close.
+    handle = %WorkflowHandle{id: workflow_id}
+
     # Allow at least one activation to land before cancelling.
-    assert_eventually(fn ->
-      {:ok, %WorkflowStatus{state: :running}} = Hourglass.status(handle)
+    WorkerProbes.poll_until("the workflow to be running", fn ->
+      match?({:ok, %WorkflowStatus{state: :running}}, Hourglass.status(handle))
     end)
 
     # Cancel through the real NIF path.
@@ -136,7 +143,7 @@ defmodule Hourglass.SignalCancelIntegrationTest do
 
     # Poll until the workflow closes. cancel/2 only requests cancellation —
     # the workflow must react to it, so we poll for a non-running state.
-    final_status = poll_until_not_running(handle, 30_000)
+    final_status = poll_until_not_running(handle, Patience.ms())
 
     # The workflow handles cancelled? → true by completing normally (not failing).
     # Temporal reports it as :completed because the workflow returned a value
@@ -149,19 +156,6 @@ defmodule Hourglass.SignalCancelIntegrationTest do
   # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
-
-  # Retries `fun` up to 30 × 100 ms (3 s) until it stops raising.
-  # Used to wait for the workflow to reach a known state before asserting.
-  defp assert_eventually(fun, retries \\ 30)
-  defp assert_eventually(fun, 0), do: fun.()
-
-  defp assert_eventually(fun, retries) do
-    fun.()
-  rescue
-    _error ->
-      Process.sleep(100)
-      assert_eventually(fun, retries - 1)
-  end
 
   defp poll_until_not_running(handle, deadline_ms) do
     deadline = System.monotonic_time(:millisecond) + deadline_ms

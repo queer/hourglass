@@ -43,6 +43,7 @@ defmodule Hourglass.Worker.CrossWorkerAffinityTest do
   alias Hourglass
   alias Hourglass.BridgeHolder
   alias Hourglass.TestSupport.EchoWorkflow
+  alias Hourglass.TestSupport.Patience
   alias Hourglass.Worker
   alias Hourglass.WorkflowHandle
 
@@ -52,7 +53,7 @@ defmodule Hourglass.Worker.CrossWorkerAffinityTest do
   # properties live in the real cluster; mocking defeats the point.
   # Default `mix test` excludes :integration.
   @moduletag :integration
-  @moduletag timeout: 90_000
+  @moduletag timeout: Patience.test_timeout(4)
   # Kill-scenario tests Process.exit/2 :kill the poll loop on purpose;
   # BridgeHolder logs each recycle, plus the killed loop's OTP
   # termination line. Capture so the runner output stays clean —
@@ -69,16 +70,14 @@ defmodule Hourglass.Worker.CrossWorkerAffinityTest do
     queue_b = "cwb-#{System.unique_integer([:positive])}"
 
     {:ok, sup_a} =
-      start_supervised(
-        {Hourglass.Worker, task_queue: queue_a},
-        id: :worker_a
-      )
+      Patience.retry(fn ->
+        start_supervised({Hourglass.Worker, task_queue: queue_a}, id: :worker_a)
+      end)
 
     {:ok, sup_b} =
-      start_supervised(
-        {Hourglass.Worker, task_queue: queue_b},
-        id: :worker_b
-      )
+      Patience.retry(fn ->
+        start_supervised({Hourglass.Worker, task_queue: queue_b}, id: :worker_b)
+      end)
 
     assert is_pid(sup_a)
     assert is_pid(sup_b)
@@ -106,8 +105,8 @@ defmodule Hourglass.Worker.CrossWorkerAffinityTest do
         task_queue: queue_b
       )
 
-    {:ok, result_a} = Hourglass.result(handle_a, timeout: 30_000)
-    {:ok, result_b} = Hourglass.result(handle_b, timeout: 30_000)
+    {:ok, result_a} = Hourglass.result(handle_a, timeout: Patience.ms())
+    {:ok, result_b} = Hourglass.result(handle_b, timeout: Patience.ms())
 
     assert result_a["echoed"]["nonce"] == nonce_a
     assert result_b["echoed"]["nonce"] == nonce_b
@@ -140,7 +139,7 @@ defmodule Hourglass.Worker.CrossWorkerAffinityTest do
     queue = "cwa-inflight-#{System.unique_integer([:positive])}"
 
     {:ok, _gs} =
-      start_supervised({Hourglass.Worker, task_queue: queue})
+      Patience.start_worker(task_queue: queue)
 
     # Drive an initial workflow to completion to confirm the worker is healthy.
     nonce = UUIDv7.generate()
@@ -151,7 +150,7 @@ defmodule Hourglass.Worker.CrossWorkerAffinityTest do
         task_queue: queue
       )
 
-    {:ok, result} = Hourglass.result(handle, timeout: 30_000)
+    {:ok, result} = Hourglass.result(handle, timeout: Patience.ms())
     assert result["echoed"]["nonce"] == nonce
 
     # Kill the WorkflowPollLoop. This is purely intra-Worker —
@@ -212,7 +211,7 @@ defmodule Hourglass.Worker.CrossWorkerAffinityTest do
     queue = "cwa-recovery-#{System.unique_integer([:positive])}"
 
     {:ok, _gs} =
-      start_supervised({Hourglass.Worker, task_queue: queue})
+      Patience.start_worker(task_queue: queue)
 
     # Drive an initial workflow to completion. Confirms the worker is
     # healthy and the poll loops are settled into a steady-state long
@@ -225,7 +224,7 @@ defmodule Hourglass.Worker.CrossWorkerAffinityTest do
         task_queue: queue
       )
 
-    {:ok, result_1} = Hourglass.result(handle_1, timeout: 30_000)
+    {:ok, result_1} = Hourglass.result(handle_1, timeout: Patience.ms())
     assert result_1["echoed"]["nonce"] == nonce_1
 
     # Snapshot the inner Supervisor + the live WorkflowPollLoop pid.
@@ -289,7 +288,7 @@ defmodule Hourglass.Worker.CrossWorkerAffinityTest do
     # caller, recycles the handle (worker_shutdown + worker_new), and
     # the new poll loop polls against the fresh handle. Core redelivers
     # within seconds.
-    {:ok, result_2} = Hourglass.result(handle_2, timeout: 60_000)
+    {:ok, result_2} = Hourglass.result(handle_2, timeout: Patience.ms())
     assert result_2["echoed"]["nonce"] == nonce_2
   end
 

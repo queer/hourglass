@@ -36,13 +36,14 @@ defmodule Hourglass.ActivityHeartbeatTest do
   use ExUnit.Case, async: true
   use Hourglass.Test.UseRealTemporalBackend
 
+  alias Hourglass.TestSupport.Patience
   alias Hourglass.WorkflowHandle
 
   @moduletag :temporal
   @moduletag :integration
   # ~5 s activity body + cluster round-trips + (scenario 2) a retry; keep
   # headroom over the default 60 s ExUnit timeout used by the sibling tests.
-  @moduletag timeout: 90_000
+  @moduletag timeout: Patience.test_timeout(4)
 
   # ---------------------------------------------------------------------------
   # Fixtures: heartbeating + non-heartbeating activities, run by a workflow
@@ -138,7 +139,7 @@ defmodule Hourglass.ActivityHeartbeatTest do
     queue = "heartbeat-pos-#{System.unique_integer([:positive])}"
 
     {:ok, _worker_pid} =
-      start_supervised({Hourglass.Worker, task_queue: queue})
+      Patience.start_worker(task_queue: queue)
 
     workflow_id = "heartbeat-pos:#{UUIDv7.generate()}"
 
@@ -148,7 +149,7 @@ defmodule Hourglass.ActivityHeartbeatTest do
         task_queue: queue
       )
 
-    {:ok, result} = Hourglass.result(handle, timeout: 60_000)
+    {:ok, result} = Hourglass.result(handle, timeout: Patience.ms())
 
     # The activity ran ~5 s — well past the 2 s heartbeat window — and was NOT
     # failed by a heartbeat timeout, because it heartbeated every ~500 ms.
@@ -160,7 +161,7 @@ defmodule Hourglass.ActivityHeartbeatTest do
     queue = "heartbeat-neg-#{System.unique_integer([:positive])}"
 
     {:ok, _worker_pid} =
-      start_supervised({Hourglass.Worker, task_queue: queue})
+      Patience.start_worker(task_queue: queue)
 
     workflow_id = "heartbeat-neg:#{UUIDv7.generate()}"
 
@@ -170,7 +171,7 @@ defmodule Hourglass.ActivityHeartbeatTest do
         task_queue: queue
       )
 
-    {:ok, result} = Hourglass.result(handle, timeout: 60_000)
+    {:ok, result} = Hourglass.result(handle, timeout: Patience.ms())
 
     # The activity never heartbeated, so Temporal failed the first attempt at
     # the 2 s heartbeat_timeout, retried it (attempt 2 raised), and the

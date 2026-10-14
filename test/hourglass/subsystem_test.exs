@@ -8,6 +8,7 @@ defmodule Hourglass.SubsystemTest do
   use ExUnit.Case, async: false
 
   alias Hourglass.BridgeHolder
+  alias Hourglass.TestSupport.Patience
   # credo:disable-for-next-line Credo.Check.Readability.AliasAs
   alias Hourglass.Worker.Supervisor, as: WorkerSupervisor
   alias Hourglass.WorkerRegistry
@@ -50,7 +51,7 @@ defmodule Hourglass.SubsystemTest do
       # Production-shape Worker booted via Worker.Supervisor (the same
       # path the application uses).
       {:ok, worker_pid} =
-        WorkerSupervisor.start_worker(task_queue: queue)
+        Patience.retry(fn -> WorkerSupervisor.start_worker(task_queue: queue) end)
 
       assert BridgeHolder.registered?(queue)
 

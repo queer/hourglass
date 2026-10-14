@@ -8,6 +8,7 @@ defmodule Hourglass.Workflow.PatchReplayTest do
   alias Hourglass.Replay.Mismatch
   alias Hourglass.Replayer
   alias Hourglass.TestSupport.EchoActivity
+  alias Hourglass.TestSupport.Patience
 
   @moduletag :temporal
   # The history these tests replay has to be RECORDED, not constructed: a
@@ -16,7 +17,7 @@ defmodule Hourglass.Workflow.PatchReplayTest do
   # the patch existed answers `patched?/1` `false`. Only a real pre-patch run
   # can produce one, so the recording step needs a cluster.
   @moduletag :integration
-  @moduletag timeout: 120_000
+  @moduletag timeout: Patience.test_timeout(4)
 
   # ---------------------------------------------------------------------------
   # The three bodies: what shipped, the naive change, and the patched change.
@@ -72,7 +73,9 @@ defmodule Hourglass.Workflow.PatchReplayTest do
   # GetWorkflowExecutionHistoryResponse `Replayer.replay_history/2` expects.
   defp record(module, label) do
     queue = "#{label}-#{System.unique_integer([:positive])}"
-    {:ok, _worker} = start_supervised({Hourglass.Worker, task_queue: queue}, id: queue)
+
+    {:ok, _worker} =
+      Patience.retry(fn -> start_supervised({Hourglass.Worker, task_queue: queue}, id: queue) end)
 
     nonce = UUIDv7.generate()
     workflow_id = "#{label}:#{nonce}"
@@ -80,9 +83,12 @@ defmodule Hourglass.Workflow.PatchReplayTest do
     {:ok, handle} =
       Hourglass.start(module, %{"nonce" => nonce}, id: workflow_id, task_queue: queue)
 
-    {:ok, result} = Hourglass.result(handle, timeout: 60_000)
-    {:ok, client} = Client.connect([])
-    {:ok, history_bytes} = Client.fetch_history(client, workflow_id)
+    {:ok, result} = Hourglass.result(handle, timeout: Patience.ms())
+
+    {:ok, history_bytes} =
+      Patience.retry(fn ->
+        with {:ok, client} <- Client.connect([]), do: Client.fetch_history(client, workflow_id)
+      end)
 
     {result, history_bytes}
   end

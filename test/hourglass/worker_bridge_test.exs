@@ -5,6 +5,7 @@ defmodule Hourglass.WorkerBridgeTest do
 
   alias Hourglass.Bridge
   alias Hourglass.Runtime
+  alias Hourglass.TestSupport.Patience
 
   @moduletag :temporal
   # Bridge-NIF contract test — exercises real worker_new / poll / shutdown.
@@ -24,7 +25,7 @@ defmodule Hourglass.WorkerBridgeTest do
         client_target_url: "http://localhost:7233"
       })
 
-    {:ok, worker} = Bridge.worker_new(runtime, config_bin)
+    {:ok, worker} = Patience.retry(fn -> Bridge.worker_new(runtime, config_bin) end)
     [worker: worker, queue: queue]
   end
 

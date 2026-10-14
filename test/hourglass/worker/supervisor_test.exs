@@ -6,6 +6,7 @@ defmodule Hourglass.Worker.SupervisorTest do
   use ExUnit.Case, async: false
 
   alias Hourglass.BridgeHolder
+  alias Hourglass.TestSupport.Patience
   alias Hourglass.Worker
   alias Hourglass.Worker.ActivityPollLoop
   alias Hourglass.Worker.WorkflowPollLoop
@@ -122,7 +123,7 @@ defmodule Hourglass.Worker.SupervisorTest do
       queue = "ws-bracket-#{System.unique_integer([:positive])}"
 
       {:ok, _pid} =
-        Hourglass.Worker.Supervisor.start_worker(task_queue: queue)
+        Patience.retry(fn -> Hourglass.Worker.Supervisor.start_worker(task_queue: queue) end)
 
       # Supervised by the global Worker.Supervisor, so it outlives the test
       # process — guarantee teardown even if an assertion below fails.

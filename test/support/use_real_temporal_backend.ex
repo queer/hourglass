@@ -1,9 +1,10 @@
 defmodule Hourglass.Test.UseRealTemporalBackend do
   @moduledoc """
   Opts a test module into the production `Hourglass.Client.Real`
-  backend. The default test config sets the backend to a Mox mock; tests
-  that need to round-trip a real Temporal cluster (`:temporal`-tagged)
-  swap to `Real` per-process here.
+  backend, through `Hourglass.TestSupport.PatientBackend`, which makes a
+  call again while the shared Temporal times it out. The default test
+  config sets the backend to a Mox mock; tests that need to round-trip a
+  real Temporal cluster (`:temporal`-tagged) swap per-process here.
 
   ## Use
 
@@ -23,9 +24,7 @@ defmodule Hourglass.Test.UseRealTemporalBackend do
   defmacro __using__(_opts) do
     quote do
       setup do
-        alias Hourglass.Client.Backend
-        alias Hourglass.Client.Real
-        Backend.set_impl(Real)
+        Hourglass.Client.Backend.set_impl(Hourglass.TestSupport.PatientBackend)
         :ok
       end
     end

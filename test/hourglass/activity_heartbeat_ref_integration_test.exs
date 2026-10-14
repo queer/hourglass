@@ -19,6 +19,7 @@ defmodule Hourglass.ActivityHeartbeatRefIntegrationTest do
   alias Hourglass.Activity.HeartbeatRef
   alias Hourglass.Client.Real
   alias Hourglass.TestSupport.GatedWork
+  alias Hourglass.TestSupport.Patience
   alias Hourglass.TestSupport.RaceGate
   alias Hourglass.TestSupport.WorkerProbes
   alias Hourglass.WorkflowHandle
@@ -26,12 +27,12 @@ defmodule Hourglass.ActivityHeartbeatRefIntegrationTest do
 
   @moduletag :temporal
   @moduletag :integration
-  @moduletag timeout: 120_000
+  @moduletag timeout: Patience.test_timeout(4)
   @moduletag capture_log: true
 
   setup do
     queue = "hb-ref-#{System.unique_integer([:positive])}"
-    {:ok, _worker} = start_supervised({Hourglass.Worker, task_queue: queue})
+    {:ok, _worker} = Patience.start_worker(task_queue: queue)
     %{queue: queue, id: "hb-ref-#{UUIDv7.generate()}"}
   end
 
@@ -91,7 +92,7 @@ defmodule Hourglass.ActivityHeartbeatRefIntegrationTest do
     # Nothing heartbeats, so the activity's one-second heartbeat timeout runs
     # out and Core cancels it.
     {_handle, ref, _running} = start_activity!(id, queue, %{"heartbeat_timeout" => 1_000})
-    assert_receive :cancel_received, 30_000
+    assert_receive :cancel_received, Patience.ms()
 
     # The cancelled activity is still running (it is held at its gate): the
     # ref tells whoever heartbeats for it that it has been cancelled.
@@ -117,13 +118,13 @@ defmodule Hourglass.ActivityHeartbeatRefIntegrationTest do
     {:ok, %WorkflowHandle{} = handle} =
       Hourglass.start(GatedWork, input, id: id, task_queue: queue)
 
-    assert_receive {RaceGate, :observed, ^id, {:heartbeat_ref, ref}}, 20_000
+    assert_receive {RaceGate, :observed, ^id, {:heartbeat_ref, ref}}, Patience.ms()
     running = RaceGate.await_held({id, :activity})
     {handle, ref, running}
   end
 
   defp last_heartbeat(handle) do
-    {:ok, description} = Real.describe_workflow_execution(handle)
+    {:ok, description} = Patience.retry(fn -> Real.describe_workflow_execution(handle) end)
 
     case description.pending_activities do
       [pending] -> pending.last_heartbeat_time

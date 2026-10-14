@@ -101,8 +101,10 @@ defmodule Hourglass.TestSupport.RaceGate do
   # Test side: wait for a body to reach the gate. Returns the token `release/1`
   # takes. The gate stays armed until `disarm/1`, so whoever reaches it next
   # blocks too — disarm BEFORE releasing unless that is what the test wants.
+  # By default it waits as long as the suite waits on Temporal
+  # (`Hourglass.TestSupport.Patience`): reaching a gate takes a workflow task.
   @spec await_held(term(), timeout()) :: {pid(), reference()}
-  def await_held(key, timeout \\ 20_000) do
+  def await_held(key, timeout \\ Hourglass.TestSupport.Patience.ms()) do
     receive do
       {__MODULE__, :reached, ^key, pid, ref} -> {pid, ref}
     after

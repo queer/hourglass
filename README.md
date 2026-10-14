@@ -523,6 +523,13 @@ HOURGLASS_TEMPORAL_PORT=7333 HOURGLASS_UI_PORT=8234 podman compose up -d
 TEMPORAL_TARGET_URL=http://localhost:7333 mix test.integration
 ```
 
+A Temporal shared with other suites on a busy machine can take tens of
+seconds to answer, and past 30 s Core gives up on a call. The integration
+tests wait out a slow Temporal for up to two minutes per wait, making a call
+again when Core gave up on it, so they fail on what hourglass does rather than
+on how busy the machine is; a hang still fails, after those two minutes. Set
+`HOURGLASS_TEST_PATIENCE_MS` to change the wait.
+
 If `cargo` is not on your `PATH`, prepend `~/.cargo/bin`:
 
 ```bash

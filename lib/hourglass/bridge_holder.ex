@@ -266,6 +266,13 @@ defmodule Hourglass.BridgeHolder do
   # How long `unregister_worker/1` waits for the polls it aborted to return.
   @poll_return_timeout 5_000
 
+  # How long `register_worker/2` waits for `worker_new`, which connects to
+  # Temporal (the OS gives up on a TCP connect after about 75 s) and asks it
+  # GetSystemInfo (Core gives up after 30 s). Longer than both, so a slow or
+  # silent Temporal reaches the caller as the error `worker_new` returns, not
+  # as the call timing out first.
+  @register_timeout 120_000
+
   @doc false
   @spec default_max_cached_workflows() :: pos_integer()
   def default_max_cached_workflows, do: @default_max_cached_workflows
@@ -362,7 +369,7 @@ defmodule Hourglass.BridgeHolder do
   """
   @spec register_worker(String.t(), register_opts()) :: :ok | {:error, term()}
   def register_worker(task_queue, opts \\ []) when is_binary(task_queue) do
-    GenServer.call(__MODULE__, {:register_worker, task_queue, opts}, 30_000)
+    GenServer.call(__MODULE__, {:register_worker, task_queue, opts}, @register_timeout)
   end
 
   @doc """

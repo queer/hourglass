@@ -15,13 +15,14 @@ defmodule Hourglass.ContinueAsNewIntegrationTest do
 
   import ExUnit.CaptureLog
 
+  alias Hourglass.TestSupport.Patience
   alias Hourglass.WorkflowHandle
 
   require Logger
 
   @moduletag :temporal
   @moduletag :integration
-  @moduletag timeout: 60_000
+  @moduletag timeout: Patience.test_timeout(4)
 
   defmodule Generations do
     @moduledoc false
@@ -43,13 +44,13 @@ defmodule Hourglass.ContinueAsNewIntegrationTest do
 
     log =
       capture_log([level: :debug], fn ->
-        {:ok, _worker} = start_supervised({Hourglass.Worker, task_queue: queue})
+        {:ok, _worker} = Patience.start_worker(task_queue: queue)
 
         {:ok, handle} =
           Hourglass.start(Generations, %{"gen" => 1, "last" => 3}, id: id, task_queue: queue)
 
         assert {:ok, %{"finished_gen" => 3}} =
-                 Hourglass.result(%WorkflowHandle{id: handle.id}, timeout: 30_000)
+                 Hourglass.result(%WorkflowHandle{id: handle.id}, timeout: Patience.ms())
 
         # A graceful stop hands out, and waits for the completion of, every
         # activation Core still holds for the queue, the runs' evictions

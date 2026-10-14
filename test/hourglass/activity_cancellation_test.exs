@@ -21,11 +21,12 @@ defmodule Hourglass.ActivityCancellationTest do
   use ExUnit.Case, async: true
   use Hourglass.Test.UseRealTemporalBackend
 
+  alias Hourglass.TestSupport.Patience
   alias Hourglass.WorkflowHandle
 
   @moduletag :temporal
   @moduletag :integration
-  @moduletag timeout: 120_000
+  @moduletag timeout: Patience.test_timeout(4)
 
   # A side-effect counter (named Agent) proves whether the body kept running after cancellation.
   defmodule Marker do
@@ -93,7 +94,7 @@ defmodule Hourglass.ActivityCancellationTest do
     queue = "cancel-#{System.unique_integer([:positive])}"
 
     {:ok, _worker} =
-      start_supervised({Hourglass.Worker, task_queue: queue, closed_workflow_bound: 600_000})
+      Patience.start_worker(task_queue: queue, closed_workflow_bound: 600_000)
 
     workflow_id = "cancel:#{UUIDv7.generate()}"
 
@@ -102,7 +103,7 @@ defmodule Hourglass.ActivityCancellationTest do
 
     # Core delivered a Cancel task for the timed-out attempt (proves the trigger fired at all).
     assert_receive {:cancel_received, _},
-                   30_000,
+                   Patience.ms(),
                    "Core never delivered a Cancel activity task for the heartbeat-timed-out attempt"
 
     # Give the activity a couple more tick intervals to observe the mark and unwind.

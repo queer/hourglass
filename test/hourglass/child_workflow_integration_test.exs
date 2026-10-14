@@ -34,15 +34,16 @@ defmodule Hourglass.ChildWorkflowIntegrationTest do
   alias Hourglass.Client
   alias Hourglass.Replay.Mismatch
   alias Hourglass.Replayer
+  alias Hourglass.TestSupport.Patience
   alias Hourglass.WorkflowHandle
 
   @moduletag :temporal
   @moduletag :integration
-  @moduletag timeout: 120_000
+  @moduletag timeout: Patience.test_timeout(4)
 
   test "a parent awaits a real child workflow's result" do
     queue = "child-await-#{System.unique_integer([:positive])}"
-    {:ok, _worker} = start_supervised({Hourglass.Worker, task_queue: queue})
+    {:ok, _worker} = Patience.start_worker(task_queue: queue)
 
     nonce = UUIDv7.generate()
 
@@ -52,13 +53,13 @@ defmodule Hourglass.ChildWorkflowIntegrationTest do
         task_queue: queue
       )
 
-    assert {:ok, result} = Hourglass.result(handle, timeout: 60_000)
+    assert {:ok, result} = Hourglass.result(handle, timeout: Patience.ms())
     assert result == %{"child" => %{"echoed" => %{"nonce" => nonce}}}
   end
 
   test "fan-out: N children via async/await_all all complete" do
     queue = "child-fanout-#{System.unique_integer([:positive])}"
-    {:ok, _worker} = start_supervised({Hourglass.Worker, task_queue: queue})
+    {:ok, _worker} = Patience.start_worker(task_queue: queue)
 
     nonces = for _n <- 1..3, do: UUIDv7.generate()
 
@@ -68,7 +69,7 @@ defmodule Hourglass.ChildWorkflowIntegrationTest do
         task_queue: queue
       )
 
-    assert {:ok, %{"results" => results}} = Hourglass.result(handle, timeout: 60_000)
+    assert {:ok, %{"results" => results}} = Hourglass.result(handle, timeout: Patience.ms())
     assert length(results) == 3
 
     # await_all/1 preserves scope order, so results line up with the input nonces.
@@ -77,7 +78,7 @@ defmodule Hourglass.ChildWorkflowIntegrationTest do
 
   test "parent_close_policy :abandon — the child outlives the parent" do
     queue = "child-abandon-#{System.unique_integer([:positive])}"
-    {:ok, _worker} = start_supervised({Hourglass.Worker, task_queue: queue})
+    {:ok, _worker} = Patience.start_worker(task_queue: queue)
 
     child_id = "abandoned-child-#{UUIDv7.generate()}"
 
@@ -90,17 +91,17 @@ defmodule Hourglass.ChildWorkflowIntegrationTest do
       )
 
     # The parent returns as soon as the child STARTS — it does not await it.
-    assert {:ok, %{"child_id" => ^child_id}} = Hourglass.result(handle, timeout: 60_000)
+    assert {:ok, %{"child_id" => ^child_id}} = Hourglass.result(handle, timeout: Patience.ms())
 
     # Parent is closed; the abandoned child must still be running.
-    assert_eventually(fn ->
+    Patience.eventually(fn ->
       assert {:ok, %{state: :running}} = Hourglass.status(child_id)
     end)
   end
 
   test "parent_close_policy :terminate — the child dies with the parent" do
     queue = "child-terminate-#{System.unique_integer([:positive])}"
-    {:ok, _worker} = start_supervised({Hourglass.Worker, task_queue: queue})
+    {:ok, _worker} = Patience.start_worker(task_queue: queue)
 
     child_id = "terminated-child-#{UUIDv7.generate()}"
 
@@ -112,10 +113,10 @@ defmodule Hourglass.ChildWorkflowIntegrationTest do
         task_queue: queue
       )
 
-    assert {:ok, %{"child_id" => ^child_id}} = Hourglass.result(handle, timeout: 60_000)
+    assert {:ok, %{"child_id" => ^child_id}} = Hourglass.result(handle, timeout: Patience.ms())
 
     # Parent closed ⇒ the server terminates the still-sleeping child.
-    assert_eventually(fn ->
+    Patience.eventually(fn ->
       assert {:ok, %{state: state}} = Hourglass.status(child_id)
       assert state == :terminated
     end)
@@ -127,7 +128,7 @@ defmodule Hourglass.ChildWorkflowIntegrationTest do
     # through its continue-as-new chain, so the parent sees the FINAL
     # generation's output.
     queue = "child-can-#{System.unique_integer([:positive])}"
-    {:ok, _worker} = start_supervised({Hourglass.Worker, task_queue: queue})
+    {:ok, _worker} = Patience.start_worker(task_queue: queue)
 
     nonce = UUIDv7.generate()
 
@@ -137,7 +138,7 @@ defmodule Hourglass.ChildWorkflowIntegrationTest do
         task_queue: queue
       )
 
-    assert {:ok, result} = Hourglass.result(handle, timeout: 60_000)
+    assert {:ok, result} = Hourglass.result(handle, timeout: Patience.ms())
     assert result == %{"child" => %{"finished_gen" => 2, "nonce" => nonce}}
   end
 
@@ -146,7 +147,7 @@ defmodule Hourglass.ChildWorkflowIntegrationTest do
     # :reject_duplicate. Deriving the child id from run_id (fresh per
     # generation) is what keeps gen 2's start from colliding with gen 1's.
     queue = "parent-can-#{System.unique_integer([:positive])}"
-    {:ok, _worker} = start_supervised({Hourglass.Worker, task_queue: queue})
+    {:ok, _worker} = Patience.start_worker(task_queue: queue)
 
     nonce = UUIDv7.generate()
     workflow_id = "parent-can-#{nonce}"
@@ -170,7 +171,7 @@ defmodule Hourglass.ChildWorkflowIntegrationTest do
     # Reaching gen 2's completion at all proves gen 2's child started, i.e. its
     # id did not collide with gen 1's.
     assert {:ok, %{"second" => %{"echoed" => %{"nonce" => ^nonce}}}} =
-             Hourglass.result(workflow_id, timeout: 60_000)
+             Hourglass.result(workflow_id, timeout: Patience.ms())
 
     # And the surviving generation's history replays cleanly.
     assert {:ok, history_bytes} = fetch_history_bytes(workflow_id)
@@ -181,7 +182,7 @@ defmodule Hourglass.ChildWorkflowIntegrationTest do
 
   test "replay: a child-using parent replays cleanly against itself and mismatches a tampered twin" do
     queue = "child-replay-#{System.unique_integer([:positive])}"
-    {:ok, _worker} = start_supervised({Hourglass.Worker, task_queue: queue})
+    {:ok, _worker} = Patience.start_worker(task_queue: queue)
 
     nonce = UUIDv7.generate()
     workflow_id = "child-replay-#{nonce}"
@@ -192,7 +193,7 @@ defmodule Hourglass.ChildWorkflowIntegrationTest do
         task_queue: queue
       )
 
-    assert {:ok, _result} = Hourglass.result(handle, timeout: 60_000)
+    assert {:ok, _result} = Hourglass.result(handle, timeout: Patience.ms())
     assert {:ok, history_bytes} = fetch_history_bytes(workflow_id)
 
     assert :ok = Replayer.replay_history(history_bytes, Hourglass.TestSupport.ParentAwaitsChild)
@@ -202,19 +203,8 @@ defmodule Hourglass.ChildWorkflowIntegrationTest do
   end
 
   defp fetch_history_bytes(workflow_id) do
-    with {:ok, client} <- Client.connect([]) do
-      Client.fetch_history(client, workflow_id)
-    end
-  end
-
-  defp assert_eventually(fun, retries \\ 50)
-  defp assert_eventually(fun, 0), do: fun.()
-
-  defp assert_eventually(fun, retries) do
-    fun.()
-  rescue
-    _error ->
-      Process.sleep(100)
-      assert_eventually(fun, retries - 1)
+    Patience.retry(fn ->
+      with {:ok, client} <- Client.connect([]), do: Client.fetch_history(client, workflow_id)
+    end)
   end
 end

@@ -7,6 +7,7 @@ defmodule Hourglass.EchoWorkflowTest do
   use Hourglass.Test.UseRealTemporalBackend
 
   alias Hourglass.TestSupport.EchoWorkflow
+  alias Hourglass.TestSupport.Patience
   alias Hourglass.WorkflowHandle
 
   @moduletag :temporal
@@ -14,13 +15,13 @@ defmodule Hourglass.EchoWorkflowTest do
   # + Bridge stack actually executes a workflow against real Temporal.
   # Cannot be mocked. Default `mix test` excludes :integration.
   @moduletag :integration
-  @moduletag timeout: 60_000
+  @moduletag timeout: Patience.test_timeout(4)
 
   test "Echo workflow round-trips end-to-end" do
     queue = "echo-test-#{System.unique_integer([:positive])}"
 
     {:ok, _worker_pid} =
-      start_supervised({Hourglass.Worker, task_queue: queue})
+      Patience.start_worker(task_queue: queue)
 
     nonce = UUIDv7.generate()
     workflow_id = "echo:#{nonce}"
@@ -31,7 +32,7 @@ defmodule Hourglass.EchoWorkflowTest do
         task_queue: queue
       )
 
-    {:ok, result} = Hourglass.result(handle, timeout: 30_000)
+    {:ok, result} = Hourglass.result(handle, timeout: Patience.ms())
 
     # EchoWorkflow returns %{"echoed" => %{"nonce" => nonce}}.
     # The activity receives JSON-decoded args (atom keys become string keys),

@@ -27,9 +27,11 @@ defmodule Hourglass.EvictionReplayIntegrationTest do
   alias Hourglass.Replayer
   alias Hourglass.TestSupport.ActivityThenSignal
   alias Hourglass.TestSupport.CancelObserver
+  alias Hourglass.TestSupport.Patience
   alias Hourglass.TestSupport.RaceGate
   alias Hourglass.TestSupport.RacedContinue
   alias Hourglass.TestSupport.RacedEnd
+  alias Hourglass.TestSupport.WorkerProbes
   alias Hourglass.Worker.WorkflowStateCache
   alias Hourglass.Workflow.State
   alias Hourglass.WorkflowHandle
@@ -38,13 +40,13 @@ defmodule Hourglass.EvictionReplayIntegrationTest do
 
   @moduletag :temporal
   @moduletag :integration
-  @moduletag timeout: 120_000
+  @moduletag timeout: Patience.test_timeout(4)
   # The rejected task and the replay log their own lines; surface on failure.
   @moduletag capture_log: false
 
   setup do
     queue = "evict-replay-#{System.unique_integer([:positive])}"
-    {:ok, _worker} = start_supervised({Hourglass.Worker, task_queue: queue})
+    {:ok, _worker} = Patience.start_worker(task_queue: queue)
     %{queue: queue, id: "evict-replay-#{UUIDv7.generate()}"}
   end
 
@@ -94,7 +96,7 @@ defmodule Hourglass.EvictionReplayIntegrationTest do
     assert :WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_COMMAND in task_failure_causes(id)
 
     assert {:ok, %{"work" => %{"worked" => ^id}, "stop" => %{"n" => 2}, "cancelled" => false}} =
-             Hourglass.result(handle, timeout: 5_000)
+             Hourglass.result(handle, timeout: Patience.ms())
 
     assert :ok = replay(id, RacedEnd)
   end
@@ -159,57 +161,64 @@ defmodule Hourglass.EvictionReplayIntegrationTest do
   # Other ways for the same race, and for a replay, to arise
   # ---------------------------------------------------------------------------
 
+  # In these two the racing event is Temporal's own (a timer firing, a child's
+  # close reaching its parent), with no RPC to wait on, so the held task is
+  # held for a duration. A slow Temporal may deliver the event after it: then
+  # the run ends without the race, and is run again (`until_rejected/2`).
+
   test "a timer that fires while a complete command is in flight is handled after the replay",
-       %{queue: queue, id: id} do
-    :ok = RaceGate.arm(id)
-    handle = start!(RacedEnd, %{"gate" => id, "timer_ms" => 1_000}, id, queue)
-    await_first_task_completed(handle)
+       %{queue: queue} do
+    {id, handle} =
+      until_rejected(fn id ->
+        :ok = RaceGate.arm(id)
+        handle = start!(RacedEnd, %{"gate" => id, "timer_ms" => 1_000}, id, queue)
+        await_first_task_completed(handle)
 
-    :ok = Hourglass.signal(handle, "stop", %{"n" => 3})
-    held = RaceGate.await_held(id)
+        :ok = Hourglass.signal(handle, "stop", %{"n" => 3})
+        held = RaceGate.await_held(id)
 
-    # Hold the task open past the timer's deadline so it fires inside it. A
-    # timer has no RPC the test can wait on, so this one wait is a duration —
-    # the UnhandledCommand assertion below is what proves it landed.
-    Process.sleep(2_500)
-    :ok = RaceGate.disarm(id)
-    :ok = RaceGate.release(held)
-
-    assert %WorkflowStatus{state: :completed} = await_closed(handle)
-    assert :WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_COMMAND in task_failure_causes(id)
+        # Hold the task open past the timer's deadline so it fires inside it,
+        # and short of the ten seconds after which Temporal times the task out.
+        Process.sleep(5_000)
+        :ok = RaceGate.disarm(id)
+        :ok = RaceGate.release(held)
+        handle
+      end)
 
     assert {:ok, %{"stop" => %{"n" => 3}, "timer" => "ok"}} =
-             Hourglass.result(handle, timeout: 5_000)
+             Hourglass.result(handle, timeout: Patience.ms())
 
     assert :ok = replay(id, RacedEnd)
   end
 
   test "a child workflow that completes while a complete command is in flight is handled after the replay",
-       %{queue: queue, id: id} do
-    child_id = "#{id}-child"
-    :ok = RaceGate.arm(id)
-    handle = start!(RacedEnd, %{"gate" => id, "child" => child_id}, id, queue)
-    await_running(child_id)
+       %{queue: queue} do
+    {id, handle} =
+      until_rejected(fn id ->
+        child_id = "#{id}-child"
+        :ok = RaceGate.arm(id)
+        handle = start!(RacedEnd, %{"gate" => id, "child" => child_id}, id, queue)
+        await_running(child_id)
 
-    :ok = Hourglass.signal(handle, "stop", %{"n" => 4})
-    held = RaceGate.await_held(id)
+        :ok = Hourglass.signal(handle, "stop", %{"n" => 4})
+        held = RaceGate.await_held(id)
 
-    :ok = Hourglass.signal(child_id, "go", %{"child" => true})
+        :ok = Hourglass.signal(child_id, "go", %{"child" => true})
 
-    assert %WorkflowStatus{state: :completed} =
-             await_closed(%WorkflowHandle{id: child_id, run_id: ""})
+        assert %WorkflowStatus{state: :completed} =
+                 await_closed(%WorkflowHandle{id: child_id, run_id: ""})
 
-    # The child's close reaches the parent as a separate server-side step.
-    Process.sleep(1_000)
+        # The child's close reaches the parent as a separate server-side
+        # step; hold the task short of Temporal timing it out.
+        Process.sleep(3_000)
 
-    :ok = RaceGate.disarm(id)
-    :ok = RaceGate.release(held)
-
-    assert %WorkflowStatus{state: :completed} = await_closed(handle)
-    assert :WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_COMMAND in task_failure_causes(id)
+        :ok = RaceGate.disarm(id)
+        :ok = RaceGate.release(held)
+        handle
+      end)
 
     assert {:ok, %{"stop" => %{"n" => 4}, "child" => %{"go" => %{"child" => true}}}} =
-             Hourglass.result(handle, timeout: 5_000)
+             Hourglass.result(handle, timeout: Patience.ms())
 
     assert :ok = replay(id, RacedEnd)
   end
@@ -281,14 +290,14 @@ defmodule Hourglass.EvictionReplayIntegrationTest do
     # what was cached.
     :ok = stop_supervised(Hourglass.Worker)
     :ok = WorkflowStateCache.put(queue, handle.run_id, stale)
-    {:ok, _worker} = start_supervised({Hourglass.Worker, task_queue: queue})
+    {:ok, _worker} = Patience.start_worker(task_queue: queue)
 
     :ok = Hourglass.signal(handle, "next", %{"n" => 7})
 
-    assert %WorkflowStatus{state: :completed} = await_closed(handle, 60_000)
+    assert %WorkflowStatus{state: :completed} = await_closed(handle)
 
     assert {:ok, %{"echoed" => %{"nonce" => ^id}, "next" => %{"n" => 7}}} =
-             Hourglass.result(handle, timeout: 5_000)
+             Hourglass.result(handle, timeout: Patience.ms())
 
     assert :ok = replay(id, ActivityThenSignal)
   end
@@ -305,7 +314,7 @@ defmodule Hourglass.EvictionReplayIntegrationTest do
   # Wait for a closed state. A nondeterminism failure in the history is the
   # failure this suite exists to catch and it never resolves on its own, so it
   # ends the wait at once rather than burning the whole budget.
-  defp await_closed(handle, timeout \\ 45_000) do
+  defp await_closed(handle, timeout \\ Patience.ms()) do
     deadline = System.monotonic_time(:millisecond) + timeout
     do_await_closed(handle, deadline)
   end
@@ -355,17 +364,22 @@ defmodule Hourglass.EvictionReplayIntegrationTest do
     end)
   end
 
-  defp poll_until(what, fun, retries \\ 100)
-  defp poll_until(what, _fun, 0), do: flunk("timed out waiting for #{what}")
+  # Run `scenario` with a fresh workflow id until Temporal rejected the task
+  # it held with UnhandledCommand, at most `attempts` times. Returns the id and
+  # the handle of the run that raced, once it has closed.
+  defp until_rejected(scenario, attempts \\ 5) do
+    id = "evict-replay-#{UUIDv7.generate()}"
+    handle = scenario.(id)
+    assert %WorkflowStatus{state: :completed} = await_closed(handle)
 
-  defp poll_until(what, fun, retries) do
-    if fun.() do
-      :ok
-    else
-      Process.sleep(100)
-      poll_until(what, fun, retries - 1)
+    cond do
+      :WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_COMMAND in task_failure_causes(id) -> {id, handle}
+      attempts > 1 -> until_rejected(scenario, attempts - 1)
+      true -> flunk("the racing event never landed inside the held task")
     end
   end
+
+  defp poll_until(what, fun), do: WorkerProbes.poll_until(what, fun)
 
   defp events(workflow_id) do
     {:ok, %History{events: events}} = Hourglass.history(workflow_id)
@@ -408,14 +422,17 @@ defmodule Hourglass.EvictionReplayIntegrationTest do
   end
 
   defp replay(workflow_id, module) do
-    {:ok, client} = Client.connect([])
-    {:ok, history_bytes} = Client.fetch_history(client, workflow_id)
+    {:ok, history_bytes} =
+      Patience.retry(fn ->
+        with {:ok, client} <- Client.connect([]), do: Client.fetch_history(client, workflow_id)
+      end)
+
     Replayer.replay_history(history_bytes, module)
   end
 
   defp take_observations(probe, count) do
     for _n <- 1..count//1 do
-      assert_receive {RaceGate, :observed, ^probe, observation}, 20_000
+      assert_receive {RaceGate, :observed, ^probe, observation}, Patience.ms()
       observation
     end
   end

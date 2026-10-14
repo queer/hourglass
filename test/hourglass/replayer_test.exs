@@ -7,6 +7,7 @@ defmodule Hourglass.ReplayerTest do
   alias Hourglass.Client
   alias Hourglass.Replay.Mismatch
   alias Hourglass.TestSupport.EchoWorkflow
+  alias Hourglass.TestSupport.Patience
 
   @moduletag :temporal
   # Real-cluster Hourglass.Replayer tests — capture history from a
@@ -15,7 +16,7 @@ defmodule Hourglass.ReplayerTest do
   # history fixtures aren't checked into tree, so the test is end-to-end.
   # :integration so default suite stays fast.
   @moduletag :integration
-  @moduletag timeout: 60_000
+  @moduletag timeout: Patience.test_timeout(4)
 
   # TamperedEchoWorkflow: executes the activity TWICE instead of once.
   # When replayed against a history that only recorded ONE activity execution,
@@ -47,16 +48,16 @@ defmodule Hourglass.ReplayerTest do
   # given workflow ID via a direct Client.connect + Client.fetch_history call.
   # This is the binary form that Hourglass.Replayer.replay_history/2 expects.
   defp fetch_history_bytes(workflow_id) do
-    with {:ok, client} <- Client.connect([]) do
-      Client.fetch_history(client, workflow_id)
-    end
+    Patience.retry(fn ->
+      with {:ok, client} <- Client.connect([]), do: Client.fetch_history(client, workflow_id)
+    end)
   end
 
   test "Replayer accepts a real Echo history" do
     queue = "replayer-ok-#{System.unique_integer([:positive])}"
 
     {:ok, _worker_pid} =
-      start_supervised({Hourglass.Worker, task_queue: queue})
+      Patience.start_worker(task_queue: queue)
 
     nonce = UUIDv7.generate()
     workflow_id = "replay-echo:#{nonce}"
@@ -67,7 +68,7 @@ defmodule Hourglass.ReplayerTest do
         task_queue: queue
       )
 
-    {:ok, _result} = Hourglass.result(handle, timeout: 30_000)
+    {:ok, _result} = Hourglass.result(handle, timeout: Patience.ms())
 
     {:ok, history_bytes} = fetch_history_bytes(workflow_id)
     assert :ok = Hourglass.Replayer.replay_history(history_bytes, EchoWorkflow)
@@ -77,7 +78,7 @@ defmodule Hourglass.ReplayerTest do
     queue = "replayer-tamper-#{System.unique_integer([:positive])}"
 
     {:ok, _worker_pid} =
-      start_supervised({Hourglass.Worker, task_queue: queue})
+      Patience.start_worker(task_queue: queue)
 
     nonce = UUIDv7.generate()
     workflow_id = "replay-tamper:#{nonce}"
@@ -88,7 +89,7 @@ defmodule Hourglass.ReplayerTest do
         task_queue: queue
       )
 
-    {:ok, _result} = Hourglass.result(handle, timeout: 30_000)
+    {:ok, _result} = Hourglass.result(handle, timeout: Patience.ms())
 
     # Fetch the EchoWorkflow history, but replay it against TamperedEchoWorkflow
     # which schedules two activities. The single-activity history causes a

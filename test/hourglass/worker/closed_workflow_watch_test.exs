@@ -9,6 +9,11 @@ defmodule Hourglass.Worker.ClosedWorkflowWatchTest do
   Each "activity" is a plain process the test registers the way an executor
   registers the activity it runs (`Hourglass.ActivityExecutor.DynamicSupervisor`),
   so the watch takes it for one.
+
+  The watch owes its bound only when Temporal answers it in time, so how soon
+  an activity is ended is asserted only then (`Hourglass.TestSupport.WatchTrace`);
+  that it is ended at all is waited for as long as the suite waits on
+  Temporal (`Hourglass.TestSupport.Patience`).
   """
 
   use ExUnit.Case, async: true
@@ -17,21 +22,36 @@ defmodule Hourglass.Worker.ClosedWorkflowWatchTest do
   alias Hourglass.Activity.CancelRegistry
   alias Hourglass.Client
   alias Hourglass.TestSupport.FreezableProxy
+  alias Hourglass.TestSupport.Patience
+  alias Hourglass.TestSupport.SchedulerLag
+  alias Hourglass.TestSupport.WatchTrace
   alias Hourglass.TestSupport.WorkerProbes
   alias Hourglass.Worker.ClosedWorkflowWatch
 
   @moduletag capture_log: true
+  @moduletag timeout: Patience.test_timeout(4)
 
   @bound 400
+
+  # How late the BEAM runs, measured from the start of each test.
+  setup do
+    Process.put(:scheduler_lag, SchedulerLag.start())
+    :ok
+  end
 
   @tag :temporal
   test "an activity of a run Temporal does not know is ended" do
     queue = queue()
     {activity, _token} = fake_activity!(queue, unknown_run())
     monitor = Process.monitor(activity)
-    start_watch!(queue, Client.default_namespace(), Client.default_target_url())
+    started = System.monotonic_time(:millisecond)
+    watch = start_watch!(queue, Client.default_namespace(), Client.default_target_url())
 
-    assert_receive {:DOWN, ^monitor, :process, ^activity, :killed}, 2 * @bound
+    assert_receive {:DOWN, ^monitor, :process, ^activity, :killed}, Patience.ms()
+
+    if owed?(watch, @bound) do
+      assert System.monotonic_time(:millisecond) - started < 2 * @bound
+    end
   end
 
   @tag :temporal
@@ -42,14 +62,16 @@ defmodule Hourglass.Worker.ClosedWorkflowWatchTest do
     monitors = MapSet.new(activities, &Process.monitor/1)
 
     started = System.monotonic_time(:millisecond)
-    start_watch!(queue, Client.default_namespace(), Client.default_target_url(), bound)
+    watch = start_watch!(queue, Client.default_namespace(), Client.default_target_url(), bound)
 
     for _activity <- activities do
-      assert_receive {:DOWN, monitor, :process, _pid, :killed}, bound
+      assert_receive {:DOWN, monitor, :process, _pid, :killed}, Patience.ms()
       assert MapSet.member?(monitors, monitor)
     end
 
-    assert System.monotonic_time(:millisecond) - started < bound
+    if owed?(watch, bound) do
+      assert System.monotonic_time(:millisecond) - started < bound
+    end
   end
 
   @tag :temporal
@@ -87,8 +109,14 @@ defmodule Hourglass.Worker.ClosedWorkflowWatchTest do
 
     # Temporal answers again: the run it never answered for is found closed.
     monitor = Process.monitor(activity)
+    :ok = WatchTrace.reset(watch)
+    thawed = System.monotonic_time(:millisecond)
     :ok = FreezableProxy.thaw(proxy)
-    assert_receive {:DOWN, ^monitor, :process, ^activity, :killed}, 3_000
+    assert_receive {:DOWN, ^monitor, :process, ^activity, :killed}, Patience.ms()
+
+    if owed?(watch, @bound) do
+      assert System.monotonic_time(:millisecond) - thawed < 3_000
+    end
   end
 
   @tag :temporal
@@ -173,12 +201,31 @@ defmodule Hourglass.Worker.ClosedWorkflowWatchTest do
     {activity, token}
   end
 
+  # Whether a watch keeping `bound` owed its bound: Temporal answered it in
+  # time (`WatchTrace`), and the BEAM ran its timers on time (`SchedulerLag`).
+  defp owed?(watch, bound) do
+    lag = Process.get(:scheduler_lag)
+
+    not SchedulerLag.late?(lag, answer_time(bound)) and
+      WatchTrace.in_time?(watch, answer_time(bound))
+  end
+
+  # A watch, traced (`WatchTrace`) to the test.
   defp start_watch!(queue, namespace, target_url, bound \\ @bound) do
     opts = [namespace: namespace, target_url: target_url]
 
-    start_supervised!(%{
-      id: queue,
-      start: {ClosedWorkflowWatch, :start_link, [queue, bound, opts]}
-    })
+    watch =
+      start_supervised!(%{
+        id: queue,
+        start: {ClosedWorkflowWatch, :start_link, [queue, bound, opts]}
+      })
+
+    :ok = WatchTrace.start(watch)
+    watch
   end
+
+  # How soon Temporal must answer a watch keeping `bound` for the watch to owe
+  # it: a quarter of the bound, as the watch asks every quarter and stops an
+  # activity half the bound after learning its run closed.
+  defp answer_time(bound), do: div(bound, 4)
 end

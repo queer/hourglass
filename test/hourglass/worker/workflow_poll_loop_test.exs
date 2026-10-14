@@ -5,6 +5,7 @@ defmodule Hourglass.Worker.WorkflowPollLoopTest do
   use ExUnit.Case, async: false
 
   alias Hourglass.BridgeHolder
+  alias Hourglass.TestSupport.Patience
   alias Hourglass.Worker.WorkflowPollLoop
 
   @moduletag :temporal
@@ -71,7 +72,12 @@ defmodule Hourglass.Worker.WorkflowPollLoopTest do
   # body never repeats the register/unregister dance.
   defp registered_queue(_context) do
     queue = "wfp-real-#{System.unique_integer([:positive])}"
-    :ok = BridgeHolder.register_worker(queue, target_url: Hourglass.Client.default_target_url())
+
+    :ok =
+      Patience.retry(fn ->
+        BridgeHolder.register_worker(queue, target_url: Hourglass.Client.default_target_url())
+      end)
+
     on_exit(fn -> _result = BridgeHolder.unregister_worker(queue) end)
     %{queue: queue}
   end
