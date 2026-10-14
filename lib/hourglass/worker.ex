@@ -70,9 +70,18 @@ defmodule Hourglass.Worker do
        and a five-second margin have passed — the inner Supervisor is
        stopped, and every activity executor still running for the queue
        is stopped: sent a `:shutdown` exit, and killed two seconds later
-       if it traps exits. Its outcome was reported in step 3, so nothing
-       it could still do would reach Temporal, and stopping it keeps it
-       from racing its own retry.
+       if it traps exits. Stopping it keeps it from racing its own
+       retry. Each activity stopped is then reported to Temporal as the
+       same retryable `"WorkerShutdown"` failure, through the handle
+       that handed it out
+       (`Hourglass.ActivityRunner.report_worker_shutdown/3`). For one
+       Core already reported in step 3 this second report names a task
+       Core no longer holds, and is dropped; for one Core had not — the
+       margin ran out first — it is the report. The reports go out in
+       parallel, bounded by what is left of the shutdown budget (less six
+       seconds kept for step 5): one stuck on the network is given up
+       on, and its activity left to its timeout, rather than pushing the
+       stop past its shutdown timeout.
     5. **Lets go of Temporal.** `BridgeHolder.unregister_worker/1` drops
        the handle. `[:hourglass, :worker, :stopped]` is emitted, with
        the stop's `duration` and the number of `abandoned_activities`
@@ -90,15 +99,23 @@ defmodule Hourglass.Worker do
   has still not been completed when the margin runs out (a completion
   stuck on the network, say) is lost with the handle, and the server
   retries it after the workflow task timeout (ten seconds by default).
-  The same goes for an activity whose report is stuck: it is left to
-  its timeout.
 
   A Worker that is not stopped gracefully — killed outright, or a node
   that crashes — cannot do any of this: its activities' outcomes wait
   out their timeouts. `BridgeHolder` still drops a killed Worker's
-  handle, so the queue can be served again. A Worker that stops
-  because its inner Supervisor crashed has no poll loops left to drain
-  with, and goes straight to step 4.
+  handle, so the queue can be served again.
+
+  A Worker that stops because its inner Supervisor crashed has no poll
+  loops left to drain with, so Core can hand out nothing more — its
+  `WORKER_SHUTDOWN` cancels included. Its running activities still
+  finish and report through the held handle; in place of steps 2 and 3
+  it waits until none is running, up to the grace, and then goes on to
+  step 4, which reports each one still running as failed by the
+  shutdown. Either way each activity is reported within the grace (and
+  the moment step 4 takes), never left to its start-to-close timeout.
+  A workflow task in flight in this case is completed if its
+  evaluation finishes in time, and otherwise retried by the server
+  after the workflow task timeout.
 
   ## Children of the inner Supervisor (`:one_for_one`)
 

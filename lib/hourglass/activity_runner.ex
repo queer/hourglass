@@ -103,6 +103,34 @@ defmodule Hourglass.ActivityRunner do
     end
   end
 
+  @doc """
+  Report the activity task `task_token` to Temporal as a retryable failure
+  of type `"WorkerShutdown"` — the failure Core reports for an activity its
+  worker's graceful shutdown cancelled — through `complete_fn` (by default
+  `Hourglass.BridgeHolder.complete_activity_task/2`, which routes it to the
+  handle that handed the task out). A stopping `Hourglass.Worker` sends it
+  for each activity it had to stop (its moduledoc's "Graceful stop").
+  """
+  @spec report_worker_shutdown(
+          binary(),
+          String.t(),
+          (String.t(), binary() -> :ok | {:error, term()})
+        ) :: :ok | {:error, term()}
+  def report_worker_shutdown(
+        task_token,
+        task_queue,
+        complete_fn \\ &BridgeHolder.complete_activity_task/2
+      ) do
+    failure = %{
+      type: "WorkerShutdown",
+      message: "Worker is shutting down and this activity did not complete in time",
+      details: nil,
+      non_retryable: false
+    }
+
+    complete_fn.(task_queue, encode_completion(%{task_token: task_token}, {:failed, failure}))
+  end
+
   # An activity body raised: classify the exception, emit telemetry, and build
   # the failed-completion payload.
   defp failed_from_exception(activity_task, exception) do

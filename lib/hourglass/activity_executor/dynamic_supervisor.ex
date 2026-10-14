@@ -28,7 +28,8 @@ defmodule Hourglass.ActivityExecutor.DynamicSupervisor do
   Each executor registers under its task queue in
   `Hourglass.ActivityExecutor.Registry` (a duplicate-key `Registry`
   started next to this supervisor), so a stopping `Hourglass.Worker`
-  can find the executors of its own queue with `running/1`. A Worker
+  can find the executors of its own queue, and the task tokens of the
+  activities they run, with `running/1`. A Worker
   stops only the executors still running once its drain is over, whose
   outcome either was already reported to Temporal or can never be
   (`Hourglass.Worker`'s "Graceful stop").
@@ -78,11 +79,12 @@ defmodule Hourglass.ActivityExecutor.DynamicSupervisor do
   end
 
   @doc """
-  The executors running for `task_queue`.
+  The executors running for `task_queue`, each with the task token of the
+  activity task it runs.
   """
-  @spec running(String.t()) :: [pid()]
+  @spec running(String.t()) :: [{pid(), binary()}]
   def running(task_queue) when is_binary(task_queue) do
-    for {pid, _value} <- Registry.lookup(@registry, task_queue), do: pid
+    Registry.lookup(@registry, task_queue)
   end
 
   @doc """
@@ -94,7 +96,7 @@ defmodule Hourglass.ActivityExecutor.DynamicSupervisor do
   def registry_child_spec, do: Registry.child_spec(keys: :duplicate, name: @registry)
 
   defp execute(activity_task, task_queue) do
-    {:ok, _owner} = Registry.register(@registry, task_queue, nil)
+    {:ok, _owner} = Registry.register(@registry, task_queue, activity_task.task_token)
     ActivityRunner.run(activity_task, task_queue)
   end
 end

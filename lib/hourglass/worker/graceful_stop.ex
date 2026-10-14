@@ -8,6 +8,7 @@ defmodule Hourglass.Worker.GracefulStop do
 
   # credo:disable-for-next-line Credo.Check.Readability.AliasAs
   alias Hourglass.ActivityExecutor.DynamicSupervisor, as: Executors
+  alias Hourglass.ActivityRunner
   alias Hourglass.BridgeHolder
 
   require Logger
@@ -21,6 +22,10 @@ defmodule Hourglass.Worker.GracefulStop do
   # the executors left running, and dropping the handle.
   @release_margin 10_000
 
+  # Of the shutdown budget (the grace and both margins), the part kept back
+  # for dropping the handle once the shutdown reports are sent or given up on.
+  @release_reserve 6_000
+
   # How long an executor that traps exits is given to wind down once it has
   # been sent a `:shutdown` exit, before it is killed.
   @executor_stop_timeout 2_000
@@ -32,40 +37,61 @@ defmodule Hourglass.Worker.GracefulStop do
   def run(task_queue, sup_pid, grace) do
     started = now()
 
-    # 1. Stop taking new tasks; keep the handle. 2 and 3: Core hands out what it
-    # holds until both sides have drained; the grace is Core's.
-    drained? =
-      case holder_call(fn -> BridgeHolder.initiate_shutdown(task_queue) end) do
-        :ok ->
-          :telemetry.execute(
-            [:hourglass, :worker, :stopping],
-            %{system_time: System.system_time()},
-            %{task_queue: task_queue, graceful_shutdown_period: grace}
-          )
+    # 1, 2 and 3.
+    drained? = drain(task_queue, sup_pid, grace, started)
 
-          await_poll_loops(sup_pid, started + grace + @drain_margin)
-
-        _gone ->
-          # No handle to drain: a BridgeHolder cascade killed the holder (its
-          # own terminate shut every handle down), or the handle was already
-          # dropped. Nothing is left to report through, and the poll loops
-          # would only wait for a registration that never comes.
-          false
-      end
-
-    # 4. Stop what is left.
+    # 4. Stop what is left, and report each activity stopped as failed by the
+    # shutdown, through the handle that handed it out, so Temporal retries it
+    # now rather than at its timeout. One Core already reported (its
+    # WORKER_SHUTDOWN cancel was acknowledged) names a task Core no longer
+    # holds, and Core drops the second report.
     stop_inner_supervisor(sup_pid)
-    abandoned = stop_executors(task_queue)
-    log_abandoned(task_queue, abandoned, drained?)
+    stopped = stop_executors(task_queue)
+    report_worker_shutdowns(stopped, task_queue, started + grace + margins() - @release_reserve)
+    log_abandoned(task_queue, length(stopped), drained?)
 
     # 5. Let go of Temporal.
     _result = holder_call(fn -> BridgeHolder.unregister_worker(task_queue) end)
 
     :telemetry.execute(
       [:hourglass, :worker, :stopped],
-      %{duration: now() - started, abandoned_activities: abandoned},
+      %{duration: now() - started, abandoned_activities: length(stopped)},
       %{task_queue: task_queue, drained: drained?}
     )
+  end
+
+  # 1. Stop taking new tasks; keep the handle. 2 and 3: Core hands out what it
+  # holds until both sides have drained; the grace is Core's. True if the work
+  # drained before the deadline.
+  defp drain(task_queue, sup_pid, grace, started) do
+    # A Worker stopping because its inner Supervisor crashed has no poll loops
+    # left to drain with.
+    polling? = live_children(sup_pid) != []
+
+    case holder_call(fn -> BridgeHolder.initiate_shutdown(task_queue) end) do
+      :ok ->
+        :telemetry.execute(
+          [:hourglass, :worker, :stopping],
+          %{system_time: :erlang.system_time()},
+          %{task_queue: task_queue, graceful_shutdown_period: grace}
+        )
+
+        if polling? do
+          await_poll_loops(sup_pid, started + grace + @drain_margin)
+        else
+          # Without poll loops Core can deliver nothing, its WORKER_SHUTDOWN
+          # cancels included; the running activities still report through the
+          # held handle as they finish, until the grace runs out.
+          await_executors(task_queue, started + grace)
+        end
+
+      _gone ->
+        # No handle to drain: a BridgeHolder cascade killed the holder (its own
+        # terminate shut every handle down), or the handle was already dropped.
+        # Nothing is left to report through, and the poll loops would only wait
+        # for a registration that never comes.
+        false
+    end
   end
 
   # A call into BridgeHolder from a stopping Worker. The holder is gone when a
@@ -110,12 +136,38 @@ defmodule Hourglass.Worker.GracefulStop do
     :exit, _reason -> :ok
   end
 
-  # Stop every activity executor still running for the queue, and return how
-  # many there were. Each is sent a `:shutdown` exit, which ends one that does
-  # not trap exits at once; one still running `@executor_stop_timeout` later is
-  # killed. All of them are gone when this returns.
+  # Wait until no activity executor runs for the queue, or the deadline
+  # passes. True if none is left.
+  defp await_executors(task_queue, deadline) do
+    case Executors.running(task_queue) do
+      [] ->
+        true
+
+      [{pid, _task_token} | _others] ->
+        if await_down(pid, Process.monitor(pid), deadline) == :down do
+          await_executors(task_queue, deadline)
+        else
+          false
+        end
+    end
+  end
+
+  # Stop every activity executor still running for the queue, and return the
+  # task tokens of the activities they ran. Each is sent a `:shutdown` exit,
+  # which ends one that does not trap exits at once; one still running
+  # `@executor_stop_timeout` later is killed. All of them are gone when this
+  # returns, so none can report after the shutdown failure does.
   defp stop_executors(task_queue) do
-    monitored = for pid <- Executors.running(task_queue), do: {pid, Process.monitor(pid)}
+    running = Executors.running(task_queue)
+    stop_all(for {pid, _task_token} <- running, do: pid)
+
+    running
+    |> Enum.map(fn {_pid, task_token} -> task_token end)
+    |> Enum.uniq()
+  end
+
+  defp stop_all(pids) do
+    monitored = for pid <- pids, do: {pid, Process.monitor(pid)}
     Enum.each(monitored, fn {pid, _ref} -> Process.exit(pid, :shutdown) end)
 
     deadline = now() + @executor_stop_timeout
@@ -126,8 +178,24 @@ defmodule Hourglass.Worker.GracefulStop do
         :down = await_down(pid, Process.monitor(pid), :infinity)
       end
     end)
+  end
 
-    length(monitored)
+  # Send the reports in parallel, and give up on any not sent by `deadline`:
+  # a report stuck on the network must not push the stop past the shutdown
+  # timeout `Hourglass.Worker.child_spec/1` sets. An activity whose report is
+  # given up on is left to its timeout.
+  defp report_worker_shutdowns(task_tokens, task_queue, deadline) do
+    task_tokens
+    |> Enum.map(&Task.async(fn -> report_worker_shutdown(&1, task_queue) end))
+    |> Task.yield_many(max(deadline - now(), 0))
+    |> Enum.each(fn
+      {_task, {:ok, _result}} -> :ok
+      {task, _exited_or_unsent} -> Task.shutdown(task, :brutal_kill)
+    end)
+  end
+
+  defp report_worker_shutdown(task_token, task_queue) do
+    holder_call(fn -> ActivityRunner.report_worker_shutdown(task_token, task_queue) end)
   end
 
   # Wait for the monitored `pid` to go down, until `deadline`.
@@ -144,22 +212,15 @@ defmodule Hourglass.Worker.GracefulStop do
   defp remaining(:infinity), do: :infinity
   defp remaining(deadline), do: max(deadline - now(), 0)
 
-  defp now, do: System.monotonic_time(:millisecond)
+  defp now, do: :erlang.monotonic_time(:millisecond)
 
   defp log_abandoned(_task_queue, 0, _drained?), do: :ok
 
-  defp log_abandoned(task_queue, count, true) do
+  defp log_abandoned(task_queue, count, drained?) do
     Logger.warning(
       "worker for task_queue=#{task_queue} stopped #{count} activity executor(s) still " <>
-        "running after the graceful shutdown period; each was reported to Temporal as a " <>
-        "retryable WorkerShutdown failure"
-    )
-  end
-
-  defp log_abandoned(task_queue, count, false) do
-    Logger.warning(
-      "worker for task_queue=#{task_queue} stopped #{count} activity executor(s) before " <>
-        "Core had drained; any whose outcome had not reached Temporal is left to its timeout"
+        "running at the end of its graceful stop (drained: #{drained?}); each was reported " <>
+        "to Temporal as a retryable WorkerShutdown failure"
     )
   end
 end

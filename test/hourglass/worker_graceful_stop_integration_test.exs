@@ -201,6 +201,50 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
   end
 
   # ---------------------------------------------------------------------------
+  # A worker that stops because its poll loops' supervisor crashed
+  # ---------------------------------------------------------------------------
+
+  test "a worker whose inner supervisor crashes lets its running activity finish and report",
+       %{control: control, queue: queue, id: id} do
+    start_worker!(queue, graceful_shutdown_period: 30_000)
+    :ok = RaceGate.arm({id, :activity})
+    _handle = start!(GatedWork, %{"gate" => id, "queue" => queue}, id, control)
+    running = RaceGate.await_held({id, :activity})
+
+    crash_inner_supervisor!(queue)
+    assert_receive {:stopping, ^queue}, 5_000
+
+    :ok = RaceGate.disarm({id, :activity})
+    :ok = RaceGate.release(running)
+
+    poll_until("the activity's completion to be recorded", fn ->
+      activity_completions(id) != []
+    end)
+
+    assert activity_failures(id) == []
+  end
+
+  test "a worker whose inner supervisor crashes reports an activity still running at the grace as failed by the shutdown",
+       %{control: control, queue: queue, id: id} do
+    start_worker!(queue, graceful_shutdown_period: 1_000)
+    :ok = RaceGate.arm({id, :activity})
+    _handle = start!(GatedWork, %{"gate" => id, "queue" => queue}, id, control)
+    {activity_pid, _ref} = RaceGate.await_held({id, :activity})
+    activity_ref = Process.monitor(activity_pid)
+
+    crash_inner_supervisor!(queue)
+
+    poll_until("the activity's failure to be recorded", fn -> activity_failures(id) != [] end)
+    assert [failure] = activity_failures(id)
+
+    assert {:application_failure_info, %{type: "WorkerShutdown", non_retryable: false}} =
+             failure.failure_info
+
+    assert_receive {:DOWN, ^activity_ref, :process, ^activity_pid, _reason}, 1_000
+    :ok = RaceGate.disarm({id, :activity})
+  end
+
+  # ---------------------------------------------------------------------------
   # Edge cases
   # ---------------------------------------------------------------------------
 
@@ -326,6 +370,15 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
       Process.sleep(100)
       poll_until(what, fun, retries - 1)
     end
+  end
+
+  # Kill the worker's inner supervisor, which takes its poll loops with it and
+  # stops the worker (Worker.Supervisor then restarts it).
+  defp crash_inner_supervisor!(queue) do
+    sup = Hourglass.Worker.inner_supervisor(queue)
+    ref = Process.monitor(sup)
+    Process.exit(sup, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^sup, :killed}
   end
 
   defp start_worker!(queue, opts \\ []) do

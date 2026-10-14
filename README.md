@@ -285,6 +285,10 @@ down — finishes the work it holds before it lets go of Temporal:
    instead of waiting out its start-to-close timeout. Its process is then stopped.
 4. Only then is the worker's handle on Temporal released.
 
+The same holds for a worker that stops because its poll loops' supervisor crashed:
+its running activities finish and report through the held handle, and any still
+running at the grace is stopped and reported as a `"WorkerShutdown"` failure.
+
 So a stop takes as long as the longest running activity, up to the grace (and is
 immediate when nothing is running). The grace defaults to 20 seconds; set it per
 worker, or for every worker:
