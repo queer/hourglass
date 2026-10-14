@@ -28,8 +28,8 @@ defmodule Hourglass.RecycleInFlightIntegrationTest do
   alias Hourglass.Client.Real
   alias Hourglass.TestSupport.GatedWork
   alias Hourglass.TestSupport.RaceGate
+  alias Hourglass.TestSupport.WorkerProbes
   alias Hourglass.Worker
-  alias Hourglass.Worker.ActivityPollLoop
   alias Hourglass.WorkflowHandle
   alias Temporal.Api.History.V1.History
 
@@ -50,20 +50,20 @@ defmodule Hourglass.RecycleInFlightIntegrationTest do
     handle = start!(GatedWork, %{"gate" => id, "queue" => queue}, id, queue)
     running = RaceGate.await_held({id, :activity})
 
-    polls = parked_polls()
-    recycle!(queue)
+    polls = WorkerProbes.parked_polls()
+    WorkerProbes.recycle!(queue)
 
     # The old handle's polls returned, the orphan the killed loop left included,
     # though the activity the handle handed out is still running: none holds a
     # dirty-IO thread now.
-    assert Enum.filter(polls, &(&1 in parked_polls())) == []
+    assert Enum.filter(polls, &(&1 in WorkerProbes.parked_polls())) == []
 
     :ok = RaceGate.disarm({id, :activity})
     :ok = RaceGate.release(running)
 
     # The completion reaches Temporal now, through the handle that handed the
     # activity out — not after the activity's two-minute timeout.
-    poll_until("the activity's completion to be recorded", fn ->
+    WorkerProbes.poll_until("the activity's completion to be recorded", fn ->
       activity_completions(id) != []
     end)
 
@@ -81,7 +81,7 @@ defmodule Hourglass.RecycleInFlightIntegrationTest do
     handle = start!(GatedWork, %{"gate" => id, "queue" => queue}, id, queue)
     {activity_pid, _ref} = running = RaceGate.await_held({id, :activity})
 
-    recycle!(queue)
+    WorkerProbes.recycle!(queue)
 
     # A heartbeat goes to the handle that handed the activity out, which sends
     # it on to Temporal, rather than to the fresh one, which drops it as
@@ -89,12 +89,14 @@ defmodule Hourglass.RecycleInFlightIntegrationTest do
     assert last_heartbeat(handle) == nil
     assert :ok = heartbeat_from(activity_pid, queue)
 
-    poll_until("the heartbeat to reach Temporal", fn -> last_heartbeat(handle) != nil end)
+    WorkerProbes.poll_until("the heartbeat to reach Temporal", fn ->
+      last_heartbeat(handle) != nil
+    end)
 
     :ok = RaceGate.disarm({id, :activity})
     :ok = RaceGate.release(running)
 
-    poll_until("the activity's completion to be recorded", fn ->
+    WorkerProbes.poll_until("the activity's completion to be recorded", fn ->
       activity_completions(id) != []
     end)
   end
@@ -102,43 +104,6 @@ defmodule Hourglass.RecycleInFlightIntegrationTest do
   # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
-
-  # Kill the queue's activity poll loop while it is parked on a poll, and wait
-  # for the holder to install the recycled handle.
-  defp recycle!(queue) do
-    before = current_handle(queue)
-
-    loop =
-      queue
-      |> Worker.inner_supervisor()
-      |> Supervisor.which_children()
-      |> Enum.find_value(fn {id, pid, _type, _modules} -> id == ActivityPollLoop && pid end)
-
-    poll_until("the activity poll loop to park on a poll", fn ->
-      Process.info(loop, :current_function) == {:current_function, {:gen, :do_call, 4}}
-    end)
-
-    ref = Process.monitor(loop)
-    Process.exit(loop, :kill)
-    assert_receive {:DOWN, ^ref, :process, ^loop, :killed}
-
-    poll_until("the holder to recycle the handle", fn ->
-      current = current_handle(queue)
-      current != nil and current != before
-    end)
-  end
-
-  # Processes in the VM parked in a poll NIF, each holding a dirty-IO
-  # scheduler thread while it waits on Core.
-  defp parked_polls do
-    for pid <- Process.list(),
-        {:current_function, {Hourglass.Bridge, function, 1}} <-
-          [Process.info(pid, :current_function)],
-        function in [:worker_poll_workflow_activation, :worker_poll_activity_task],
-        do: pid
-  end
-
-  defp current_handle(queue), do: :sys.get_state(BridgeHolder).handles[queue]
 
   # Record a heartbeat as the activity's own process would: the heartbeat
   # names the activity's task token, which `Hourglass.Activity.info/0` holds in
@@ -167,17 +132,5 @@ defmodule Hourglass.RecycleInFlightIntegrationTest do
   defp activity_completions(workflow_id) do
     {:ok, %History{events: events}} = Hourglass.history(workflow_id)
     for %{attributes: {:activity_task_completed_event_attributes, attrs}} <- events, do: attrs
-  end
-
-  defp poll_until(what, fun, retries \\ 100)
-  defp poll_until(what, _fun, 0), do: flunk("timed out waiting for #{what}")
-
-  defp poll_until(what, fun, retries) do
-    if fun.() do
-      :ok
-    else
-      Process.sleep(100)
-      poll_until(what, fun, retries - 1)
-    end
   end
 end

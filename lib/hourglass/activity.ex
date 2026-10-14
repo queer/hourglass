@@ -166,6 +166,57 @@ defmodule Hourglass.Activity do
   defdelegate heartbeat, to: Hourglass.Activity.Heartbeat
 
   @doc """
+  A ref with which another process can heartbeat on behalf of the
+  activity this process is running (`heartbeat/1`): call it inside the
+  activity, and hand the ref to, say, a process linked to the activity
+  that heartbeats while the activity's own process is busy. Returns
+  `nil` outside an activity dispatch.
+
+      def execute(args) do
+        ref = Hourglass.Activity.heartbeat_ref()
+        beating = spawn_link(fn -> keep_beating(ref) end)
+
+        try do
+          do_the_work(args)
+        after
+          Process.unlink(beating)
+          Process.exit(beating, :kill)
+        end
+      end
+
+      defp keep_beating(ref) do
+        if Hourglass.Activity.heartbeat(ref) != :ended do
+          Process.sleep(1_000)
+          keep_beating(ref)
+        end
+      end
+
+  The ref names one dispatch (one attempt) of the activity, and stays
+  correct for as long as that dispatch runs: through a recycle of the
+  worker's bridge handle its heartbeats still reach Temporal, through
+  the handle that handed the activity out. It cannot outlive it — once
+  the dispatch is over, `heartbeat/1` sends nothing and returns `:ended`
+  — and it never heartbeats for a later attempt.
+  """
+  @spec heartbeat_ref() :: Hourglass.Activity.HeartbeatRef.t() | nil
+  defdelegate heartbeat_ref, to: Hourglass.Activity.Heartbeat
+
+  @doc """
+  Heartbeat on behalf of the activity `ref` names (`heartbeat_ref/0`),
+  from any process. Returns what `heartbeat/0` would in the activity's
+  own process — `:ok`, or `:cancel` once Core has cancelled the activity
+  — or `:ended`, sending nothing, once that dispatch of the activity is
+  over.
+
+  A `:cancel` here only informs: the activity's own process stops when it
+  next calls `heartbeat!/0` (or acts on `heartbeat/0`'s `:cancel`), which
+  is what reports its cancellation. Raising `Hourglass.Activity.Cancelled`
+  in another process reports nothing, so there is no `heartbeat!/1`.
+  """
+  @spec heartbeat(Hourglass.Activity.HeartbeatRef.t()) :: :ok | :cancel | :ended
+  defdelegate heartbeat(ref), to: Hourglass.Activity.Heartbeat
+
+  @doc """
   Like `heartbeat/0`, but RAISES `Hourglass.Activity.Cancelled` when the activity has been
   cancelled (instead of returning `:cancel`). The runner turns the raise into a Temporal
   Cancellation completion. Use in activity bodies that want automatic unwinding at the next

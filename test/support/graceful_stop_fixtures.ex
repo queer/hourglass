@@ -7,22 +7,31 @@ defmodule Hourglass.TestSupport.GatedWork do
   #
   # `attempts` is the activity's `max_attempts` (default 1: no retry), so a test
   # can see whether a failure reported for the activity reached Temporal at once.
-  # `stubborn` runs `StubbornGatedActivity` in place of `GatedActivity`.
+  # `stubborn` runs `StubbornGatedActivity` in place of `GatedActivity`, and
+  # `heartbeat_ref` runs `HeartbeatRefActivity`; `heartbeat_timeout` (ms) is the
+  # activity's heartbeat timeout.
   use Hourglass.Workflow, input: :map, output: :map
 
   alias Hourglass.TestSupport.EchoActivity
   alias Hourglass.TestSupport.GatedActivity
+  alias Hourglass.TestSupport.HeartbeatRefActivity
   alias Hourglass.TestSupport.StubbornGatedActivity
 
   @impl Hourglass.Workflow.Behaviour
   def run(%{"gate" => gate, "queue" => queue} = args) do
-    activity = if args["stubborn"], do: StubbornGatedActivity, else: GatedActivity
+    activity =
+      cond do
+        args["stubborn"] -> StubbornGatedActivity
+        args["heartbeat_ref"] -> HeartbeatRefActivity
+        true -> GatedActivity
+      end
 
     gated =
       async(fn ->
         execute_activity(activity, %{"gate" => gate},
           task_queue: queue,
           start_to_close_timeout: 120_000,
+          heartbeat_timeout: args["heartbeat_timeout"],
           retry_policy: [max_attempts: Map.get(args, "attempts", 1), initial_interval: 100]
         )
       end)
@@ -99,5 +108,23 @@ defmodule Hourglass.TestSupport.RetriedWork do
       start_to_close_timeout: 120_000,
       retry_policy: [max_attempts: 3, initial_interval: 3_000, backoff_coefficient: 1.0]
     )
+  end
+end
+
+defmodule Hourglass.TestSupport.HeartbeatRefActivity do
+  @moduledoc false
+  # `GatedActivity` that first hands the test a heartbeat ref
+  # (`Hourglass.Activity.heartbeat_ref/0`), reported on the RaceGate key that is
+  # its gate, so the test can heartbeat on its behalf from another process.
+  # The activity itself never heartbeats.
+  use Hourglass.Activity, input: :map, output: :map
+
+  alias Hourglass.TestSupport.RaceGate
+
+  @impl Hourglass.Activity.Behaviour
+  def execute(%{"gate" => gate}) do
+    :ok = RaceGate.report(gate, {:heartbeat_ref, Hourglass.Activity.heartbeat_ref()})
+    :ok = RaceGate.hold({gate, :activity})
+    %{"worked" => gate}
   end
 end

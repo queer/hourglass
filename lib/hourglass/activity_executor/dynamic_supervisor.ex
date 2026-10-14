@@ -29,7 +29,10 @@ defmodule Hourglass.ActivityExecutor.DynamicSupervisor do
   `Hourglass.ActivityExecutor.Registry` (a duplicate-key `Registry`
   started next to this supervisor), so a stopping `Hourglass.Worker`
   can find the executors of its own queue, and the task tokens of the
-  activities they run, with `running/1`. A Worker
+  activities they run, with `running/1`. The executor running an
+  activity also registers under that activity's task token, so
+  `running_activity?/2` can tell whether a dispatch is still going on
+  (`Hourglass.Activity.heartbeat/1`). A Worker
   stops only the executors still running once its drain is over, whose
   outcome either was already reported to Temporal or can never be
   (`Hourglass.Worker`'s "Graceful stop").
@@ -95,8 +98,26 @@ defmodule Hourglass.ActivityExecutor.DynamicSupervisor do
   @spec registry_child_spec() :: Supervisor.child_spec()
   def registry_child_spec, do: Registry.child_spec(keys: :duplicate, name: @registry)
 
+  @doc """
+  Whether `pid` is the executor running the activity whose task token is
+  `task_token` — that is, whether that dispatch of the activity is still
+  going on. A Cancel task for the token does not count: only the
+  executor that runs the activity itself does.
+  """
+  @spec running_activity?(binary(), pid()) :: boolean()
+  def running_activity?(task_token, pid) when is_binary(task_token) and is_pid(pid) do
+    {pid, nil} in Registry.lookup(@registry, {:activity, task_token})
+  end
+
   defp execute(activity_task, task_queue) do
     {:ok, _owner} = Registry.register(@registry, task_queue, activity_task.task_token)
+
+    # The executor that runs an activity — not one acknowledging a cancel of
+    # it — also registers under its task token, for `running_activity?/2`.
+    with %{variant: {:start, _start}} <- activity_task do
+      {:ok, _owner} = Registry.register(@registry, {:activity, activity_task.task_token}, nil)
+    end
+
     ActivityRunner.run(activity_task, task_queue)
   end
 end

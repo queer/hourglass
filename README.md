@@ -240,6 +240,34 @@ end
 `heartbeat/0` is best-effort and never crashes the activity body (a missing/absent runtime degrades
 to `:ok`).
 
+To heartbeat from another process — a process linked to the activity, say, that keeps it alive
+while the activity's own process is busy — capture a ref inside the activity with
+`Hourglass.Activity.heartbeat_ref/0` and heartbeat with `Hourglass.Activity.heartbeat/1`. It returns
+`:ok`, `:cancel` once Core has cancelled the activity, or `:ended`, sending nothing, once that
+dispatch of the activity is over; it keeps reaching Temporal through a recycle of the worker's
+bridge handle, and never heartbeats for a later attempt:
+
+```elixir
+def execute(args) do
+  ref = Hourglass.Activity.heartbeat_ref()
+  beating = spawn_link(fn -> keep_beating(ref) end)
+
+  try do
+    do_the_work(args)
+  after
+    Process.unlink(beating)
+    Process.exit(beating, :kill)
+  end
+end
+
+defp keep_beating(ref) do
+  if Hourglass.Activity.heartbeat(ref) != :ended do
+    Process.sleep(1_000)
+    keep_beating(ref)
+  end
+end
+```
+
 > **Scope:** cancellation is delivered by Temporal Core as a Cancel activity task — currently on
 > **heartbeat timeout**, server-side activity cancellation, and a stopping worker's grace running
 > out (see [Stopping a worker](#stopping-a-worker)). Requesting cancellation of the parent
