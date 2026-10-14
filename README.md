@@ -481,6 +481,11 @@ Note: retry eligibility (which error shapes retry) belongs to the classifier. Pe
 ## Development
 
 ```bash
+# Before every change lands: Elixir and Rust formatting (checked, never
+# rewritten), clippy and compile with warnings as errors, credo, the
+# default suite
+mix precommit
+
 # Cluster-free tests (default suite)
 mix test
 

@@ -3,12 +3,10 @@ use std::time::Duration;
 
 use prost::Message;
 use rustler::{Binary, ResourceArc};
-use tokio::sync::watch;
 use temporalio_client::{Connection, ConnectionOptions};
-use temporalio_sdk_core::{
-    PollError, Worker, WorkerConfig, WorkerVersioningStrategy, init_worker,
-};
 use temporalio_common::worker::WorkerTaskTypes;
+use temporalio_sdk_core::{init_worker, PollError, Worker, WorkerConfig, WorkerVersioningStrategy};
+use tokio::sync::watch;
 use url::Url;
 
 use crate::error::{BridgeError, ElixirBridgeError, OkOrError};
@@ -252,10 +250,7 @@ pub fn worker_record_activity_heartbeat(
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
-pub fn worker_shutdown(
-    env: rustler::Env,
-    worker: ResourceArc<WorkerResource>,
-) -> OkOrError {
+pub fn worker_shutdown(env: rustler::Env, worker: ResourceArc<WorkerResource>) -> OkOrError {
     // initiate_shutdown signals shutdown (cancels the CancellationToken) and returns
     // immediately. Core stops polling the server for new tasks, but keeps handing out
     // what it already holds: polls go on returning activations, activity cancels (among
@@ -293,4 +288,3 @@ fn map_poll_err(e: temporalio_sdk_core::PollError) -> BridgeError {
         temporalio_sdk_core::PollError::TonicError(s) => BridgeError::TonicError(s.to_string()),
     }
 }
-

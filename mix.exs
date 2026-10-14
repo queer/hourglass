@@ -61,8 +61,8 @@ defmodule Hourglass.MixProject do
   end
 
   def cli do
-    # `mix test.integration` is a test command, not a dev one.
-    [preferred_envs: ["test.integration": :test]]
+    # `mix test.integration` and `mix precommit` are test commands, not dev ones.
+    [preferred_envs: ["test.integration": :test, precommit: :test]]
   end
 
   defp description do
@@ -118,6 +118,17 @@ defmodule Hourglass.MixProject do
       #   ERL_FLAGS="+SDio 128" mix test.integration
       "test.integration": [
         "test --include temporal --include integration"
+      ],
+      # Run before every change lands. It never rewrites a file: unformatted
+      # Elixir or Rust fails it, and `mix format` / `cargo fmt` fix that.
+      # Dialyzer is not in it: it runs in the dev env, this in the test env.
+      precommit: [
+        "format --check-formatted",
+        "cmd --cd native/hourglass cargo fmt --check",
+        "cmd --cd native/hourglass cargo clippy -- -D warnings",
+        "compile --warnings-as-errors",
+        "credo",
+        "test"
       ],
       # Publish through this, never `mix hex.publish` directly. A version
       # already on Hex is immutable after an hour — so republishing one is

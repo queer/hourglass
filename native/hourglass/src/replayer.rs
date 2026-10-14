@@ -3,12 +3,12 @@ use std::sync::Arc;
 use prost::Message;
 use rustler::{Binary, ResourceArc};
 use temporalio_common::protos::temporal::api::history::v1::History;
+use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_sdk_core::{
-    Worker, WorkerConfig, WorkerVersioningStrategy,
     init_replay_worker,
     replay::{HistoryFeeder, HistoryForReplay, ReplayWorkerInput},
+    Worker, WorkerConfig, WorkerVersioningStrategy,
 };
-use temporalio_common::worker::WorkerTaskTypes;
 use tokio::sync::Mutex;
 
 use crate::error::{BridgeError, ElixirBridgeError, OkOrError};
@@ -113,7 +113,10 @@ pub fn replayer_push_history(
 ///
 /// Must be called after all `replayer_push_history` calls for a replay session.
 #[rustler::nif(schedule = "DirtyIo")]
-pub fn replayer_close_feeder(env: rustler::Env, replayer: ResourceArc<ReplayerResource>) -> OkOrError {
+pub fn replayer_close_feeder(
+    env: rustler::Env,
+    replayer: ResourceArc<ReplayerResource>,
+) -> OkOrError {
     let mut feeder_guard = replayer.feeder.blocking_lock();
     // Take the feeder out of the Option, dropping it — this closes the mpsc channel,
     // which ends the stream and triggers Core's shutdown path.
@@ -122,10 +125,7 @@ pub fn replayer_close_feeder(env: rustler::Env, replayer: ResourceArc<ReplayerRe
     OkOrError::Ok
 }
 
-fn build_replayer_worker_config(
-    namespace: &str,
-    task_queue: &str,
-) -> Result<WorkerConfig, String> {
+fn build_replayer_worker_config(namespace: &str, task_queue: &str) -> Result<WorkerConfig, String> {
     WorkerConfig::builder()
         .namespace(namespace)
         .task_queue(task_queue)
@@ -172,15 +172,10 @@ pub fn replayer_complete_workflow_activation(
 ) -> OkOrError {
     use temporalio_common::protos::coresdk::workflow_completion::WorkflowActivationCompletion;
 
-    let completion =
-        match WorkflowActivationCompletion::decode(completion_bin.as_slice()) {
-            Ok(c) => c,
-            Err(e) => {
-                return OkOrError::Err(
-                    BridgeError::InvalidProto(e.to_string()).to_elixir(env),
-                )
-            }
-        };
+    let completion = match WorkflowActivationCompletion::decode(completion_bin.as_slice()) {
+        Ok(c) => c,
+        Err(e) => return OkOrError::Err(BridgeError::InvalidProto(e.to_string()).to_elixir(env)),
+    };
 
     match replayer
         .runtime

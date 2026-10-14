@@ -3,6 +3,7 @@ use std::sync::Arc;
 use prost::Message;
 use prost_wkt_types::Duration as ProtoDuration;
 use rustler::{Binary, ResourceArc};
+use temporalio_client::tonic::Request;
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
 use temporalio_common::protos::temporal::api::{
     common::v1::WorkflowExecution,
@@ -14,7 +15,6 @@ use temporalio_common::protos::temporal::api::{
         StartWorkflowExecutionRequest,
     },
 };
-use temporalio_client::tonic::Request;
 use url::Url;
 
 use crate::error::{BridgeError, ElixirBridgeError, OkOrError};
@@ -82,7 +82,10 @@ pub fn client_describe_namespace<'a>(
     client: ResourceArc<ClientResource>,
     namespace: String,
 ) -> Result<Binary<'a>, ElixirBridgeError> {
-    let req = DescribeNamespaceRequest { namespace, ..Default::default() };
+    let req = DescribeNamespaceRequest {
+        namespace,
+        ..Default::default()
+    };
 
     let resp = client
         .runtime
@@ -107,7 +110,10 @@ pub fn client_register_namespace(
     namespace: String,
 ) -> OkOrError {
     // 1-day retention period is required by the Temporal server.
-    let retention = ProtoDuration { seconds: 86_400, nanos: 0 };
+    let retention = ProtoDuration {
+        seconds: 86_400,
+        nanos: 0,
+    };
     let req = RegisterNamespaceRequest {
         namespace,
         workflow_execution_retention_period: Some(retention),
@@ -293,4 +299,3 @@ pub fn client_cancel_workflow(
         Err(e) => OkOrError::Err(e.to_elixir(env)),
     }
 }
-
