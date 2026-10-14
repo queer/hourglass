@@ -83,7 +83,9 @@ defmodule Hourglass.Worker do
        on, and its activity left to its timeout, rather than pushing the
        stop past its shutdown timeout.
     5. **Lets go of Temporal.** `BridgeHolder.unregister_worker/1` drops
-       the handle. `[:hourglass, :worker, :stopped]` is emitted, with
+       the handle, and aborts and waits out any poll still on it — one
+       the margin cut off is still parked in Core — so a stopped worker
+       holds no dirty-IO scheduler thread. `[:hourglass, :worker, :stopped]` is emitted, with
        the stop's `duration` and the number of `abandoned_activities`
        stopped in step 4, and `drained: false` if step 4 came at the
        margin's end rather than when Core had drained.

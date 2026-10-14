@@ -3,9 +3,10 @@ use std::time::Duration;
 
 use prost::Message;
 use rustler::{Binary, ResourceArc};
+use tokio::sync::watch;
 use temporalio_client::{Connection, ConnectionOptions};
 use temporalio_sdk_core::{
-    Worker, WorkerConfig, WorkerVersioningStrategy, init_worker,
+    PollError, Worker, WorkerConfig, WorkerVersioningStrategy, init_worker,
 };
 use temporalio_common::worker::WorkerTaskTypes;
 use url::Url;
@@ -16,6 +17,12 @@ use crate::runtime::CoreRuntimeResource;
 pub struct WorkerResource {
     pub worker: Arc<Worker>,
     pub runtime: ResourceArc<CoreRuntimeResource>,
+    // Set by worker_abort_polls: every poll on this handle, in flight or
+    // later, returns ShutDown at once. Core's own shutdown makes a poll
+    // return only once everything it handed out has been completed, so a
+    // poll on a handle being let go of could otherwise stay parked — holding
+    // a dirty-IO scheduler thread — until Core next has something to yield.
+    pub abort: watch::Sender<bool>,
 }
 
 // Worker contains internal mutexes and tokio handles that are not UnwindSafe by default.
@@ -127,6 +134,7 @@ pub fn worker_new(
     Ok(ResourceArc::new(WorkerResource {
         worker: Arc::new(worker),
         runtime,
+        abort: watch::Sender::new(false),
     }))
 }
 
@@ -135,10 +143,17 @@ pub fn worker_poll_workflow_activation(
     env: rustler::Env<'_>,
     worker: ResourceArc<WorkerResource>,
 ) -> Result<Binary<'_>, ElixirBridgeError> {
+    let mut aborted = worker.abort.subscribe();
     let activation = worker
         .runtime
         .tokio_handle
-        .block_on(worker.worker.poll_workflow_activation())
+        .block_on(async {
+            tokio::select! {
+                biased;
+                _ = aborted.wait_for(|aborted| *aborted) => Err(PollError::ShutDown),
+                polled = worker.worker.poll_workflow_activation() => polled,
+            }
+        })
         .map_err(|e| map_poll_err(e).to_elixir(env))?;
 
     let bytes = activation.encode_to_vec();
@@ -173,10 +188,17 @@ pub fn worker_poll_activity_task(
     env: rustler::Env<'_>,
     worker: ResourceArc<WorkerResource>,
 ) -> Result<Binary<'_>, ElixirBridgeError> {
+    let mut aborted = worker.abort.subscribe();
     let task = worker
         .runtime
         .tokio_handle
-        .block_on(worker.worker.poll_activity_task())
+        .block_on(async {
+            tokio::select! {
+                biased;
+                _ = aborted.wait_for(|aborted| *aborted) => Err(PollError::ShutDown),
+                polled = worker.worker.poll_activity_task() => polled,
+            }
+        })
         .map_err(|e| map_poll_err(e).to_elixir(env))?;
 
     let bytes = task.encode_to_vec();
@@ -251,6 +273,16 @@ pub fn worker_shutdown(
         worker.worker.initiate_shutdown();
     });
     let _ = env;
+    OkOrError::Ok
+}
+
+// Make every poll on this handle — those in flight and any later one — return
+// ShutDown at once, whatever Core still holds. For a handle being let go of
+// (released, or retired by a recycle): what Core still holds can no longer be
+// handed to anyone who would act on it. Instant, so not a dirty NIF.
+#[rustler::nif]
+pub fn worker_abort_polls(worker: ResourceArc<WorkerResource>) -> OkOrError {
+    worker.abort.send_replace(true);
     OkOrError::Ok
 }
 

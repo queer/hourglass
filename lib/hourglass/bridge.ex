@@ -65,6 +65,11 @@ defmodule Hourglass.Bridge do
   @spec worker_shutdown(reference()) :: :ok | {:error, Hourglass.Bridge.Error.t()}
   def worker_shutdown(_worker), do: :erlang.nif_error(:nif_not_loaded)
 
+  # Every poll on the handle, in flight or later, returns
+  # `{:error, %Error{kind: :shutdown}}` at once, whatever Core still holds.
+  @spec worker_abort_polls(reference()) :: :ok
+  def worker_abort_polls(_worker), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec client_new(reference(), binary()) ::
           {:ok, reference()} | {:error, Hourglass.Bridge.Error.t()}
   def client_new(_runtime, _config_bin), do: :erlang.nif_error(:nif_not_loaded)

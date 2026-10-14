@@ -50,7 +50,13 @@ defmodule Hourglass.RecycleInFlightIntegrationTest do
     handle = start!(GatedWork, %{"gate" => id, "queue" => queue}, id, queue)
     running = RaceGate.await_held({id, :activity})
 
+    polls = parked_polls()
     recycle!(queue)
+
+    # The old handle's polls returned, the orphan the killed loop left included,
+    # though the activity the handle handed out is still running: none holds a
+    # dirty-IO thread now.
+    assert Enum.filter(polls, &(&1 in parked_polls())) == []
 
     :ok = RaceGate.disarm({id, :activity})
     :ok = RaceGate.release(running)
@@ -120,6 +126,16 @@ defmodule Hourglass.RecycleInFlightIntegrationTest do
       current = current_handle(queue)
       current != nil and current != before
     end)
+  end
+
+  # Processes in the VM parked in a poll NIF, each holding a dirty-IO
+  # scheduler thread while it waits on Core.
+  defp parked_polls do
+    for pid <- Process.list(),
+        {:current_function, {Hourglass.Bridge, function, 1}} <-
+          [Process.info(pid, :current_function)],
+        function in [:worker_poll_workflow_activation, :worker_poll_activity_task],
+        do: pid
   end
 
   defp current_handle(queue), do: :sys.get_state(BridgeHolder).handles[queue]

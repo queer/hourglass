@@ -245,6 +245,37 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
   end
 
   # ---------------------------------------------------------------------------
+  # A drain the margin cuts off
+  # ---------------------------------------------------------------------------
+
+  test "a worker whose drain the margin cuts off holds no dirty-IO thread once its stop returns",
+       %{queue: queue, id: id} do
+    # The control worker's polls, parked before this test's worker starts.
+    poll_until("the control worker to park its polls", fn -> length(parked_polls()) >= 2 end)
+    others = parked_polls()
+
+    start_worker!(queue, graceful_shutdown_period: 0)
+
+    # A workflow task held open for the whole stop: Core never drains, so
+    # both poll loops are still parked on polls when the margin runs out.
+    :ok = RaceGate.arm(id)
+    _handle = start!(GatedDecision, %{"gate" => id}, id, queue)
+    _held = RaceGate.await_held(id)
+
+    poll_until("the worker's two polls to park", fn ->
+      length(parked_polls() -- others) == 2
+    end)
+
+    polls = parked_polls() -- others
+    assert WorkerSupervisor.stop_worker(queue) == :ok
+
+    # The stopped worker's polls returned with the stop: neither is still
+    # parked in a poll NIF, holding a dirty-IO scheduler thread.
+    assert Enum.filter(polls, &(&1 in parked_polls())) == []
+    :ok = RaceGate.disarm(id)
+  end
+
+  # ---------------------------------------------------------------------------
   # Edge cases
   # ---------------------------------------------------------------------------
 
@@ -370,6 +401,16 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
       Process.sleep(100)
       poll_until(what, fun, retries - 1)
     end
+  end
+
+  # Processes in the VM parked in a poll NIF, each holding a dirty-IO
+  # scheduler thread while it waits on Core.
+  defp parked_polls do
+    for pid <- Process.list(),
+        {:current_function, {Hourglass.Bridge, function, 1}} <-
+          [Process.info(pid, :current_function)],
+        function in [:worker_poll_workflow_activation, :worker_poll_activity_task],
+        do: pid
   end
 
   # Kill the worker's inner supervisor, which takes its poll loops with it and
