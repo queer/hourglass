@@ -24,7 +24,9 @@ defmodule Hourglass.Bridge do
 
   See `signal_nif_reload!/1` for the cascade-signal internals.
   """
-  use Rustler, otp_app: :hourglass, crate: :hourglass
+  # Release mode in every Mix environment, so the NIF the suite tests is the
+  # one that ships (README, "NIF build mode").
+  use Rustler, otp_app: :hourglass, crate: :hourglass, mode: :release
 
   require Logger
 

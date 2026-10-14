@@ -523,11 +523,15 @@ HOURGLASS_TEMPORAL_PORT=7333 HOURGLASS_UI_PORT=8234 podman compose up -d
 TEMPORAL_TARGET_URL=http://localhost:7333 mix test.integration
 ```
 
-The NIF is built in debug mode for all non-production Mix environments. If `cargo` is not on your `PATH`, prepend `~/.cargo/bin`:
+If `cargo` is not on your `PATH`, prepend `~/.cargo/bin`:
 
 ```bash
 PATH="$HOME/.cargo/bin:$PATH" mix compile
 ```
+
+### NIF build mode
+
+The NIF is built in release mode in every Mix environment (`use Rustler, mode: :release` in `Hourglass.Bridge`), so the NIF the suite tests is the one that ships. A debug build differs in more than speed: it turns `temporalio-sdk-core`'s internal debug assertions into panics, so tests would exercise a build production never runs. To debug the NIF locally, ask for one explicitly with `config :hourglass, Hourglass.Bridge, mode: :debug`, and never land that setting.
 
 ## License
 

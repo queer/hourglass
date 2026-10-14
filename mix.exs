@@ -18,13 +18,7 @@ defmodule Hourglass.MixProject do
       # `:mix` (Mix.Tasks.Hourglass.Proto) and `:credo` (the packaged
       # Hourglass.Check.WorkflowDeterminism check) are dev/build-time-only
       # apps not in the runtime PLT; add them so dialyzer sees their modules.
-      dialyzer: [plt_add_apps: [:mix, :credo]],
-      rustler_crates: [
-        hourglass: [
-          path: "native/hourglass",
-          mode: if(Mix.env() == :prod, do: :release, else: :debug)
-        ]
-      ]
+      dialyzer: [plt_add_apps: [:mix, :credo]]
     ]
   end
 
