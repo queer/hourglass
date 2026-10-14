@@ -64,8 +64,21 @@ defmodule Hourglass.Activity.Heartbeat do
   @spec heartbeat!() :: :ok
   def heartbeat! do
     case heartbeat() do
-      :cancel -> raise(Activity.Cancelled, reason: :cancel_requested)
+      :cancel -> raise(Activity.Cancelled, reason: cancel_reason())
       :ok -> :ok
+    end
+  end
+
+  # Why the activity was cancelled, as far as its own process can tell:
+  # `:workflow_closed` when its worker found its workflow run closed
+  # (`Hourglass.Worker`, "Activities of a closed workflow"), else
+  # `:cancel_requested`.
+  defp cancel_reason do
+    with %Activity.Info{task_token: token} when is_binary(token) <- Activity.try_info(),
+         :workflow_closed <- Activity.CancelRegistry.cancelled?(token) do
+      :workflow_closed
+    else
+      _other -> :cancel_requested
     end
   end
 

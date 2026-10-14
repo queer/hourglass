@@ -11,8 +11,9 @@
 defmodule Hourglass.Activity.Cancelled do
   @moduledoc """
   Raised by `Hourglass.Activity.heartbeat!/0` when the running activity has been
-  cancelled (heartbeat timeout, workflow cancel, terminate, or its worker stopping and the grace
-  running out). `Hourglass.ActivityRunner`
+  cancelled: by a heartbeat timeout, server-side cancellation, its worker stopping and the grace
+  running out (reason `:cancel_requested`), or its workflow run closing (reason
+  `:workflow_closed`; see `Hourglass.Worker`'s "Activities of a closed workflow"). `Hourglass.ActivityRunner`
   recognises it and reports a Temporal Cancellation completion rather than a failure.
 
   Deliberately not named `…Error`: see the `credo:disable-for-this-file` note above

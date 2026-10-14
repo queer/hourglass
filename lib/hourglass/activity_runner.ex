@@ -131,6 +131,29 @@ defmodule Hourglass.ActivityRunner do
     complete_fn.(task_queue, encode_completion(%{task_token: task_token}, {:failed, failure}))
   end
 
+  @doc """
+  Report the activity task `task_token` to Temporal as cancelled, with
+  `reason`, through `complete_fn` (by default
+  `Hourglass.BridgeHolder.complete_activity_task/2`). A `Hourglass.Worker`
+  sends it for each activity of a closed workflow it had to stop (its
+  moduledoc's "Activities of a closed workflow"), so Core lets go of the
+  task.
+  """
+  @spec report_cancelled(
+          binary(),
+          String.t(),
+          term(),
+          (String.t(), binary() -> :ok | {:error, term()})
+        ) :: :ok | {:error, term()}
+  def report_cancelled(
+        task_token,
+        task_queue,
+        reason,
+        complete_fn \\ &BridgeHolder.complete_activity_task/2
+      ) do
+    complete_fn.(task_queue, encode_completion(%{task_token: task_token}, {:cancelled, reason}))
+  end
+
   # An activity body raised: classify the exception, emit telemetry, and build
   # the failed-completion payload.
   defp failed_from_exception(activity_task, exception) do

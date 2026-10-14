@@ -1,3 +1,8 @@
+# credo:disable-for-this-file Credo.Check.Refactor.ModuleDependencies
+#
+# The Worker starts and stops everything a task queue's serving is made of
+# (the handle, the poll loops, the closed-workflow watch, the graceful stop):
+# each is a dependency it has to have.
 defmodule Hourglass.Worker do
   @moduledoc """
   Per-task-queue Worker — a `GenServer` that owns the bridge-handle
@@ -12,10 +17,61 @@ defmodule Hourglass.Worker do
       back to `config :hourglass, Hourglass.Worker,
       graceful_shutdown_period: ms`, then to 20 seconds. `0` reports
       every running activity as failed by the shutdown at once.
+    * `:closed_workflow_bound` — milliseconds within which an activity
+      whose workflow has closed is ended (see "Activities of a closed
+      workflow"). Falls back to `config :hourglass, Hourglass.Worker,
+      closed_workflow_bound: ms`, then to
+      #{Hourglass.Worker.ClosedWorkflowWatch.default_bound()} ms.
     * `:namespace`, `:target_url`, `:max_cached_workflows`,
       `:max_outstanding_workflow_tasks`, `:max_outstanding_activities`,
       `:max_outstanding_local_activities` — passed to the bridge
       worker; see `Hourglass.BridgeHolder.register_worker/2`.
+
+  ## Activities of a closed workflow
+
+  An activity belongs to one run of its workflow. Once that run has
+  closed — completed, failed, timed out, been terminated, ended because
+  a cancel was requested of it, or continued as new — or Temporal no
+  longer knows it, nobody is waiting for the activity: Temporal drops
+  its outcome. The Worker ends such an activity within
+  `:closed_workflow_bound` of the run closing:
+
+    1. Every quarter of the bound, the Worker asks Temporal
+       (`DescribeWorkflowExecution`, through a client of its own
+       namespace and target) about each run that has an activity
+       running on its queue, up to sixteen runs at a time. A check
+       still waiting for its answers when the next is due is left to
+       finish.
+    2. Each activity of a run that has closed is cancelled:
+       `Hourglass.Activity.heartbeat/0` answers `:cancel` from then on,
+       and `heartbeat!/0` raises `Hourglass.Activity.Cancelled` (reason
+       `:workflow_closed`). An activity that heeds it has half the
+       bound to clean up and end by itself, reporting as it ends as
+       usual. `[:hourglass, :activity, :workflow_closed]` is emitted.
+    3. One still running half the bound after it was cancelled is
+       killed, and reported to Temporal as cancelled, so Core lets go
+       of the task. `[:hourglass, :activity, :workflow_closed,
+       :stopped]` is emitted, and a warning logged.
+
+  So an activity of a closed run is gone within three quarters of the
+  bound, plus the time Temporal takes to answer, and one that heeds the
+  cancel sees it within a quarter of the bound, plus that time and its
+  own heartbeat interval. Only a closed run ends its activities: a
+  cancel requested of a run that goes on running, because its body does
+  not end on `cancelled?/0`, ends nothing.
+
+  Nor does a Temporal that cannot be asked. Temporal is given a quarter
+  of the bound (at least a second) to answer for each run; a run it has
+  not answered for by then is taken as still running, and asked about
+  again at a later check. The asking waits on no scheduler thread, so a
+  Temporal that is slow, or has gone quiet, holds nothing of the
+  Worker's, and delays its stop not at all.
+
+  Temporal Core would tell the activity itself only through a heartbeat
+  it sends — answered as not found once the run has closed — and sends
+  those at most once per 0.8 of the heartbeat timeout (or per 30
+  seconds without one), and never for an activity that does not
+  heartbeat; hence the Worker asks.
 
   ## Why a GenServer + inner Supervisor (not just `use Supervisor`)
 
@@ -170,6 +226,7 @@ defmodule Hourglass.Worker do
 
   alias Hourglass.BridgeHolder
   alias Hourglass.Worker.ActivityPollLoop
+  alias Hourglass.Worker.ClosedWorkflowWatch
   alias Hourglass.Worker.GracefulStop
   alias Hourglass.Worker.WorkflowPollLoop
   alias Hourglass.WorkerRegistry
@@ -182,7 +239,8 @@ defmodule Hourglass.Worker do
           max_outstanding_workflow_tasks: non_neg_integer(),
           max_outstanding_activities: non_neg_integer(),
           max_outstanding_local_activities: non_neg_integer(),
-          graceful_shutdown_period: non_neg_integer()
+          graceful_shutdown_period: non_neg_integer(),
+          closed_workflow_bound: pos_integer()
         ]
 
   @spec start_link(opts()) :: GenServer.on_start()
@@ -217,6 +275,18 @@ defmodule Hourglass.Worker do
   """
   @spec graceful_shutdown_period(keyword()) :: non_neg_integer()
   defdelegate graceful_shutdown_period(opts), to: BridgeHolder
+
+  @doc """
+  Within how long a Worker started with `opts` ends an activity whose
+  workflow run has closed, in milliseconds (see "Activities of a closed
+  workflow"): the `:closed_workflow_bound` option, else `config
+  :hourglass, Hourglass.Worker, closed_workflow_bound: ms`, else
+  #{ClosedWorkflowWatch.default_bound()} ms. Raises `ArgumentError` unless it
+  is an integer from #{ClosedWorkflowWatch.min_bound()} to
+  #{ClosedWorkflowWatch.max_bound()}.
+  """
+  @spec closed_workflow_bound(keyword()) :: pos_integer()
+  defdelegate closed_workflow_bound(opts), to: ClosedWorkflowWatch, as: :bound
 
   @doc """
   Returns the inner Supervisor pid for `task_queue`, primarily for
@@ -260,6 +330,7 @@ defmodule Hourglass.Worker do
 
     task_queue = Keyword.fetch!(opts, :task_queue)
     grace = graceful_shutdown_period(opts)
+    bound = closed_workflow_bound(opts)
 
     register_opts =
       opts
@@ -267,12 +338,20 @@ defmodule Hourglass.Worker do
       |> Keyword.put(:graceful_shutdown_period, grace)
 
     with :ok <- BridgeHolder.register_worker(task_queue, register_opts),
-         {:ok, sup_pid} <- start_inner_supervisor(task_queue) do
-      {:ok, %{task_queue: task_queue, sup_pid: sup_pid, graceful_shutdown_period: grace}}
+         {:ok, sup_pid} <- start_inner_supervisor(task_queue),
+         {:ok, watch_pid} <- ClosedWorkflowWatch.start_link(task_queue, bound, opts) do
+      {:ok,
+       %{
+         task_queue: task_queue,
+         sup_pid: sup_pid,
+         watch_pid: watch_pid,
+         graceful_shutdown_period: grace
+       }}
     else
       {:error, reason} ->
-        # Roll back the bridge allocation if the inner Supervisor
-        # failed to start. Idempotent if registration itself failed.
+        # Roll back the bridge allocation if the inner Supervisor or the
+        # closed-workflow watch failed to start (either, started, is linked
+        # to us and goes with us). Idempotent if registration itself failed.
         _result = BridgeHolder.unregister_worker(task_queue)
         {:stop, reason}
     end
@@ -292,12 +371,20 @@ defmodule Hourglass.Worker do
     {:stop, reason, state}
   end
 
+  # Likewise the closed-workflow watch, which links to us too.
+  def handle_info({:EXIT, watch_pid, reason}, %{watch_pid: watch_pid} = state) do
+    {:stop, reason, state}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
-  # The graceful stop: see the moduledoc's "Graceful stop".
+  # The graceful stop: see the moduledoc's "Graceful stop". The
+  # closed-workflow watch goes on ending the activities of closed runs while
+  # the stop drains, and is stopped once the stop is done.
   @impl GenServer
   def terminate(_reason, %{task_queue: task_queue, sup_pid: sup_pid} = state) do
     GracefulStop.run(task_queue, sup_pid, state.graceful_shutdown_period)
+    stop_closed_workflow_watch(state.watch_pid)
   end
 
   # ---------------------------------------------------------------------------
@@ -311,5 +398,12 @@ defmodule Hourglass.Worker do
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one)
+  end
+
+  # A watch that crashed (and so stops this Worker) is already gone.
+  defp stop_closed_workflow_watch(watch_pid) do
+    GenServer.stop(watch_pid, :normal)
+  catch
+    :exit, _gone -> :ok
   end
 end

@@ -1,4 +1,5 @@
 mod client;
+mod closed_runs;
 mod error;
 mod payload;
 mod replayer;

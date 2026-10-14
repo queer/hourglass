@@ -85,8 +85,16 @@ defmodule Hourglass.ActivityCancellationTest do
 
     on_exit(fn -> :telemetry.detach(handler) end)
 
+    # The timed-out attempt fails the workflow's only activity, so the workflow
+    # completes while the attempt runs on; a worker ends the activities of a
+    # closed workflow itself, and may do so before Core's Cancel arrives. Its
+    # bound is set far beyond this test, so what stops the attempt here is
+    # Core's Cancel alone.
     queue = "cancel-#{System.unique_integer([:positive])}"
-    {:ok, _worker} = start_supervised({Hourglass.Worker, task_queue: queue})
+
+    {:ok, _worker} =
+      start_supervised({Hourglass.Worker, task_queue: queue, closed_workflow_bound: 600_000})
+
     workflow_id = "cancel:#{UUIDv7.generate()}"
 
     {:ok, %WorkflowHandle{}} =

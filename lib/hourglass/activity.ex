@@ -155,9 +155,10 @@ defmodule Hourglass.Activity do
     * Swallows a BridgeHolder `:exit` (holder absent or mid-recycle) — a heartbeat must never
       crash or fail the activity.
 
-  Returns `:cancel` iff Core has cancelled this activity (heartbeat timeout, workflow cancel,
-  terminate, or its worker stopping and the grace running out — see `Hourglass.Worker`'s
-  "Graceful stop") — the runner's Cancel-task handler marked the token in `CancelRegistry`. Long
+  Returns `:cancel` iff the activity has been cancelled: by Core (heartbeat timeout, server-side
+  cancellation, or its worker stopping and the grace running out — see `Hourglass.Worker`'s
+  "Graceful stop"), whose Cancel task the runner marks in `CancelRegistry`; or by its worker,
+  once its workflow run has closed (`Hourglass.Worker`'s "Activities of a closed workflow"). Long
   activities check the return at their heartbeat points and stop cleanly; or use `heartbeat!/0`.
 
   Liveness only: no `details` payload (Hourglass does not surface heartbeat details on retry).
@@ -204,7 +205,7 @@ defmodule Hourglass.Activity do
   @doc """
   Heartbeat on behalf of the activity `ref` names (`heartbeat_ref/0`),
   from any process. Returns what `heartbeat/0` would in the activity's
-  own process — `:ok`, or `:cancel` once Core has cancelled the activity
+  own process — `:ok`, or `:cancel` once the activity has been cancelled
   — or `:ended`, sending nothing, once that dispatch of the activity is
   over.
 
@@ -218,7 +219,8 @@ defmodule Hourglass.Activity do
 
   @doc """
   Like `heartbeat/0`, but RAISES `Hourglass.Activity.Cancelled` when the activity has been
-  cancelled (instead of returning `:cancel`). The runner turns the raise into a Temporal
+  cancelled (instead of returning `:cancel`), with reason `:workflow_closed` when its worker
+  cancelled it because its workflow run has closed, and `:cancel_requested` otherwise. The runner turns the raise into a Temporal
   Cancellation completion. Use in activity bodies that want automatic unwinding at the next
   heartbeat; the body needs no other change.
   """

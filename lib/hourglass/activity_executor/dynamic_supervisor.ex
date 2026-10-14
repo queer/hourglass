@@ -30,9 +30,12 @@ defmodule Hourglass.ActivityExecutor.DynamicSupervisor do
   started next to this supervisor), so a stopping `Hourglass.Worker`
   can find the executors of its own queue, and the task tokens of the
   activities they run, with `running/1`. The executor running an
-  activity also registers under that activity's task token, so
-  `running_activity?/2` can tell whether a dispatch is still going on
-  (`Hourglass.Activity.heartbeat/1`). A Worker
+  activity also registers under that activity's task token, with the
+  workflow run the activity belongs to, so `running_activity?/2` can
+  tell whether a dispatch is still going on
+  (`Hourglass.Activity.heartbeat/1`), and `running_activities/1` which
+  runs a Worker's activities belong to (its "Activities of a closed
+  workflow"). A Worker
   stops only the executors still running once its drain is over, whose
   outcome either was already reported to Temporal or can never be
   (`Hourglass.Worker`'s "Graceful stop").
@@ -99,25 +102,49 @@ defmodule Hourglass.ActivityExecutor.DynamicSupervisor do
   def registry_child_spec, do: Registry.child_spec(keys: :duplicate, name: @registry)
 
   @doc """
+  The activities running for `task_queue`: for each, the executor running
+  it, its task token, and the workflow id and run id of the run it belongs
+  to. Executors acknowledging a cancel are not among them, nor is an
+  activity whose task names no run.
+  """
+  @spec running_activities(String.t()) :: [{pid(), binary(), String.t(), String.t()}]
+  def running_activities(task_queue) when is_binary(task_queue) do
+    for {pid, task_token} <- running(task_queue),
+        {^pid, {workflow_id, run_id}} <- Registry.lookup(@registry, {:activity, task_token}),
+        do: {pid, task_token, workflow_id, run_id}
+  end
+
+  @doc """
   Whether `pid` is the executor running the activity whose task token is
   `task_token` — that is, whether that dispatch of the activity is still
   going on. A Cancel task for the token does not count: only the
-  executor that runs the activity itself does.
+  executor that runs the activity itself does. Nor does an executor that
+  has exited, which the registry may list for a moment after.
   """
   @spec running_activity?(binary(), pid()) :: boolean()
   def running_activity?(task_token, pid) when is_binary(task_token) and is_pid(pid) do
-    {pid, nil} in Registry.lookup(@registry, {:activity, task_token})
+    @registry
+    |> Registry.lookup({:activity, task_token})
+    |> Enum.any?(fn {owner, _run} -> owner == pid end) and Process.alive?(pid)
   end
 
   defp execute(activity_task, task_queue) do
     {:ok, _owner} = Registry.register(@registry, task_queue, activity_task.task_token)
 
     # The executor that runs an activity — not one acknowledging a cancel of
-    # it — also registers under its task token, for `running_activity?/2`.
-    with %{variant: {:start, _start}} <- activity_task do
-      {:ok, _owner} = Registry.register(@registry, {:activity, activity_task.task_token}, nil)
+    # it — also registers under its task token, with the run it belongs to,
+    # for `running_activity?/2` and `running_activities/1`.
+    with %{variant: {:start, start}} <- activity_task do
+      {:ok, _owner} =
+        Registry.register(@registry, {:activity, activity_task.task_token}, run_of(start))
     end
 
     ActivityRunner.run(activity_task, task_queue)
   end
+
+  defp run_of(%{workflow_execution: %{workflow_id: workflow_id, run_id: run_id}})
+       when workflow_id != "" and run_id != "",
+       do: {workflow_id, run_id}
+
+  defp run_of(_start), do: nil
 end

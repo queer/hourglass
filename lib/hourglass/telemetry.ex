@@ -24,6 +24,11 @@ defmodule Hourglass.Telemetry do
     [:hourglass, :activity, :exception],
     [:hourglass, :activity, :cancel_received],
     [:hourglass, :activity, :dispatch_failed],
+    # an activity's workflow run has closed, so it is cancelled
+    # (Hourglass.Worker, "Activities of a closed workflow"); metadata: task_queue, workflow_id, run_id
+    [:hourglass, :activity, :workflow_closed],
+    # such an activity was still running once half the bound had passed, and was killed
+    [:hourglass, :activity, :workflow_closed, :stopped],
     [:hourglass, :workflow, :exception],
     # workflow body raised → parked as a workflow-task failure; retried by the server
     [:hourglass, :workflow, :task_failed],

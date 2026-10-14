@@ -91,6 +91,25 @@ defmodule Hourglass.Bridge do
   def client_describe_workflow_execution(_client, _workflow_id, _run_id),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  # The closed-workflow watch's calls (`Hourglass.Worker.ClosedRuns`). Each
+  # starts its work on the Core runtime and returns `:ok` at once; the outcome
+  # is sent to the caller: `{:hourglass_client_opened, tag, {:ok, client} |
+  # {:error, %Error{}}}`, and `{:hourglass_runs_described, tag, [{workflow_id,
+  # run_id, {:ok, describe_response_bytes} | {:error, %Error{}}}]}`.
+  @spec closed_runs_open_client(reference(), binary(), pos_integer(), non_neg_integer()) ::
+          :ok | {:error, Hourglass.Bridge.Error.t()}
+  def closed_runs_open_client(_runtime, _config_bin, _timeout_ms, _tag),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec closed_runs_describe(
+          reference(),
+          [{String.t(), String.t()}],
+          pos_integer(),
+          non_neg_integer()
+        ) :: :ok
+  def closed_runs_describe(_client, _runs, _timeout_ms, _tag),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec client_describe_namespace(reference(), String.t()) ::
           {:ok, binary()} | {:error, Hourglass.Bridge.Error.t()}
   def client_describe_namespace(_client, _namespace), do: :erlang.nif_error(:nif_not_loaded)
