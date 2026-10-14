@@ -141,10 +141,19 @@ defmodule Hourglass.BridgeHolder do
   back to the GenServer, which dequeues the next waiting call (if any)
   and starts a new Task for it.
 
-  `Bridge.worker_complete_activity_task/2` is kept inline because it is
-  fast (no long wait in Core), and keeping it inline in `handle_call`
-  ensures it can always be processed even while a
-  `complete_workflow_activation` Task is running.
+  ## Activity calls run off the holder
+
+  `complete_activity_task/2` and `record_heartbeat/2` are not run inline
+  in `handle_call` either. Completing an activity waits on Core's RPC to
+  the server, and a completion stuck on the network would otherwise block
+  the holder — and with it every other activity's completion and
+  heartbeat on the node, on every task queue, and every poll and
+  workflow completion besides. The holder only decides which handle the
+  call goes to (the one that handed the task out: see "Handle recycle and
+  the work it handed out"), and a Task under its Task.Supervisor makes
+  the NIF call and replies. The task token is read from the proto in the
+  caller's process, not the holder's. Activity calls are not serialised
+  per queue, as workflow completions are: Core takes them concurrently.
 
   ## In-flight Task survival
 
@@ -247,6 +256,12 @@ defmodule Hourglass.BridgeHolder do
   # SDKs use. Hosts that run more concurrent workflows raise it explicitly via
   # worker opts or `config :hourglass, Hourglass.Worker, max_cached_workflows: N`.
   @default_max_cached_workflows 100
+
+  # The module whose `worker_complete_activity_task/2` and
+  # `worker_record_activity_heartbeat/2` the holder calls: `Hourglass.Bridge`,
+  # except in hourglass's own test build, where a stand-in lets a test stall
+  # one of them (test/support/stallable_bridge.ex).
+  @activity_bridge Application.compile_env(:hourglass, :activity_bridge, Hourglass.Bridge)
 
   # How long `unregister_worker/1` waits for the polls it aborted to return.
   @poll_return_timeout 5_000
@@ -447,7 +462,9 @@ defmodule Hourglass.BridgeHolder do
   @spec complete_activity_task(String.t(), binary()) :: :ok | {:error, term()}
   def complete_activity_task(task_queue, bytes)
       when is_binary(task_queue) and is_binary(bytes) do
-    GenServer.call(__MODULE__, {:complete_activity_task, task_queue, bytes}, 30_000)
+    # The task token is read here, in the caller, not in the holder.
+    call = {:complete_activity_task, task_queue, completion_token(bytes), bytes}
+    GenServer.call(__MODULE__, call, 30_000)
   end
 
   @doc """
@@ -458,7 +475,8 @@ defmodule Hourglass.BridgeHolder do
   @spec record_heartbeat(String.t(), binary()) :: :ok | {:error, term()}
   def record_heartbeat(task_queue, heartbeat_bin)
       when is_binary(task_queue) and is_binary(heartbeat_bin) do
-    GenServer.call(__MODULE__, {:record_heartbeat, task_queue, heartbeat_bin}, 30_000)
+    call = {:record_heartbeat, task_queue, heartbeat_token(heartbeat_bin), heartbeat_bin}
+    GenServer.call(__MODULE__, call, 30_000)
   end
 
   # ---------------------------------------------------------------------------
@@ -618,34 +636,22 @@ defmodule Hourglass.BridgeHolder do
   end
 
   @impl GenServer
-  def handle_call({:complete_activity_task, task_queue, bytes}, _from, state) do
+  def handle_call({:complete_activity_task, task_queue, token, bytes}, from, state) do
     # The activity is done with its route: pop it, so a retired handle is
     # released once nothing it handed out is still running.
-    {handle, state} = pop_activity_handle(state, task_queue, completion_token(bytes))
+    {handle, state} = pop_activity_handle(state, task_queue, token)
 
     case handle do
       handle when is_reference(handle) ->
-        reply =
-          try do
-            Bridge.worker_complete_activity_task(handle, bytes)
-          rescue
-            err in ArgumentError ->
-              # Emit telemetry before signalling the cascade.
-              :telemetry.execute(
-                [:hourglass, :worker, :registration_failed],
-                %{count: 1},
-                %{
-                  failure_class: :nif_reload,
-                  task_queue: task_queue,
-                  detail: Exception.message(err)
-                }
-              )
+        # In a Task, never inline: the NIF waits on Core's RPC to the server,
+        # and a completion stuck on the network must hold up no other
+        # activity's completion or heartbeat (see "Activity calls run off the
+        # holder" in the moduledoc).
+        activity_call_in_task(state, from, task_queue, "worker_complete_activity_task", fn ->
+          @activity_bridge.worker_complete_activity_task(handle, bytes)
+        end)
 
-              signal_nif_reload!("worker_complete_activity_task")
-              {:error, :nif_reloaded}
-          end
-
-        {:reply, reply, state}
+        {:noreply, state}
 
       nil ->
         # In-flight Task tried to ship a completion after the Worker was
@@ -665,29 +671,14 @@ defmodule Hourglass.BridgeHolder do
   end
 
   @impl GenServer
-  def handle_call({:record_heartbeat, task_queue, bytes}, _from, state) do
-    case activity_handle(state, task_queue, heartbeat_token(bytes)) do
+  def handle_call({:record_heartbeat, task_queue, token, bytes}, from, state) do
+    case activity_handle(state, task_queue, token) do
       handle when is_reference(handle) ->
-        reply =
-          try do
-            Bridge.worker_record_activity_heartbeat(handle, bytes)
-          rescue
-            err in ArgumentError ->
-              :telemetry.execute(
-                [:hourglass, :worker, :registration_failed],
-                %{count: 1},
-                %{
-                  failure_class: :nif_reload,
-                  task_queue: task_queue,
-                  detail: Exception.message(err)
-                }
-              )
+        activity_call_in_task(state, from, task_queue, "worker_record_activity_heartbeat", fn ->
+          @activity_bridge.worker_record_activity_heartbeat(handle, bytes)
+        end)
 
-              signal_nif_reload!("worker_record_activity_heartbeat")
-              {:error, :nif_reloaded}
-          end
-
-        {:reply, reply, state}
+        {:noreply, state}
 
       nil ->
         {:reply, {:error, :worker_not_registered}, state}
@@ -893,6 +884,34 @@ defmodule Hourglass.BridgeHolder do
     Task.Supervisor.start_child(state.task_sup, fn ->
       _result = safe_worker_shutdown(handle, task_queue)
       GenServer.reply(from, :ok)
+    end)
+  end
+
+  # Run an activity's bridge call (`fun`) in a Task and reply its result to
+  # `from`. A stale handle (NIF reload) replies `{:error, :nif_reloaded}`
+  # after signalling the cascade.
+  defp activity_call_in_task(state, from, task_queue, call_site, fun) do
+    Task.Supervisor.start_child(state.task_sup, fn ->
+      reply =
+        try do
+          fun.()
+        rescue
+          err in ArgumentError ->
+            :telemetry.execute(
+              [:hourglass, :worker, :registration_failed],
+              %{count: 1},
+              %{
+                failure_class: :nif_reload,
+                task_queue: task_queue,
+                detail: Exception.message(err)
+              }
+            )
+
+            signal_nif_reload!(call_site)
+            {:error, :nif_reloaded}
+        end
+
+      GenServer.reply(from, reply)
     end)
   end
 
