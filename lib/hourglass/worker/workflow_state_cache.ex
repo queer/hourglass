@@ -51,7 +51,10 @@ defmodule Hourglass.Worker.WorkflowStateCache do
   that history (the evaluator returns `:evict` and the evaluator Task deletes
   the entry). An entry that outlives Core's own copy of the run anyway — a
   worker restart, say — is never read back into a replay: an activation
-  carrying `initialize_workflow` starts the run from a fresh state.
+  carrying `initialize_workflow` starts the run from a fresh state. When
+  a queue's handle is let go of — its worker stopped, or killed — every
+  entry for the queue is dropped (`delete_task_queue/1`), since Core's
+  copy of those runs goes with the handle.
 
   ## Non-goal
 
@@ -120,6 +123,18 @@ defmodule Hourglass.Worker.WorkflowStateCache do
   @spec delete(String.t(), String.t()) :: :ok
   def delete(task_queue, run_id) when is_binary(task_queue) and is_binary(run_id) do
     true = :ets.delete(@table, {task_queue, run_id})
+    :ok
+  end
+
+  @doc """
+  Remove every cache entry for `task_queue`. Called when the queue's
+  bridge handle is let go of (`Hourglass.BridgeHolder`): Core's cache of
+  the queue's runs goes with the handle — Core does not evict a stopping
+  worker's idle runs first — so the mirror must go too.
+  """
+  @spec delete_task_queue(String.t()) :: :ok
+  def delete_task_queue(task_queue) when is_binary(task_queue) do
+    true = :ets.match_delete(@table, {{task_queue, :_}, :_})
     :ok
   end
 end

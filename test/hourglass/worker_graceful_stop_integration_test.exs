@@ -33,6 +33,7 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
   alias Hourglass.TestSupport.GatedWork
   alias Hourglass.TestSupport.RaceGate
   alias Hourglass.TestSupport.RetriedWork
+  alias Hourglass.Worker.WorkflowStateCache
   # credo:disable-for-next-line Credo.Check.Readability.AliasAs
   alias Hourglass.Worker.Supervisor, as: WorkerSupervisor
   alias Hourglass.WorkflowHandle
@@ -273,6 +274,33 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
     # parked in a poll NIF, holding a dirty-IO scheduler thread.
     assert Enum.filter(polls, &(&1 in parked_polls())) == []
     :ok = RaceGate.disarm(id)
+  end
+
+  # ---------------------------------------------------------------------------
+  # The worker's mirror of Core's workflow cache
+  # ---------------------------------------------------------------------------
+
+  test "a stopped worker leaves nothing of its runs in the workflow state cache",
+       %{queue: queue, id: id} do
+    start_worker!(queue, graceful_shutdown_period: 30_000)
+
+    # A run waiting on a signal: Core keeps it cached, and so does the worker.
+    handle = start!(Hourglass.TestSupport.SignalledChild, %{}, id, queue)
+
+    poll_until("the run's state to be cached", fn ->
+      WorkflowStateCache.fetch(queue, handle.run_id) != nil
+    end)
+
+    assert WorkerSupervisor.stop_worker(queue) == :ok
+
+    # Core does not evict a stopping worker's idle runs, and the cache it
+    # mirrored is gone with the handle: so must the mirror be.
+    assert WorkflowStateCache.fetch(queue, handle.run_id) == nil
+
+    # The run carries on, from its history, on the next worker.
+    start_worker!(queue)
+    :ok = Hourglass.signal(handle, "go", %{"n" => 1})
+    assert {:ok, %{"go" => %{"n" => 1}}} = Hourglass.result(handle, timeout: 30_000)
   end
 
   # ---------------------------------------------------------------------------

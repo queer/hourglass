@@ -226,6 +226,7 @@ defmodule Hourglass.BridgeHolder do
   alias Hourglass.Bridge
   alias Hourglass.Client
   alias Hourglass.Runtime
+  alias Hourglass.Worker.WorkflowStateCache
 
   require Logger
 
@@ -967,12 +968,14 @@ defmodule Hourglass.BridgeHolder do
     _error -> nil
   end
 
-  # Forget every trace of `task_queue`'s handle. Dropping register_opts too
+  # Forget every trace of `task_queue`'s handle — the worker's mirror of the
+  # Core cache that goes with it included. Dropping register_opts too
   # means a recycle in flight detects the missing handle entry and discards
   # its new handle.
   defp release(state, task_queue) do
     {owner_ref, owners} = Map.pop(state.owners, task_queue)
     if owner_ref, do: Process.demonitor(owner_ref, [:flush])
+    :ok = WorkflowStateCache.delete_task_queue(task_queue)
 
     routes =
       state.activity_routes
