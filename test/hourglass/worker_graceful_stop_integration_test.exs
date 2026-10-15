@@ -32,6 +32,7 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
   alias Hourglass.TestSupport.GatedDecision
   alias Hourglass.TestSupport.GatedWork
   alias Hourglass.TestSupport.Patience
+  alias Hourglass.TestSupport.Runs
   alias Hourglass.TestSupport.RaceGate
   alias Hourglass.TestSupport.RetriedWork
   alias Hourglass.TestSupport.WorkerProbes
@@ -62,7 +63,9 @@ defmodule Hourglass.WorkerGracefulStopIntegrationTest do
 
     on_exit(fn -> :telemetry.detach({__MODULE__, queue}) end)
 
-    %{control: control, queue: queue, id: "stop-#{UUIDv7.generate()}"}
+    id = "stop-#{UUIDv7.generate()}"
+    :ok = Runs.end_on_exit(id)
+    %{control: control, queue: queue, id: id}
   end
 
   @doc false

@@ -129,6 +129,23 @@ defmodule Hourglass do
   end
 
   @doc """
+  Terminates a workflow execution: it closes at once, as terminated, and its
+  body does not run again (unlike `cancel/2`, which its body may ignore).
+  Its activities are ended within their worker's closed-workflow bound
+  (`Hourglass.Worker`). One that has already closed, or that Temporal does
+  not know, is an error with reason `:not_found`.
+
+  Accepts a `%WorkflowHandle{}` (its run, or with an empty `run_id` the
+  latest run of its id) or a bare workflow-id string.
+  """
+  @spec terminate(WorkflowHandle.t() | String.t(), String.t()) :: :ok | {:error, Error.t()}
+  def terminate(handle_or_id, reason \\ "") do
+    handle_or_id
+    |> normalize_handle()
+    |> Backend.impl().terminate_workflow(reason)
+  end
+
+  @doc """
   Fetches the full event history for a workflow execution.
 
   Accepts a `%WorkflowHandle{}` or a bare workflow-id string.

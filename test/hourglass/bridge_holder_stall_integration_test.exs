@@ -26,6 +26,7 @@ defmodule Hourglass.BridgeHolderStallIntegrationTest do
   alias Hourglass.Client.Real
   alias Hourglass.TestSupport.GatedWork
   alias Hourglass.TestSupport.Patience
+  alias Hourglass.TestSupport.Runs
   alias Hourglass.TestSupport.RaceGate
   alias Hourglass.TestSupport.StallableBridge
   alias Hourglass.WorkflowHandle
@@ -145,6 +146,8 @@ defmodule Hourglass.BridgeHolderStallIntegrationTest do
   # ---------------------------------------------------------------------------
 
   defp start!(id, queue) do
+    :ok = Runs.end_on_exit(id)
+
     {:ok, %WorkflowHandle{} = handle} =
       Hourglass.start(GatedWork, %{"gate" => id, "queue" => queue}, id: id, task_queue: queue)
 

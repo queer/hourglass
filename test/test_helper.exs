@@ -7,6 +7,10 @@ ExUnit.configure(exclude: [:temporal])
 {:ok, _guard} = Hourglass.TestSupport.NamespaceGuard.start()
 ExUnit.after_suite(fn _results -> Hourglass.TestSupport.NamespaceGuard.verify() end)
 
+# Nor does it leave a workflow running (Hourglass.TestSupport.WorkflowGuard).
+{:ok, _guard} = Hourglass.TestSupport.WorkflowGuard.start()
+ExUnit.after_suite(fn _results -> Hourglass.TestSupport.WorkflowGuard.verify() end)
+
 # A message a test waits for comes within this by default. It catches a hang,
 # and is no promise of how soon: on a machine busy with other suites, work
 # the default 100 ms would cover takes seconds. A test that asserts how soon

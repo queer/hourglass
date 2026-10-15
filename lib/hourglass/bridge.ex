@@ -144,6 +144,10 @@ defmodule Hourglass.Bridge do
           :ok | {:error, Hourglass.Bridge.Error.t()}
   def client_cancel_workflow(_client, _request_bin), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec client_terminate_workflow(reference(), binary()) ::
+          :ok | {:error, Hourglass.Bridge.Error.t()}
+  def client_terminate_workflow(_client, _request_bin), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec replayer_new(reference(), binary()) ::
           {:ok, reference()} | {:error, Hourglass.Bridge.Error.t()}
   def replayer_new(_runtime, _config_bin), do: :erlang.nif_error(:nif_not_loaded)

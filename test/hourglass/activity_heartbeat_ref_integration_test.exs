@@ -20,6 +20,7 @@ defmodule Hourglass.ActivityHeartbeatRefIntegrationTest do
   alias Hourglass.Client.Real
   alias Hourglass.TestSupport.GatedWork
   alias Hourglass.TestSupport.Patience
+  alias Hourglass.TestSupport.Runs
   alias Hourglass.TestSupport.RaceGate
   alias Hourglass.TestSupport.WorkerProbes
   alias Hourglass.WorkflowHandle
@@ -33,7 +34,9 @@ defmodule Hourglass.ActivityHeartbeatRefIntegrationTest do
   setup do
     queue = "hb-ref-#{System.unique_integer([:positive])}"
     {:ok, _worker} = Patience.start_worker(task_queue: queue)
-    %{queue: queue, id: "hb-ref-#{UUIDv7.generate()}"}
+    id = "hb-ref-#{UUIDv7.generate()}"
+    :ok = Runs.end_on_exit(id)
+    %{queue: queue, id: id}
   end
 
   test "another process heartbeats for the activity, and is told once the activity has ended",

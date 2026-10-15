@@ -35,6 +35,7 @@ defmodule Hourglass.ChildWorkflowIntegrationTest do
   alias Hourglass.Replay.Mismatch
   alias Hourglass.Replayer
   alias Hourglass.TestSupport.Patience
+  alias Hourglass.TestSupport.Runs
   alias Hourglass.WorkflowHandle
 
   @moduletag :temporal
@@ -81,6 +82,7 @@ defmodule Hourglass.ChildWorkflowIntegrationTest do
     {:ok, _worker} = Patience.start_worker(task_queue: queue)
 
     child_id = "abandoned-child-#{UUIDv7.generate()}"
+    :ok = Runs.end_on_exit(child_id)
 
     {:ok, %WorkflowHandle{} = handle} =
       Hourglass.start(

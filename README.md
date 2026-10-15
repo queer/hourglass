@@ -462,8 +462,11 @@ runs. A connection lost is made again by the next call. See `Hourglass.Client.co
 # Send a signal to a running workflow
 :ok = Hourglass.signal(handle, "proceed", %{"value" => 42})
 
-# Request cancellation of a running workflow
+# Request cancellation of a running workflow (its body decides what to do about it)
 :ok = Hourglass.cancel(handle, "operator requested")
+
+# Terminate a workflow: it closes at once, its body does not run again
+:ok = Hourglass.terminate(handle, "operator ended it")
 
 # Snapshot the current state — cheap, one RPC call
 {:ok, status} = Hourglass.status(handle)

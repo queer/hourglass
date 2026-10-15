@@ -28,6 +28,7 @@ defmodule Hourglass.RecycleInFlightIntegrationTest do
   alias Hourglass.Client.Real
   alias Hourglass.TestSupport.GatedWork
   alias Hourglass.TestSupport.Patience
+  alias Hourglass.TestSupport.Runs
   alias Hourglass.TestSupport.RaceGate
   alias Hourglass.TestSupport.WorkerProbes
   alias Hourglass.WorkflowHandle
@@ -41,7 +42,9 @@ defmodule Hourglass.RecycleInFlightIntegrationTest do
   setup do
     queue = "recycle-#{System.unique_integer([:positive])}"
     {:ok, _worker} = Patience.start_worker(task_queue: queue)
-    %{queue: queue, id: "recycle-#{UUIDv7.generate()}"}
+    id = "recycle-#{UUIDv7.generate()}"
+    :ok = Runs.end_on_exit(id)
+    %{queue: queue, id: id}
   end
 
   test "an activity running when its handle is recycled reports its outcome to Temporal",

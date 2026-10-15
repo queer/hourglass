@@ -35,8 +35,8 @@ defmodule Hourglass.Client.Backend do
     * **`await_workflow`** — `Hourglass.result/2` is a polling loop
       on `Hourglass.status/2`; it doesn't need a separate cluster hook. Mock-
       backed `describe_workflow_execution` covers it.
-    * **`query_workflow`, `terminate_workflow`** —
-      not used by Hourglass today. Add when needed.
+    * **`query_workflow`** — not used by Hourglass today. Add when
+      needed.
   """
 
   alias Hourglass.Error
@@ -96,6 +96,13 @@ defmodule Hourglass.Client.Backend do
   Requests cancellation of the identified workflow execution.
   """
   @callback cancel_workflow(handle :: WorkflowHandle.t(), reason :: String.t()) ::
+              :ok | {:error, Error.t()}
+
+  @doc """
+  Terminates the identified workflow execution: it closes at once, without
+  its body running again.
+  """
+  @callback terminate_workflow(handle :: WorkflowHandle.t(), reason :: String.t()) ::
               :ok | {:error, Error.t()}
 
   @doc """

@@ -49,6 +49,12 @@ defmodule Hourglass.TestSupport.PatientBackend do
     send_again(request, &Bridge.client_cancel_workflow/2)
   end
 
+  @impl Hourglass.Client.Backend
+  def terminate_workflow(%WorkflowHandle{} = handle, reason) do
+    request = Real.build_terminate_request(Client.default_namespace(), handle, reason)
+    send_again(request, &Bridge.client_terminate_workflow/2)
+  end
+
   # The same request bytes on every try, over a fresh connection each time.
   defp send_again(request, call) do
     bytes = Protobuf.encode(request)

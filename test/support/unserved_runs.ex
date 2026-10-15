@@ -1,14 +1,16 @@
 defmodule Hourglass.TestSupport.UnservedRuns do
   @moduledoc """
   Workflow runs Temporal knows and that go on running, for a test that needs
-  one: started on a queue no worker serves. Each times out ten minutes after
-  it starts, longer than any test waits, so none is left running on the
-  Temporal the suite shares; Temporal drops it a day after.
+  one: started on a queue no worker serves. Each is terminated when its test
+  ends (`Hourglass.TestSupport.Runs`), and times out ten minutes after it
+  starts should that fail, so none is left running on the Temporal the
+  suite shares.
   """
 
   alias Hourglass.Bridge
   alias Hourglass.Client
   alias Hourglass.TestSupport.Patience
+  alias Hourglass.TestSupport.Runs
   alias Temporal.Api.Common.V1.WorkflowType
   alias Temporal.Api.Taskqueue.V1.TaskQueue
   alias Temporal.Api.Workflowservice.V1.StartWorkflowExecutionRequest
@@ -33,6 +35,8 @@ defmodule Hourglass.TestSupport.UnservedRuns do
 
     {:ok, bytes} =
       Patience.retry(fn -> Bridge.client_start_workflow(client, Protobuf.encode(request)) end)
+
+    :ok = Runs.end_on_exit(workflow_id)
 
     {workflow_id, StartWorkflowExecutionResponse.decode(bytes).run_id}
   end

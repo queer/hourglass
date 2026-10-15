@@ -29,6 +29,7 @@ defmodule Hourglass.Client.Real do
   alias Temporal.Api.Workflowservice.V1.SignalWorkflowExecutionRequest
   alias Temporal.Api.Workflowservice.V1.StartWorkflowExecutionRequest
   alias Temporal.Api.Workflowservice.V1.StartWorkflowExecutionResponse
+  alias Temporal.Api.Workflowservice.V1.TerminateWorkflowExecutionRequest
 
   @impl Hourglass.Client.Backend
   def start_workflow(workflow_module, args, opts) do
@@ -107,6 +108,28 @@ defmodule Hourglass.Client.Real do
 
       classify_unit(Bridge.client_cancel_workflow(client, Protobuf.encode(req)))
     end
+  end
+
+  @impl Hourglass.Client.Backend
+  def terminate_workflow(%WorkflowHandle{} = handle, reason) do
+    namespace = Client.default_namespace()
+
+    with {:ok, client} <- connect([]) do
+      req = build_terminate_request(namespace, handle, reason)
+
+      classify_unit(Bridge.client_terminate_workflow(client, Protobuf.encode(req)))
+    end
+  end
+
+  @doc false
+  @spec build_terminate_request(String.t(), WorkflowHandle.t(), String.t()) ::
+          TerminateWorkflowExecutionRequest.t()
+  def build_terminate_request(namespace, %WorkflowHandle{id: id, run_id: run_id}, reason) do
+    %TerminateWorkflowExecutionRequest{
+      namespace: namespace,
+      workflow_execution: %WorkflowExecution{workflow_id: id, run_id: run_id || ""},
+      reason: reason
+    }
   end
 
   @doc false

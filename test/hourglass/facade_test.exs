@@ -110,6 +110,16 @@ defmodule Hourglass.FacadeTest do
     assert :ok = Hourglass.cancel(handle, "stop")
   end
 
+  test "terminate/2 with a bare id normalises it to a handle of its latest run" do
+    Mox.expect(TemporalMock, :terminate_workflow, fn h, reason ->
+      assert h == %WorkflowHandle{id: "w1", run_id: ""}
+      assert reason == "enough"
+      :ok
+    end)
+
+    assert :ok = Hourglass.terminate("w1", "enough")
+  end
+
   # ---------------------------------------------------------------------------
   # status/1 — bare id normalised to WorkflowHandle
   # ---------------------------------------------------------------------------

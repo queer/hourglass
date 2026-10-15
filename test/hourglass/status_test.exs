@@ -21,6 +21,7 @@ defmodule Hourglass.StatusTest do
   alias Hourglass.Error
   alias Hourglass.TestSupport.EchoWorkflow
   alias Hourglass.TestSupport.Patience
+  alias Hourglass.TestSupport.Runs
   alias Hourglass.WorkflowHandle
   alias Hourglass.WorkflowStatus
   alias Temporal.Api.Failure.V1.Failure
@@ -122,6 +123,7 @@ defmodule Hourglass.StatusTest do
     # :running state.
     queue = "status-running-#{System.unique_integer([:positive])}"
     workflow_id = "status-running-#{UUIDv7.generate()}"
+    :ok = Runs.end_on_exit(workflow_id)
 
     {:ok, %WorkflowHandle{} = handle} =
       Hourglass.start(EchoWorkflow, %{nonce: "n"},
@@ -208,6 +210,7 @@ defmodule Hourglass.StatusTest do
     # "doesn't walk history when not asked" contract.
     queue = "status-exclude-#{System.unique_integer([:positive])}"
     workflow_id = "status-exclude-#{UUIDv7.generate()}"
+    :ok = Runs.end_on_exit(workflow_id)
 
     {:ok, %WorkflowHandle{} = handle} =
       Hourglass.start(EchoWorkflow, %{nonce: "n"},
@@ -329,6 +332,7 @@ defmodule Hourglass.StatusTest do
     {:ok, client} = Patience.retry(fn -> Client.connect() end)
 
     workflow_id = "bridge-describe-#{UUIDv7.generate()}"
+    :ok = Runs.end_on_exit(workflow_id)
 
     {:ok, _handle} =
       Hourglass.start(EchoWorkflow, %{nonce: "n"},

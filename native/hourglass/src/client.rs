@@ -16,7 +16,8 @@ use temporalio_common::protos::temporal::api::{
         DescribeNamespaceRequest, DescribeWorkflowExecutionRequest,
         GetWorkflowExecutionHistoryRequest, ListNamespacesRequest, ListWorkflowExecutionsRequest,
         RegisterNamespaceRequest, RequestCancelWorkflowExecutionRequest,
-        SignalWorkflowExecutionRequest, StartWorkflowExecutionRequest, UpdateNamespaceRequest,
+        SignalWorkflowExecutionRequest, StartWorkflowExecutionRequest,
+        TerminateWorkflowExecutionRequest, UpdateNamespaceRequest,
     },
 };
 use tokio::sync::OnceCell;
@@ -454,6 +455,29 @@ pub fn client_cancel_workflow(
         let mut wf_svc = client.client.connection().workflow_service();
         wf_svc
             .request_cancel_workflow_execution(Request::new(req))
+            .await
+            .map_err(|e| BridgeError::TonicError(e.to_string()))
+    }) {
+        Ok(_) => OkOrError::Ok,
+        Err(e) => OkOrError::Err(e.to_elixir(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+pub fn client_terminate_workflow(
+    env: rustler::Env,
+    client: ResourceArc<ClientResource>,
+    request_bin: Binary,
+) -> OkOrError {
+    let req = match TerminateWorkflowExecutionRequest::decode(request_bin.as_slice()) {
+        Ok(r) => r,
+        Err(e) => return OkOrError::Err(BridgeError::InvalidProto(e.to_string()).to_elixir(env)),
+    };
+
+    match client.runtime.tokio_handle.block_on(async {
+        let mut wf_svc = client.client.connection().workflow_service();
+        wf_svc
+            .terminate_workflow_execution(Request::new(req))
             .await
             .map_err(|e| BridgeError::TonicError(e.to_string()))
     }) {

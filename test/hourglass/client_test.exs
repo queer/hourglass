@@ -12,6 +12,7 @@ defmodule Hourglass.ClientTest do
   alias Hourglass.TestSupport.FreezableProxy
   alias Hourglass.TestSupport.Namespaces
   alias Hourglass.TestSupport.Patience
+  alias Hourglass.TestSupport.Runs
   alias Hourglass.WorkflowHandle
 
   @moduletag :temporal
@@ -117,6 +118,7 @@ defmodule Hourglass.ClientTest do
   test "Client.start_workflow returns a %WorkflowHandle{}" do
     {:ok, client} = Patience.retry(fn -> Client.connect() end)
     workflow_id = "facade-test-#{UUIDv7.generate()}"
+    :ok = Runs.end_on_exit(workflow_id)
 
     # Temporal accepts the start regardless of whether a worker is registered
     # for the workflow_type — the workflow won't run, but the start call
@@ -138,6 +140,7 @@ defmodule Hourglass.ClientTest do
   test "Client.start_workflow on duplicate workflow_id returns :already_started" do
     {:ok, client} = Patience.retry(fn -> Client.connect() end)
     workflow_id = "dupe-test-#{UUIDv7.generate()}"
+    :ok = Runs.end_on_exit(workflow_id)
 
     start = fn ->
       Client.start_workflow(client, FacadeTest.NoSuchWorkflow, %{},
