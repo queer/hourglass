@@ -4,11 +4,9 @@ defmodule Hourglass.Client.Real do
   Production `Hourglass.Client.Backend` implementation. Wraps the
   Bridge NIFs to round-trip real Temporal Server.
 
-  Each callback opens its own bridge client lazily — matches the
-  pre-existing per-call connect pattern (`Hourglass.Client.connect/1`
-  did `Client.connect()` then `Client.start_workflow(client, ...)` on
-  every call). The cost is negligible compared to the gRPC round-trip
-  the call itself does.
+  Each callback gets its client from `Hourglass.Client.connect/1`'s
+  bridge call, which hands out the one client hourglass keeps per target
+  and namespace: no callback opens a connection of its own.
   """
 
   @behaviour Hourglass.Client.Backend

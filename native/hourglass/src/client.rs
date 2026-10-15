@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use prost::Message;
 use prost_wkt_types::Duration as ProtoDuration;
@@ -16,6 +17,7 @@ use temporalio_common::protos::temporal::api::{
         StartWorkflowExecutionRequest,
     },
 };
+use tokio::sync::OnceCell;
 use url::Url;
 
 use crate::error::{BridgeError, ElixirBridgeError, OkOrError};
@@ -47,6 +49,43 @@ pub struct HourglassClientConfig {
     pub namespace: String,
 }
 
+// A runtime's clients, one per configuration: target URL and namespace. Each
+// is connected once (one connection, one GetSystemInfo) by the first call that
+// needs it, which concurrent calls wait for, and shared by every call after.
+// A failed connect leaves nothing behind, so the next call connects anew. A
+// connection lost later is made again by the client's channel on the next
+// call, which alone may fail for it.
+#[derive(Default)]
+pub struct Clients(Mutex<HashMap<ClientConfig, Arc<OnceCell<Arc<Client>>>>>);
+
+// A client's configuration: its target URL and namespace.
+type ClientConfig = (String, String);
+
+pub async fn shared_client(
+    runtime: &CoreRuntimeResource,
+    target: Url,
+    namespace: String,
+) -> Result<Arc<Client>, BridgeError> {
+    let cell = {
+        let mut clients = runtime.clients.0.lock().unwrap_or_else(|e| e.into_inner());
+        clients
+            .entry((target.to_string(), namespace.clone()))
+            .or_default()
+            .clone()
+    };
+
+    cell.get_or_try_init(|| async {
+        let connection = Connection::connect(ConnectionOptions::new(target).build())
+            .await
+            .map_err(BridgeError::from_connect)?;
+        let client = Client::new(connection, ClientOptions::new(namespace).build())
+            .map_err(|e| BridgeError::Unknown(e.to_string()))?;
+        Ok(Arc::new(client))
+    })
+    .await
+    .cloned()
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
 pub fn client_new(
     env: rustler::Env,
@@ -61,20 +100,10 @@ pub fn client_new(
 
     let client = runtime
         .tokio_handle
-        .block_on(async {
-            let conn_opts = ConnectionOptions::new(target).build();
-            let connection = Connection::connect(conn_opts)
-                .await
-                .map_err(BridgeError::from_connect)?;
-            let client_opts = ClientOptions::new(cfg.namespace.clone()).build();
-            Client::new(connection, client_opts).map_err(|e| BridgeError::Unknown(e.to_string()))
-        })
+        .block_on(shared_client(&runtime, target, cfg.namespace))
         .map_err(|e| e.to_elixir(env))?;
 
-    Ok(ResourceArc::new(ClientResource {
-        client: Arc::new(client),
-        runtime,
-    }))
+    Ok(ResourceArc::new(ClientResource { client, runtime }))
 }
 
 #[rustler::nif(schedule = "DirtyIo")]

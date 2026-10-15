@@ -18,9 +18,9 @@ defmodule Hourglass.Client.Backend do
   ## Callback shape
 
   No client ref leaks through the contract — each backend manages its
-  own connection internally. Production opens the bridge client on
-  demand inside each callback (matching the per-call connect pattern
-  the codebase already uses); the mock has nothing to connect to.
+  own connection internally. Production gets the client hourglass keeps
+  for its target and namespace inside each callback; the mock has
+  nothing to connect to.
 
   Callbacks return Hourglass-typed values + decoded proto messages, never
   raw bytes — the Bridge's bytes-in/bytes-out contract is a NIF

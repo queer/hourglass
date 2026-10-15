@@ -451,6 +451,10 @@ ERL_FLAGS="+SDio 128" mix test.integration
 
 ## Starting and observing workflows
 
+hourglass keeps one connection to Temporal per target and namespace, made by the first call that
+needs it and used by every call after: the calls below, and each worker's checks on its activities'
+runs. A connection lost is made again by the next call. See `Hourglass.Client.connect/1`.
+
 ```elixir
 # Start a workflow — returns {:ok, %Hourglass.WorkflowHandle{}} or {:error, ...}
 {:ok, handle} = Hourglass.start(MyApp.Workflows.Hello, %{"name" => "Alice"}, id: "my-run-1")

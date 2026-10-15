@@ -14,6 +14,20 @@ defmodule Hourglass.Client do
 
   @type t :: reference()
 
+  @doc """
+  A client of the namespace `opts[:namespace]` at `opts[:target_url]`
+  (by default `default_namespace/0` and `default_target_url/0`).
+
+  hourglass keeps one connection per target and namespace, made by the
+  first call that needs it (Core asks Temporal's GetSystemInfo then, once)
+  and used by every call after, the facade's (`Hourglass.start/3` and the
+  rest) and each worker's closed-workflow watch included. A connection
+  that fails to be made is made again by the next call; one lost later is
+  made again by the next call that uses it, which alone may fail for it.
+  A worker's own connection to Temporal (`Hourglass.Worker`) is its own:
+  Core refuses two workers of one namespace and task queue on one
+  connection, which replacing a worker's handle needs.
+  """
   @spec connect(keyword()) :: {:ok, t()} | {:error, Error.t()}
   def connect(opts \\ []) do
     runtime = Runtime.handle()

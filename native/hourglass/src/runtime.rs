@@ -4,12 +4,15 @@ use rustler::ResourceArc;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, TokioRuntimeBuilder};
 use tokio::runtime::Handle;
 
+use crate::client::Clients;
 use crate::error::BridgeError;
 
 #[allow(dead_code)]
 pub struct CoreRuntimeResource {
     pub runtime: Arc<CoreRuntime>,
     pub tokio_handle: Handle,
+    // The clients of this runtime, one per configuration (crate::client::shared_client).
+    pub clients: Clients,
 }
 
 // CoreRuntime contains TelemetryInstance which holds interior mutability
@@ -43,5 +46,6 @@ pub fn runtime_new(
     Ok(ResourceArc::new(CoreRuntimeResource {
         runtime: Arc::new(runtime),
         tokio_handle,
+        clients: Clients::default(),
     }))
 }

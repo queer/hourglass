@@ -12,7 +12,6 @@ use std::time::Duration;
 use prost::Message;
 use rustler::{Atom, Binary, Encoder, Env, OwnedEnv, ResourceArc, Term};
 use temporalio_client::tonic::Request;
-use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
 use temporalio_common::protos::temporal::api::{
     common::v1::WorkflowExecution, workflowservice::v1::DescribeWorkflowExecutionRequest,
 };
@@ -20,7 +19,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use url::Url;
 
-use crate::client::{ClientResource, HourglassClientConfig};
+use crate::client::{shared_client, ClientResource, HourglassClientConfig};
 use crate::error::{BridgeError, ElixirBridgeError, OkOrError};
 use crate::runtime::CoreRuntimeResource;
 
@@ -35,7 +34,8 @@ mod atoms {
 // How many describes one check has in flight at once.
 const CONCURRENCY: usize = 16;
 
-// Open a client of the config's namespace at its target. Sends the caller
+// Open a client of the config's namespace at its target (the runtime's shared
+// one, crate::client::shared_client). Sends the caller
 // `{:hourglass_client_opened, tag, {:ok, client} | {:error, %Bridge.Error{}}}`,
 // within `timeout_ms`.
 #[rustler::nif]
@@ -58,13 +58,7 @@ pub fn closed_runs_open_client(
     let owner = runtime.clone();
 
     runtime.tokio_handle.spawn(async move {
-        let connecting = async {
-            let connection = Connection::connect(ConnectionOptions::new(target).build())
-                .await
-                .map_err(|e| BridgeError::TonicError(e.to_string()))?;
-            Client::new(connection, ClientOptions::new(cfg.namespace).build())
-                .map_err(|e| BridgeError::Unknown(e.to_string()))
-        };
+        let connecting = shared_client(&owner, target, cfg.namespace);
 
         let opened = match tokio::time::timeout(Duration::from_millis(timeout_ms), connecting).await
         {
@@ -75,7 +69,7 @@ pub fn closed_runs_open_client(
         let _ = OwnedEnv::new().send_and_clear(&caller, |env| {
             let opened = match opened {
                 Ok(client) => Ok(ResourceArc::new(ClientResource {
-                    client: Arc::new(client),
+                    client,
                     runtime: owner,
                 })),
                 Err(e) => Err(e.to_elixir(env)),
