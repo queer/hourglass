@@ -41,17 +41,30 @@ defmodule Hourglass.Worker.ClosedWorkflowWatchTest do
   end
 
   @tag :temporal
-  test "an activity of a run Temporal does not know is ended" do
+  test "an activity of a run Temporal does not know is ended within the bound" do
+    assert_closed_run_ended_within(@bound)
+  end
+
+  @tag :temporal
+  test "at the smallest bound it accepts, the watch ends an activity of a closed run within it" do
+    assert_closed_run_ended_within(ClosedWorkflowWatch.min_bound())
+  end
+
+  # A watch keeping `bound` ends an activity of a closed run within it. The
+  # watch opens its client as it starts, before anything runs; once it has,
+  # the run closes (as far as the watch can tell) the moment the activity
+  # registers, its run unknown to Temporal.
+  defp assert_closed_run_ended_within(bound) do
     queue = queue()
+    watch = start_watch_with_client!(queue, bound)
+    closed = System.monotonic_time(:millisecond)
     {activity, _token} = fake_activity!(queue, unknown_run())
     monitor = Process.monitor(activity)
-    started = System.monotonic_time(:millisecond)
-    watch = start_watch!(queue, Client.default_namespace(), Client.default_target_url())
 
     assert_receive {:DOWN, ^monitor, :process, ^activity, :killed}, Patience.ms()
 
-    if owed?(watch, @bound) do
-      assert System.monotonic_time(:millisecond) - started < 2 * @bound
+    if owed?(watch, bound) do
+      assert System.monotonic_time(:millisecond) - closed < bound
     end
   end
 
@@ -59,11 +72,10 @@ defmodule Hourglass.Worker.ClosedWorkflowWatchTest do
   test "the activities of many closed runs are all ended within the bound" do
     queue = queue()
     bound = 2_000
+    watch = start_watch_with_client!(queue, bound)
     activities = for _n <- 1..300, do: elem(fake_activity!(queue, unknown_run()), 0)
     monitors = MapSet.new(activities, &Process.monitor/1)
-
     started = System.monotonic_time(:millisecond)
-    watch = start_watch!(queue, Client.default_namespace(), Client.default_target_url(), bound)
 
     for _activity <- activities do
       assert_receive {:DOWN, monitor, :process, _pid, :killed}, Patience.ms()
@@ -277,6 +289,21 @@ defmodule Hourglass.Worker.ClosedWorkflowWatchTest do
       })
 
     :ok = WatchTrace.start(watch)
+    watch
+  end
+
+  # A watch keeping `bound`, of the test's Temporal, once it has opened its
+  # client; what it asked and was answered until then is not judged, and the
+  # BEAM's lateness is measured from then.
+  defp start_watch_with_client!(queue, bound) do
+    watch = start_watch!(queue, Client.default_namespace(), Client.default_target_url(), bound)
+
+    WorkerProbes.poll_until("the watch to open its client", fn ->
+      :sys.get_state(watch).client != nil
+    end)
+
+    :ok = WatchTrace.reset(watch)
+    Process.put(:scheduler_lag, SchedulerLag.start())
     watch
   end
 

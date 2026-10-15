@@ -154,7 +154,7 @@ defmodule Hourglass.Worker.ClosedWorkflowWatch do
     }
 
     schedule_check(state)
-    {:ok, state}
+    {:ok, check(state)}
   end
 
   @impl GenServer
@@ -215,6 +215,12 @@ defmodule Hourglass.Worker.ClosedWorkflowWatch do
   defp give_up_overdue_open(state), do: state
 
   # Start a check, unless one is waiting for its answer or nothing is running.
+  # With no client, open one first, whether or not anything is running: the
+  # watch keeps its client open from its start, so a check is never held up by
+  # opening one (that would be a second answer to wait for before the bound's
+  # first quarter is up), and the check is made once it is open.
+  defp check(%{client: nil} = state), do: open(state, :check)
+
   defp check(%{check: nil} = state) do
     case runs(state) do
       [] -> state
@@ -223,9 +229,6 @@ defmodule Hourglass.Worker.ClosedWorkflowWatch do
   end
 
   defp check(state), do: state
-
-  # With no client yet, open one first; the check is made once it is open.
-  defp ask(_runs, %{client: nil} = state), do: open(state, :check)
 
   defp ask(runs, state) do
     case ClosedRuns.describe(state.client, runs, state.answer_time) do
@@ -251,6 +254,12 @@ defmodule Hourglass.Worker.ClosedWorkflowWatch do
       :error ->
         opened(%{state | awaiting_client: [waiter | state.awaiting_client]}, :error)
     end
+  end
+
+  defp open(state, :check) do
+    if :check in state.awaiting_client,
+      do: state,
+      else: %{state | awaiting_client: [:check | state.awaiting_client]}
   end
 
   defp open(state, waiter), do: %{state | awaiting_client: [waiter | state.awaiting_client]}

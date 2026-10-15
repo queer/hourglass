@@ -355,6 +355,15 @@ The worker ends such an activity within its **closed-workflow bound**, which def
 3. One still running half the bound after it was cancelled is killed, and reported to Temporal as
    cancelled.
 
+**What the bound promises, and when.** When Temporal answers each of the worker's checks within a
+quarter of the bound — for every run the check asks about — an activity of a run that has closed is
+gone within the bound of the run closing: the first check after the close starts within a quarter
+of the bound, its answer comes within the next quarter, and the activity then has half the bound.
+That holds for every bound the worker accepts. The worker opens its client to Temporal as it starts
+and keeps it, so no check first waits for one to open. A Temporal slower than that still has its
+answers used — the worker waits up to a quarter of the bound, and at least a second, for each
+check — but the activity may then end later than the bound, by as long as the answers were late.
+
 An activity whose run has already closed when its task reaches the worker never runs at all: its
 `execute/1` is not called, and it is reported to Temporal as cancelled
 (`[:hourglass, :activity, :not_started]`). Temporal hands out no task of a closed run, but Temporal

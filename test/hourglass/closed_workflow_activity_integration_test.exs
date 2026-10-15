@@ -72,6 +72,14 @@ defmodule Hourglass.ClosedWorkflowActivityIntegrationTest do
 
     watch = :sys.get_state(worker).watch_pid
     :ok = WatchTrace.start(watch)
+
+    # The watch opens its client as it starts; how long that took is not the
+    # bound's to judge.
+    WorkerProbes.poll_until("the watch to open its client", fn ->
+      :sys.get_state(watch).client != nil
+    end)
+
+    :ok = WatchTrace.reset(watch)
     attach_closed_workflow_events(queue)
 
     %{

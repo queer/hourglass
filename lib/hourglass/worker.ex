@@ -79,10 +79,16 @@ defmodule Hourglass.Worker do
   So an activity of a closed run is gone within three quarters of the
   bound, plus the time Temporal takes to answer, and one that heeds the
   cancel sees it within a quarter of the bound, plus that time and its
-  own heartbeat interval. Only a closed run ends the activities that do
-  not opt in: for them, a cancel requested of a run that goes on
-  running, because its body does not end on `cancelled?/0`, ends
-  nothing.
+  own heartbeat interval. That is the bound's promise: whenever
+  Temporal answers each check within a quarter of the bound (for every
+  run it asks about), an activity of a closed run is gone within the
+  bound of the close, for every bound the Worker accepts. The Worker
+  opens its client to Temporal as it starts, and keeps it, so a check
+  never first waits for one to open.
+
+  Only a closed run ends the activities that do not opt in: for them, a
+  cancel requested of a run that goes on running, because its body does
+  not end on `cancelled?/0`, ends nothing.
 
   Nor does a Temporal that cannot be asked. Temporal is given a quarter
   of the bound (at least a second) to answer for each run; a run it has
