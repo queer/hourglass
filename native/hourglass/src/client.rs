@@ -65,7 +65,7 @@ pub fn client_new(
             let conn_opts = ConnectionOptions::new(target).build();
             let connection = Connection::connect(conn_opts)
                 .await
-                .map_err(|e| BridgeError::TonicError(e.to_string()))?;
+                .map_err(BridgeError::from_connect)?;
             let client_opts = ClientOptions::new(cfg.namespace.clone()).build();
             Client::new(connection, client_opts).map_err(|e| BridgeError::Unknown(e.to_string()))
         })

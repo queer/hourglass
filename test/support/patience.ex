@@ -146,13 +146,33 @@ defmodule Hourglass.TestSupport.Patience do
   end
 
   @doc """
-  `start_supervised/1` of an `Hourglass.Worker` with `opts`, registered
-  again while Temporal times out its GetSystemInfo. Call it from the test
-  process.
+  `start_supervised/1` of an `Hourglass.Worker` with `opts`, returned once
+  it serves: a Worker that could not reach Temporal starts, and keeps
+  trying to register (`Hourglass.Worker`, "Starting"), for as long as the
+  suite waits on Temporal. Call it from the test process.
   """
   @spec start_worker(keyword()) :: Supervisor.on_start_child()
   def start_worker(opts) do
-    retry(fn -> ExUnit.Callbacks.start_supervised({Hourglass.Worker, opts}) end)
+    with {:ok, pid} <- ExUnit.Callbacks.start_supervised({Hourglass.Worker, opts}) do
+      serving!(Keyword.fetch!(opts, :task_queue))
+      {:ok, pid}
+    end
+  end
+
+  defp serving!(task_queue, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + ms()
+
+    cond do
+      Hourglass.Worker.inner_supervisor(task_queue) != nil ->
+        :ok
+
+      System.monotonic_time(:millisecond) > deadline ->
+        raise "the Hourglass.Worker for #{task_queue} never registered with Temporal"
+
+      true ->
+        Process.sleep(50)
+        serving!(task_queue, deadline)
+    end
   end
 
   @doc "Like `start_worker/1`, returning the pid or raising."

@@ -110,14 +110,34 @@ defmodule Hourglass.Worker do
   Worker. `use Supervisor` doesn't expose terminate; wrapping a
   Supervisor inside a trap-exits GenServer gives us the hook.
 
-  Sequence on graceful start:
+  ## Starting
 
     1. `init/1` calls `BridgeHolder.register_worker(task_queue, opts)`.
        The Application-level holder allocates a fresh bridge worker
-       handle and stores it keyed by task_queue.
-    2. `init/1` starts the inner Supervisor with the two poll loops.
-       The poll loops call `BridgeHolder.poll_*` against the now-live
-       handle.
+       handle and stores it keyed by task_queue. Core connects to
+       Temporal and describes the Worker's namespace.
+    2. `init/1` starts the closed-workflow watch, then the inner
+       Supervisor with the two poll loops. The poll loops call
+       `BridgeHolder.poll_*` against the now-live handle.
+
+  A Worker that cannot reach Temporal as it starts — Temporal down, or
+  silent (Core gives up on its first call after 30 seconds) — still
+  starts, so the host's start does not fail with it. It serves nothing
+  yet: `inner_supervisor/1` is `nil`. It tries to register again after a
+  second, then twice as long after each failed attempt, up to thirty
+  seconds, for as long as it takes, and serves once an attempt succeeds.
+  Each failed attempt emits `[:hourglass, :worker, :registration_failed]`
+  (measurements `attempt` and `retry_in`, in milliseconds; metadata
+  `failure_class: :unreachable`, `task_queue`, `detail`) and logs a
+  warning. So does a namespace Temporal does not know yet while
+  `Hourglass.NamespaceEnsurer` is still making it exist (`failure_class:
+  :namespace_not_found`).
+
+  Any other failure to register fails the start (`{:error, reason}`
+  from `start_link/1`), or, on a later attempt, stops the Worker: a
+  namespace Temporal does not know (`%Hourglass.Bridge.Error{kind:
+  :namespace_not_found}`), or a call Temporal refuses. A configuration
+  Temporal will never accept is not retried.
 
   ## Graceful stop
 
@@ -254,12 +274,21 @@ defmodule Hourglass.Worker do
 
   use GenServer
 
+  alias Hourglass.Bridge
   alias Hourglass.BridgeHolder
+  alias Hourglass.NamespaceEnsurer
   alias Hourglass.Worker.ActivityPollLoop
   alias Hourglass.Worker.ClosedWorkflowWatch
   alias Hourglass.Worker.GracefulStop
   alias Hourglass.Worker.WorkflowPollLoop
   alias Hourglass.WorkerRegistry
+
+  require Logger
+
+  # A registration that could not reach Temporal is tried again this long
+  # after, doubling with each failed attempt up to `@max_retry`.
+  @first_retry 1_000
+  @max_retry 30_000
 
   @type opts :: [
           task_queue: String.t(),
@@ -358,34 +387,27 @@ defmodule Hourglass.Worker do
   def init(opts) do
     Process.flag(:trap_exit, true)
 
-    task_queue = Keyword.fetch!(opts, :task_queue)
     grace = graceful_shutdown_period(opts)
-    bound = closed_workflow_bound(opts)
 
-    register_opts =
-      opts
-      |> Keyword.take(@register_opts_keys)
-      |> Keyword.put(:graceful_shutdown_period, grace)
+    state = %{
+      task_queue: Keyword.fetch!(opts, :task_queue),
+      opts: opts,
+      bound: closed_workflow_bound(opts),
+      graceful_shutdown_period: grace,
+      register_opts:
+        opts
+        |> Keyword.take(@register_opts_keys)
+        |> Keyword.put(:graceful_shutdown_period, grace),
+      # Both nil until the Worker has registered (see "Starting").
+      sup_pid: nil,
+      watch_pid: nil,
+      # Registration attempts that could not reach Temporal so far.
+      failed_attempts: 0
+    }
 
-    # The watch starts before the poll loops: an activity asks it about its
-    # run before it starts.
-    with :ok <- BridgeHolder.register_worker(task_queue, register_opts),
-         {:ok, watch_pid} <- ClosedWorkflowWatch.start_link(task_queue, bound, opts),
-         {:ok, sup_pid} <- start_inner_supervisor(task_queue) do
-      {:ok,
-       %{
-         task_queue: task_queue,
-         sup_pid: sup_pid,
-         watch_pid: watch_pid,
-         graceful_shutdown_period: grace
-       }}
-    else
-      {:error, reason} ->
-        # Roll back the bridge allocation if the inner Supervisor or the
-        # closed-workflow watch failed to start (either, started, is linked
-        # to us and goes with us). Idempotent if registration itself failed.
-        _result = BridgeHolder.unregister_worker(task_queue)
-        {:stop, reason}
+    case register(state) do
+      {:error, reason} -> {:stop, reason}
+      state -> {:ok, state}
     end
   end
 
@@ -394,17 +416,26 @@ defmodule Hourglass.Worker do
     {:reply, sup_pid, state}
   end
 
+  # Another registration attempt, after one that could not reach Temporal.
+  @impl GenServer
+  def handle_info(:register, state) do
+    case register(state) do
+      {:error, reason} -> {:stop, reason, state}
+      state -> {:noreply, state}
+    end
+  end
+
   # The inner Supervisor links to us. If it crashes we propagate
   # (let-it-crash); the parent DynamicSupervisor (Worker.Supervisor)
   # restarts this GenServer, which re-registers a fresh bridge handle
   # and starts a fresh inner Supervisor.
-  @impl GenServer
-  def handle_info({:EXIT, sup_pid, reason}, %{sup_pid: sup_pid} = state) do
+  def handle_info({:EXIT, sup_pid, reason}, %{sup_pid: sup_pid} = state) when sup_pid != nil do
     {:stop, reason, state}
   end
 
   # Likewise the closed-workflow watch, which links to us too.
-  def handle_info({:EXIT, watch_pid, reason}, %{watch_pid: watch_pid} = state) do
+  def handle_info({:EXIT, watch_pid, reason}, %{watch_pid: watch_pid} = state)
+      when watch_pid != nil do
     {:stop, reason, state}
   end
 
@@ -414,6 +445,8 @@ defmodule Hourglass.Worker do
   # closed-workflow watch goes on ending the activities of closed runs while
   # the stop drains, and is stopped once the stop is done.
   @impl GenServer
+  def terminate(_reason, %{sup_pid: nil}), do: :ok
+
   def terminate(_reason, %{task_queue: task_queue, sup_pid: sup_pid} = state) do
     GracefulStop.run(task_queue, sup_pid, state.graceful_shutdown_period)
     stop_closed_workflow_watch(state.watch_pid)
@@ -422,6 +455,79 @@ defmodule Hourglass.Worker do
   # ---------------------------------------------------------------------------
   # Internals
   # ---------------------------------------------------------------------------
+
+  # Register with Temporal and start serving. Returns the state serving, or
+  # waiting to try again after an attempt that could not reach Temporal (see
+  # "Starting"), or `{:error, reason}` for any other failure.
+  defp register(state) do
+    %{task_queue: task_queue} = state
+
+    case BridgeHolder.register_worker(task_queue, state.register_opts) do
+      :ok ->
+        serve(state)
+
+      {:error, %Bridge.Error{} = error} = failed ->
+        if unreachable?(error, state), do: try_again(state, error), else: failed
+
+      {:error, _reason} = failed ->
+        failed
+    end
+  end
+
+  # Temporal was not reached, or (while `Hourglass.NamespaceEnsurer` is still
+  # trying to make it exist) did not know the Worker's namespace yet.
+  defp unreachable?(%Bridge.Error{kind: :unreachable}, _state), do: true
+
+  defp unreachable?(%Bridge.Error{kind: :namespace_not_found}, state) do
+    state.register_opts
+    |> Keyword.get(:namespace, Hourglass.Client.default_namespace())
+    |> NamespaceEnsurer.ensuring?()
+  end
+
+  defp unreachable?(_error, _state), do: false
+
+  defp try_again(state, error) do
+    attempt = state.failed_attempts + 1
+    retry_in = min(@first_retry * 2 ** (attempt - 1), @max_retry)
+
+    :telemetry.execute(
+      [:hourglass, :worker, :registration_failed],
+      %{count: 1, attempt: attempt, retry_in: retry_in},
+      %{failure_class: error.kind, task_queue: state.task_queue, detail: error.detail}
+    )
+
+    Logger.warning(
+      "worker for task_queue=#{state.task_queue} could not register with Temporal " <>
+        "(attempt #{attempt}, #{error.kind}): #{error.detail}; trying again in #{retry_in} ms"
+    )
+
+    Process.send_after(self(), :register, retry_in)
+    %{state | failed_attempts: attempt}
+  end
+
+  # Start the closed-workflow watch and the poll loops. The watch starts
+  # first: an activity asks it about its run before it starts.
+  defp serve(state) do
+    with {:ok, watch_pid} <-
+           ClosedWorkflowWatch.start_link(state.task_queue, state.bound, state.opts),
+         {:ok, sup_pid} <- start_inner_supervisor(state.task_queue) do
+      if state.failed_attempts > 0 do
+        Logger.info(
+          "worker for task_queue=#{state.task_queue} registered with Temporal after " <>
+            "#{state.failed_attempts} failed attempts"
+        )
+      end
+
+      %{state | watch_pid: watch_pid, sup_pid: sup_pid, failed_attempts: 0}
+    else
+      {:error, _reason} = failed ->
+        # Roll back the bridge allocation if the inner Supervisor or the
+        # closed-workflow watch failed to start (either, started, is linked
+        # to us and goes with us).
+        _result = BridgeHolder.unregister_worker(state.task_queue)
+        failed
+    end
+  end
 
   defp start_inner_supervisor(task_queue) do
     children = [

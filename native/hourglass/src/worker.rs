@@ -118,14 +118,26 @@ pub fn worker_new(
     // init_worker is sync but internally spawns tokio tasks; it must run inside the runtime
     // context. We wrap both the async connect and the sync init_worker in a single block_on
     // so that tokio::spawn calls inside Worker::new can reach the runtime.
+    //
+    // The worker is validated before it is handed out, as Core asks: Core describes its
+    // namespace, so a namespace Temporal does not know, or refuses the worker, fails the
+    // registration here, rather than leaving Core to retry its polls silently forever.
     let worker = runtime
         .tokio_handle
         .block_on(async {
             let connection = Connection::connect(conn_opts)
                 .await
-                .map_err(|e| BridgeError::TonicError(e.to_string()))?;
-            init_worker(&runtime.runtime, worker_cfg, connection)
-                .map_err(|e| BridgeError::Unknown(e.to_string()))
+                .map_err(BridgeError::from_connect)?;
+            let worker = init_worker(&runtime.runtime, worker_cfg, connection)
+                .map_err(|e| BridgeError::Unknown(e.to_string()))?;
+
+            match worker.validate().await {
+                Ok(_namespace_info) => Ok(worker),
+                Err(e) => {
+                    worker.initiate_shutdown();
+                    Err(BridgeError::from_validation(e))
+                }
+            }
         })
         .map_err(|e| e.to_elixir(env))?;
 

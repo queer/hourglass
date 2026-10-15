@@ -86,7 +86,7 @@ defmodule Hourglass.BridgeHolderTest do
       proxy = start_supervised!(FreezableProxy)
       :ok = FreezableProxy.freeze(proxy)
 
-      assert {:error, %Bridge.Error{kind: :tonic_error, detail: detail}} =
+      assert {:error, %Bridge.Error{kind: :unreachable, detail: detail}} =
                BridgeHolder.register_worker(queue, target_url: FreezableProxy.url(proxy))
 
       assert detail =~ "Timeout expired"

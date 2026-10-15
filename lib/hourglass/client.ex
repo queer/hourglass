@@ -57,12 +57,13 @@ defmodule Hourglass.Client do
   end
 
   # Map a `%Bridge.Error{}` into a `failure_class` atom for telemetry.
-  # The Bridge error surface (tonic_error / shutdown / unknown) is coarse —
-  # gRPC reachability failures land in `:tonic_error`, so the default
-  # classification for cluster-reachability failures is `:tcp_reset`.
+  # A connect failure is `:unreachable` (Temporal not reached, or silent) or
+  # `:tonic_error` (refused); either is classed by its detail, and anything
+  # the detail does not name is `:tcp_reset`.
   @spec classify_connect_error(Bridge.Error.t()) :: atom()
-  defp classify_connect_error(%Bridge.Error{kind: :tonic_error, detail: detail}),
-    do: classify_tonic_detail(detail)
+  defp classify_connect_error(%Bridge.Error{kind: kind, detail: detail})
+       when kind in [:tonic_error, :unreachable],
+       do: classify_tonic_detail(detail)
 
   defp classify_connect_error(%Bridge.Error{}), do: :tcp_reset
 

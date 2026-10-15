@@ -207,8 +207,9 @@ defmodule Hourglass.Client.Real do
   # Mirror classify_connect_error/1 locally — kept in the Real backend so the
   # classification logic for the production connect path lives next to its consumer.
   @spec classify_connect_error_class(Bridge.Error.t()) :: atom()
-  defp classify_connect_error_class(%Bridge.Error{kind: :tonic_error, detail: detail}),
-    do: classify_tonic_detail(detail)
+  defp classify_connect_error_class(%Bridge.Error{kind: kind, detail: detail})
+       when kind in [:tonic_error, :unreachable],
+       do: classify_tonic_detail(detail)
 
   defp classify_connect_error_class(%Bridge.Error{}), do: :tcp_reset
 

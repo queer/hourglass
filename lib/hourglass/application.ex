@@ -51,9 +51,9 @@ defmodule Hourglass.Application do
       — no workflow/activity inventory config is required.
     * `Hourglass.NamespaceEnsurer` — runs after the Subsystem so
       `Runtime` is alive when it calls into the Temporal client.
-      Returns `:ignore` once it succeeds; crashes the boot supervisor
-      on connect/namespace-register failure so operators see the real
-      error.
+      Returns `:ignore` once it succeeds; keeps trying, without failing
+      the boot, while Temporal cannot be reached; fails the boot on any
+      other failure, so operators see the real error.
 
   ## The gate
 

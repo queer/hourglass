@@ -1,4 +1,7 @@
 use rustler::{Atom, Env, NifStruct};
+use temporalio_client::errors::ClientConnectError;
+use temporalio_client::tonic::Code;
+use temporalio_sdk_core::WorkerValidationError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -8,6 +11,13 @@ pub enum BridgeError {
     Shutdown,
     #[error("tonic: {0}")]
     TonicError(String),
+    // Temporal could not be reached, or did not answer: worth trying again,
+    // unlike a call Temporal refused.
+    #[error("unreachable: {0}")]
+    Unreachable(String),
+    // Temporal does not know the namespace a worker was given.
+    #[error("namespace not found: {0}")]
+    NamespaceNotFound(String),
     #[error("invalid proto: {0}")]
     InvalidProto(String),
     #[error("nondeterminism: {0}")]
@@ -26,6 +36,8 @@ pub mod atoms {
         error,
         shutdown,
         tonic_error,
+        unreachable,
+        namespace_not_found,
         invalid_proto,
         nondeterminism,
         worker_already_started,
@@ -46,6 +58,8 @@ impl BridgeError {
         let (kind, detail) = match self {
             BridgeError::Shutdown => (atoms::shutdown(), String::new()),
             BridgeError::TonicError(s) => (atoms::tonic_error(), s.clone()),
+            BridgeError::Unreachable(s) => (atoms::unreachable(), s.clone()),
+            BridgeError::NamespaceNotFound(s) => (atoms::namespace_not_found(), s.clone()),
             BridgeError::InvalidProto(s) => (atoms::invalid_proto(), s.clone()),
             BridgeError::Nondeterminism(s) => (atoms::nondeterminism(), s.clone()),
             BridgeError::WorkerAlreadyStarted(s) => (atoms::worker_already_started(), s.clone()),
@@ -58,6 +72,54 @@ impl BridgeError {
 
 #[allow(dead_code)]
 pub type BridgeResult<T> = std::result::Result<T, BridgeError>;
+
+// Whether a gRPC status says Temporal was not reached, or did not answer in
+// time, rather than that it refused the call.
+fn unreachable_code(code: Code) -> bool {
+    matches!(
+        code,
+        Code::Unavailable
+            | Code::DeadlineExceeded
+            | Code::Cancelled
+            | Code::ResourceExhausted
+            | Code::Aborted
+            | Code::Unknown
+    )
+}
+
+impl BridgeError {
+    // Connecting failed: unreachable if the network or Temporal let it down
+    // (a transport or DNS failure, or GetSystemInfo not answered), else a
+    // refusal or a configuration Temporal will never accept.
+    pub fn from_connect(e: ClientConnectError) -> Self {
+        let unreachable = match &e {
+            ClientConnectError::TonicTransportError(_)
+            | ClientConnectError::DnsResolutionError { .. } => true,
+            ClientConnectError::SystemInfoCallError(status) => unreachable_code(status.code()),
+            _ => false,
+        };
+
+        if unreachable {
+            BridgeError::Unreachable(e.to_string())
+        } else {
+            BridgeError::TonicError(e.to_string())
+        }
+    }
+
+    // Describing the worker's namespace failed: unreachable as for a call,
+    // unknown to Temporal, or refused to the worker.
+    pub fn from_validation(e: WorkerValidationError) -> Self {
+        let code = match &e {
+            WorkerValidationError::NamespaceDescribeError { source, .. } => source.code(),
+        };
+
+        match code {
+            Code::NotFound => BridgeError::NamespaceNotFound(e.to_string()),
+            code if unreachable_code(code) => BridgeError::Unreachable(e.to_string()),
+            _ => BridgeError::TonicError(e.to_string()),
+        }
+    }
+}
 
 /// Return type for NIFs that return `:ok | {:error, %Bridge.Error{}}` on the Elixir side.
 ///

@@ -33,6 +33,8 @@ defmodule Hourglass.WorkerLauncher do
   worker lifecycle without contention from a global default.
   """
 
+  alias Hourglass.Client
+  alias Hourglass.Client.Backend
   # credo:disable-for-next-line Credo.Check.Readability.AliasAs
   alias Hourglass.Worker.Supervisor, as: WorkerSupervisor
 
@@ -81,6 +83,12 @@ defmodule Hourglass.WorkerLauncher do
       ])
 
     opts = [task_queue: @default_task_queue] ++ worker_opts
+
+    # The worker's namespace must exist before it registers, which Temporal
+    # refuses for an unknown namespace, and Hourglass.NamespaceEnsurer starts
+    # after this. If this cannot make it exist, the worker's registration says
+    # why (and, Temporal being unreachable, keeps trying meanwhile).
+    _ensured = Backend.impl().ensure_namespace(Client.default_namespace())
 
     case WorkerSupervisor.start_worker(opts) do
       {:ok, _pid} -> :ignore
