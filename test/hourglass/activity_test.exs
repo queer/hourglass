@@ -164,6 +164,33 @@ defmodule Hourglass.ActivityTest do
     end
   end
 
+  defmodule EndsOnCancelRequestActivity do
+    use Hourglass.Activity, ends_on_cancel_request: true
+
+    @impl Hourglass.Activity.Behaviour
+    def execute(args), do: args
+  end
+
+  describe "ends_on_cancel_request" do
+    test "an activity ends on a cancel request only if it says so" do
+      assert ends_on_cancel_request?(EndsOnCancelRequestActivity)
+      refute ends_on_cancel_request?(DefaultPolicyActivity)
+    end
+
+    test "a name that is no loaded activity does not" do
+      no_such = "Elixir.Hourglass.NoSuchActivity#{System.unique_integer([:positive])}"
+      refute Hourglass.ActivityRunner.ends_on_cancel_request?(no_such)
+      refute ends_on_cancel_request?(Enum)
+      refute Hourglass.ActivityRunner.ends_on_cancel_request?("not-an-elixir-module")
+    end
+
+    defp ends_on_cancel_request?(module) do
+      module
+      |> Atom.to_string()
+      |> Hourglass.ActivityRunner.ends_on_cancel_request?()
+    end
+  end
+
   describe "compile-time validation" do
     test "rejects :retryable_error_types (classifier owns eligibility)" do
       assert_raise CompileError, ~r/retryable_error_types/, fn ->
@@ -243,6 +270,18 @@ defmodule Hourglass.ActivityTest do
         Code.compile_string("""
         defmodule BadActivityNegativeMax do
           use Hourglass.Activity, retry: [max_interval: -100]
+          @impl true
+          def execute(_input), do: nil
+        end
+        """)
+      end
+    end
+
+    test "rejects an :ends_on_cancel_request that isn't a boolean" do
+      assert_raise CompileError, ~r/ends_on_cancel_request: ... must be a boolean/, fn ->
+        Code.compile_string("""
+        defmodule BadActivityEndsOnCancelRequest do
+          use Hourglass.Activity, ends_on_cancel_request: :yes
           @impl true
           def execute(_input), do: nil
         end

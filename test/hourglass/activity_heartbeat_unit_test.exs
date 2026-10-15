@@ -44,6 +44,22 @@ defmodule Hourglass.ActivityHeartbeatUnitTest do
     assert_raise Hourglass.Activity.Cancelled, fn -> Activity.heartbeat!() end
   end
 
+  test "heartbeat!/0 raises with the reason its worker ended it for, and :cancel_requested for Core's" do
+    for {mark, reason} <- [
+          workflow_closed: :workflow_closed,
+          workflow_cancel_requested: :workflow_cancel_requested,
+          timed_out: :cancel_requested,
+          not_found: :cancel_requested
+        ] do
+      t = "hb-#{System.unique_integer([:positive])}"
+      put_info(t)
+      CancelRegistry.mark(t, mark)
+
+      assert %Hourglass.Activity.Cancelled{reason: ^reason} =
+               catch_error(Activity.heartbeat!())
+    end
+  end
+
   test "heartbeat_ref/0 is nil outside a dispatch" do
     assert Activity.heartbeat_ref() == nil
   end

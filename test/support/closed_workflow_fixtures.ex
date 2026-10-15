@@ -5,11 +5,13 @@ defmodule Hourglass.TestSupport.EndsOnCancel do
   # running; without it, the body never asks `cancelled?/0`, so a cancel leaves
   # the run waiting on the activity.
   #
-  # `heeding` runs `HeedingActivity` in place of `GatedActivity`.
+  # `heeding` runs `HeedingActivity` in place of `GatedActivity`; `opted_in`
+  # runs `OptedInActivity`, heeding or not.
   use Hourglass.Workflow, input: :map, output: :map
 
   alias Hourglass.TestSupport.GatedActivity
   alias Hourglass.TestSupport.HeedingActivity
+  alias Hourglass.TestSupport.OptedInActivity
 
   @impl Hourglass.Workflow.Behaviour
   def run(%{"gate" => gate} = args) do
@@ -17,9 +19,16 @@ defmodule Hourglass.TestSupport.EndsOnCancel do
       %{"cancelled" => true}
     else
       {activity, input} =
-        if args["heeding"],
-          do: {HeedingActivity, %{"gate" => gate, "cleanup_ms" => args["cleanup_ms"]}},
-          else: {GatedActivity, %{"gate" => gate}}
+        cond do
+          args["opted_in"] ->
+            {OptedInActivity, Map.take(args, ["gate", "heeding"])}
+
+          args["heeding"] ->
+            {HeedingActivity, %{"gate" => gate, "cleanup_ms" => args["cleanup_ms"]}}
+
+          true ->
+            {GatedActivity, %{"gate" => gate}}
+        end
 
       outcome = execute_activity(activity, input, start_to_close_timeout: 120_000)
 
@@ -84,6 +93,41 @@ defmodule Hourglass.TestSupport.HeedingActivity do
     Process.sleep(args["cleanup_ms"] || 0)
     :ok = RaceGate.report(gate, :cleaned_up)
     raise cancelled
+  end
+
+  defp await_cancel do
+    Hourglass.Activity.heartbeat!()
+    Process.sleep(50)
+    await_cancel()
+  rescue
+    cancelled in Hourglass.Activity.Cancelled -> cancelled
+  end
+end
+
+defmodule Hourglass.TestSupport.OptedInActivity do
+  @moduledoc false
+  # Ends on a cancel requested of its workflow. Reports `{:running, pid,
+  # task_token}` to the test, on the RaceGate key that is its gate, as it
+  # starts. With `heeding`, it heartbeats every 50 ms until it is told it is
+  # cancelled, reports `{:cancel_seen, reason}`, and ends as cancelled;
+  # without, it waits at the RaceGate `{gate, :activity}`, never heartbeating,
+  # and completes once released.
+  use Hourglass.Activity, input: :map, output: :map, ends_on_cancel_request: true
+
+  alias Hourglass.TestSupport.RaceGate
+
+  @impl Hourglass.Activity.Behaviour
+  def execute(%{"gate" => gate} = args) do
+    :ok = RaceGate.report(gate, {:running, self(), Hourglass.Activity.info().task_token})
+
+    if args["heeding"] do
+      cancelled = await_cancel()
+      :ok = RaceGate.report(gate, {:cancel_seen, cancelled.reason})
+      raise cancelled
+    else
+      :ok = RaceGate.hold({gate, :activity})
+      %{"worked" => gate}
+    end
   end
 
   defp await_cancel do

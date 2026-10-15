@@ -33,7 +33,25 @@ defmodule Hourglass.Worker do
   closed — completed, failed, timed out, been terminated, ended because
   a cancel was requested of it, or continued as new — or Temporal no
   longer knows it, nobody is waiting for the activity: Temporal drops
-  its outcome. The Worker ends such an activity within
+  its outcome. An activity declared `ends_on_cancel_request: true`
+  (`Hourglass.Activity`, "Ending on a cancel request") is also done
+  with once a cancel is requested of its run; for it, everything below
+  that says "closed" says "closed, or with a cancel requested", and the
+  reason it is cancelled with is `:workflow_cancel_requested` (its
+  events `[:hourglass, :activity, :workflow_cancel_requested]` and
+  `[..., :stopped]`).
+
+  Before an activity starts, its executor asks Temporal about its run,
+  through the Worker's client: an activity whose run has closed is
+  never started, and is reported cancelled
+  (`[:hourglass, :activity, :not_started]`). Temporal hands out no task
+  of a closed run, but Core fetches tasks ahead of the worker asking for
+  them, and a busy or paused worker may start one long after; only
+  asking tells. Every activity's start therefore waits for one answer
+  from Temporal, at most a second whatever the bound; a run Temporal
+  has not answered for by then has not closed, and its activity starts.
+
+  The Worker ends a running activity of a closed run within
   `:closed_workflow_bound` of the run closing:
 
     1. Every quarter of the bound, the Worker asks Temporal
@@ -56,9 +74,10 @@ defmodule Hourglass.Worker do
   So an activity of a closed run is gone within three quarters of the
   bound, plus the time Temporal takes to answer, and one that heeds the
   cancel sees it within a quarter of the bound, plus that time and its
-  own heartbeat interval. Only a closed run ends its activities: a
-  cancel requested of a run that goes on running, because its body does
-  not end on `cancelled?/0`, ends nothing.
+  own heartbeat interval. Only a closed run ends the activities that do
+  not opt in: for them, a cancel requested of a run that goes on
+  running, because its body does not end on `cancelled?/0`, ends
+  nothing.
 
   Nor does a Temporal that cannot be asked. Temporal is given a quarter
   of the bound (at least a second) to answer for each run; a run it has
@@ -337,9 +356,11 @@ defmodule Hourglass.Worker do
       |> Keyword.take(@register_opts_keys)
       |> Keyword.put(:graceful_shutdown_period, grace)
 
+    # The watch starts before the poll loops: an activity asks it about its
+    # run before it starts.
     with :ok <- BridgeHolder.register_worker(task_queue, register_opts),
-         {:ok, sup_pid} <- start_inner_supervisor(task_queue),
-         {:ok, watch_pid} <- ClosedWorkflowWatch.start_link(task_queue, bound, opts) do
+         {:ok, watch_pid} <- ClosedWorkflowWatch.start_link(task_queue, bound, opts),
+         {:ok, sup_pid} <- start_inner_supervisor(task_queue) do
       {:ok,
        %{
          task_queue: task_queue,

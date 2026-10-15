@@ -12,7 +12,8 @@ defmodule Hourglass.Worker.ClosedRuns do
   #
   # A run that has closed, in any way, or that Temporal no longer knows, has
   # closed; a run Temporal cannot be asked about, or does not answer for in
-  # time, has not.
+  # time, has not. A run still running has a cancel requested once one was
+  # asked of it.
 
   alias Hourglass.Bridge
   alias Hourglass.Proto.ClientConfig
@@ -22,6 +23,12 @@ defmodule Hourglass.Worker.ClosedRuns do
 
   @typedoc "A workflow run: its workflow id and run id."
   @type run :: {String.t(), String.t()}
+
+  @typedoc """
+  What Temporal's answer says of a run: it has closed, it runs with a cancel
+  requested of it, or neither (it runs, or there was no answer).
+  """
+  @type state :: :closed | :cancel_requested | :open
 
   # The statuses of a run that has closed.
   @closed [
@@ -74,40 +81,70 @@ defmodule Hourglass.Worker.ClosedRuns do
     end
   end
 
+  # What Temporal says of `run` now, asked through `client` and waited for in
+  # the calling process: `:open` unless Temporal answers within `timeout`.
+  # (The describe is given up on at `timeout`; the wait allows the answer a
+  # moment longer to arrive.)
+  @spec state(reference(), run(), pos_integer()) :: state()
+  def state(client, run, timeout) do
+    case describe(client, [run], timeout) do
+      {:ok, tag} ->
+        receive do
+          {:hourglass_runs_described, ^tag, _answers} = message ->
+            {:described, ^tag, states} = answer(message)
+
+            states
+            |> Map.new()
+            |> Map.get(run, :open)
+        after
+          timeout + 1_000 -> :open
+        end
+
+      :error ->
+        :open
+    end
+  end
+
   # How long the answer to describing `count` runs, each given `timeout`, can
   # take at most: they go `@concurrency` at a time.
   @spec answer_within(non_neg_integer(), pos_integer()) :: pos_integer()
   def answer_within(count, timeout), do: (div(count, @concurrency) + 1) * timeout
 
-  # Read a message the caller was sent: a client opened (or not), or the runs
-  # among those described that have closed.
+  # Read a message the caller was sent: a client opened (or not), or the state
+  # of each run described.
   @spec answer(term()) ::
           {:opened, pos_integer(), {:ok, reference()} | :error}
-          | {:described, pos_integer(), [run()]}
+          | {:described, pos_integer(), [{run(), state()}]}
           | :unknown
   def answer({:hourglass_client_opened, tag, {:ok, client}}), do: {:opened, tag, {:ok, client}}
   def answer({:hourglass_client_opened, tag, {:error, _unreachable}}), do: {:opened, tag, :error}
 
   def answer({:hourglass_runs_described, tag, answers}) do
-    closed =
-      for {workflow_id, run_id, answer} <- answers, closed?(answer), do: {workflow_id, run_id}
-
-    {:described, tag, closed}
+    {:described, tag,
+     for({workflow_id, run_id, answer} <- answers, do: {{workflow_id, run_id}, state(answer)})}
   end
 
   def answer(_other), do: :unknown
 
   defp call(call_site, fun), do: Bridge.with_nif_reload_rescue("#{call_site}/closed_runs", fun)
 
-  defp closed?({:ok, bytes}) do
+  defp state({:ok, bytes}) do
     case DescribeWorkflowExecutionResponse.decode(bytes) do
-      %{workflow_execution_info: %WorkflowExecutionInfo{status: status}} -> status in @closed
-      _unknown -> false
+      %{workflow_execution_info: %WorkflowExecutionInfo{status: status}} when status in @closed ->
+        :closed
+
+      %{workflow_extended_info: %{cancel_requested: true}} ->
+        :cancel_requested
+
+      _running_or_unknown ->
+        :open
     end
   end
 
-  defp closed?({:error, %Bridge.Error{kind: :tonic_error, detail: detail}}), do: gone?(detail)
-  defp closed?({:error, _other}), do: false
+  defp state({:error, %Bridge.Error{kind: :tonic_error, detail: detail}}),
+    do: if(gone?(detail), do: :closed, else: :open)
+
+  defp state({:error, _other}), do: :open
 
   # Temporal no longer knows the run (NotFound), as opposed to not knowing
   # the namespace, which says nothing about the run; Temporal's message for

@@ -35,6 +35,9 @@ defmodule Hourglass.Activity do
   * `:output` — a `Hourglass.Schema` module or scalar atom.
     Default: `:map`.
   * `:retry` — keyword list of retry policy options (optional).
+  * `:ends_on_cancel_request` — `true` to have a cancel requested of the
+    activity's workflow end the activity, as its workflow closing does
+    (see "Ending on a cancel request" below). Default: `false`.
 
   Allowed retry keys (mirror Temporal's `RetryPolicy` proto fields):
 
@@ -62,6 +65,27 @@ defmodule Hourglass.Activity do
   `default_retry_policy/0` — `[max_attempts: 1]` (no retry). Retry is
   opt-in: the policy plus a `:retryable` classification are both
   required for the runner to retry.
+
+  ## Ending on a cancel request
+
+  Temporal ends no activity when a cancel is requested of its workflow:
+  the request is only a request, and the workflow's body decides what to
+  do about it. So by default an activity runs on, and only its workflow
+  closing ends it (`Hourglass.Worker`, "Activities of a closed
+  workflow"). An activity declared with `ends_on_cancel_request: true`
+  is ended by the request itself, as by its workflow closing:
+
+    * if the request comes before it starts, `execute/1` is never
+      called;
+    * if it is running, `heartbeat/0` answers `:cancel`, and
+      `heartbeat!/0` raises `Hourglass.Activity.Cancelled` with reason
+      `:workflow_cancel_requested`; one still running half the
+      closed-workflow bound later is killed.
+
+  Either way, a workflow still running sees the activity fail, not
+  retryably, with type `"WorkflowCancelRequested"`: Temporal refuses a
+  cancellation of an activity whose cancel the workflow did not request,
+  and the activity would otherwise wait out its timeout.
 
   ## Example
 
@@ -220,7 +244,9 @@ defmodule Hourglass.Activity do
   @doc """
   Like `heartbeat/0`, but RAISES `Hourglass.Activity.Cancelled` when the activity has been
   cancelled (instead of returning `:cancel`), with reason `:workflow_closed` when its worker
-  cancelled it because its workflow run has closed, and `:cancel_requested` otherwise. The runner turns the raise into a Temporal
+  cancelled it because its workflow run has closed, `:workflow_cancel_requested` when it opted in
+  to ending on a cancel request (see "Ending on a cancel request") and one was requested of its
+  workflow, and `:cancel_requested` otherwise. The runner turns the raise into a Temporal
   Cancellation completion. Use in activity bodies that want automatic unwinding at the next
   heartbeat; the body needs no other change.
   """
@@ -235,8 +261,18 @@ defmodule Hourglass.Activity do
     output = Macro.expand(output_raw, __CALLER__)
 
     retry = Keyword.get(opts, :retry) || default_retry_policy()
+    ends_on_cancel_request = Keyword.get(opts, :ends_on_cancel_request, false)
 
     __validate_retry_policy__(retry, __CALLER__)
+
+    unless is_boolean(ends_on_cancel_request) do
+      raise CompileError,
+        file: __CALLER__.file,
+        line: __CALLER__.line,
+        description:
+          "use Hourglass.Activity, ends_on_cancel_request: ... must be a boolean, " <>
+            "got: #{inspect(ends_on_cancel_request)}"
+    end
 
     quote do
       @behaviour Hourglass.Activity.Behaviour
@@ -249,6 +285,9 @@ defmodule Hourglass.Activity do
 
       @doc false
       def __activity_retry_policy__, do: unquote(Macro.escape(retry))
+
+      @doc false
+      def __activity_ends_on_cancel_request__, do: unquote(ends_on_cancel_request)
 
       defoverridable __activity_retry_policy__: 0
     end

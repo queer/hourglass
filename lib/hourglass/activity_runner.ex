@@ -135,9 +135,11 @@ defmodule Hourglass.ActivityRunner do
   Report the activity task `task_token` to Temporal as cancelled, with
   `reason`, through `complete_fn` (by default
   `Hourglass.BridgeHolder.complete_activity_task/2`). A `Hourglass.Worker`
-  sends it for each activity of a closed workflow it had to stop (its
-  moduledoc's "Activities of a closed workflow"), so Core lets go of the
-  task.
+  sends it for each activity of an ended run it had to stop, or did not
+  start (its moduledoc's "Activities of a closed workflow"), so Core lets
+  go of the task. With reason `:workflow_cancel_requested` the activity is
+  reported as a non-retryable failure of type `"WorkflowCancelRequested"`
+  (`Hourglass.Activity`, "Ending on a cancel request").
   """
   @spec report_cancelled(
           binary(),
@@ -354,6 +356,23 @@ defmodule Hourglass.ActivityRunner do
     end
   end
 
+  @doc false
+  # Whether the activity named `activity_type` (its wire name) was declared
+  # `use Hourglass.Activity, ends_on_cancel_request: true`. False for a name
+  # that is no loaded activity.
+  @spec ends_on_cancel_request?(String.t()) :: boolean()
+  def ends_on_cancel_request?(activity_type) do
+    case parse_activity_module(activity_type) do
+      nil ->
+        false
+
+      module ->
+        Code.ensure_loaded?(module) and
+          function_exported?(module, :__activity_ends_on_cancel_request__, 0) and
+          module.__activity_ends_on_cancel_request__()
+    end
+  end
+
   # Parses an activity_type wire string to an Elixir module atom.
   # The wire format is `Atom.to_string(module)`, i.e. "Elixir.My.Activity".
   # Returns nil for anything that isn't an "Elixir." prefixed string or for
@@ -494,6 +513,22 @@ defmodule Hourglass.ActivityRunner do
   # ──────────────────────────────────────────────────────────────────────
   # Completion encoding
   # ──────────────────────────────────────────────────────────────────────
+
+  # An activity ended by a cancel requested of its workflow, which it opted in
+  # to (`use Hourglass.Activity, ends_on_cancel_request: true`), is reported
+  # as a failure no retry can undo: Temporal refuses a cancellation of an
+  # activity the workflow did not ask to cancel, and the activity would wait
+  # out its timeout instead.
+  defp encode_completion(activity_task, {:cancelled, :workflow_cancel_requested}) do
+    failure = %{
+      type: "WorkflowCancelRequested",
+      message: "Activity ended: a cancel was requested of its workflow",
+      details: nil,
+      non_retryable: true
+    }
+
+    encode_completion(activity_task, {:failed, failure})
+  end
 
   defp encode_completion(activity_task, {:cancelled, reason}) do
     failure = %Temporal.Api.Failure.V1.Failure{

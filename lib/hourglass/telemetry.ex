@@ -29,6 +29,15 @@ defmodule Hourglass.Telemetry do
     [:hourglass, :activity, :workflow_closed],
     # such an activity was still running once half the bound had passed, and was killed
     [:hourglass, :activity, :workflow_closed, :stopped],
+    # a cancel was requested of the workflow run of an activity that ends on one
+    # (use Hourglass.Activity, ends_on_cancel_request: true), so it is cancelled;
+    # metadata: task_queue, workflow_id, run_id
+    [:hourglass, :activity, :workflow_cancel_requested],
+    # such an activity was still running once half the bound had passed, and was killed
+    [:hourglass, :activity, :workflow_cancel_requested, :stopped],
+    # an activity's run had ended when its task reached the worker, so it never started;
+    # metadata: task_queue, workflow_id, run_id, reason (:workflow_closed | :workflow_cancel_requested)
+    [:hourglass, :activity, :not_started],
     [:hourglass, :workflow, :exception],
     # workflow body raised → parked as a workflow-task failure; retried by the server
     [:hourglass, :workflow, :task_failed],

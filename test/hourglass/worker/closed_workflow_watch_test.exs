@@ -23,6 +23,7 @@ defmodule Hourglass.Worker.ClosedWorkflowWatchTest do
   alias Hourglass.Client
   alias Hourglass.TestSupport.FreezableProxy
   alias Hourglass.TestSupport.Patience
+  alias Hourglass.TestSupport.UnservedRuns
   alias Hourglass.TestSupport.SchedulerLag
   alias Hourglass.TestSupport.WatchTrace
   alias Hourglass.TestSupport.WorkerProbes
@@ -134,6 +135,58 @@ defmodule Hourglass.Worker.ClosedWorkflowWatchTest do
     assert elapsed < 100_000
   end
 
+  @tag :temporal
+  test "an activity that ends on a cancel request is ended once one is requested of its run, and one that does not is not" do
+    queue = queue()
+    {workflow_id, run_id} = run = running_run!()
+    {opted_in, _token} = fake_activity!(queue, run, true)
+    {not_opted_in, token} = fake_activity!(queue, run)
+    monitor = Process.monitor(opted_in)
+    start_watch!(queue, Client.default_namespace(), Client.default_target_url())
+
+    :ok = Hourglass.cancel(%Hourglass.WorkflowHandle{id: workflow_id, run_id: run_id}, "test")
+
+    assert_receive {:DOWN, ^monitor, :process, ^opted_in, :killed}, Patience.ms()
+    assert_still_running(not_opted_in, token, 3 * @bound)
+  end
+
+  @tag :temporal
+  test "what Temporal says of a run before an activity of it starts" do
+    queue = queue()
+    {workflow_id, run_id} = run = running_run!()
+    assert ClosedWorkflowWatch.run_state(queue, run) == :open, "no watch: nothing to ask"
+
+    start_watch!(queue, Client.default_namespace(), Client.default_target_url())
+    assert ClosedWorkflowWatch.run_state(queue, run) == :open
+    assert ClosedWorkflowWatch.run_state(queue, unknown_run()) == :closed
+
+    :ok = Hourglass.cancel(%Hourglass.WorkflowHandle{id: workflow_id, run_id: run_id}, "test")
+    assert ClosedWorkflowWatch.run_state(queue, run) == :cancel_requested
+  end
+
+  @tag :temporal
+  test "before an activity starts, a Temporal gone quiet is waited for a second at most, whatever the bound" do
+    queue = queue()
+    proxy = start_supervised!(FreezableProxy)
+    watch = start_watch!(queue, Client.default_namespace(), FreezableProxy.url(proxy), 60_000)
+
+    WorkerProbes.poll_until("the watch to open its client", fn ->
+      :sys.get_state(watch).client != nil
+    end)
+
+    :ok = FreezableProxy.freeze(proxy)
+    {elapsed, state} = :timer.tc(fn -> ClosedWorkflowWatch.run_state(queue, unknown_run()) end)
+
+    assert state == :open
+    assert elapsed < 2_000_000
+  end
+
+  test "before an activity starts, a Temporal that cannot be reached says its run is open" do
+    queue = queue()
+    start_watch!(queue, Client.default_namespace(), "http://127.0.0.1:1")
+    assert ClosedWorkflowWatch.run_state(queue, unknown_run()) == :open
+  end
+
   # A watch whose Temporal is reached through a proxy the test can freeze,
   # once it has opened its client, with a running activity of a running run
   # (so it has a check to make, and ends nothing by it).
@@ -156,32 +209,31 @@ defmodule Hourglass.Worker.ClosedWorkflowWatchTest do
     Process.demonitor(monitor, [:flush])
   end
 
-  # The processes the watch has linked to it, other than its supervisor: any
-  # it would have started to wait on Temporal for it.
+  # The processes the watch has linked to it, other than its supervisor and
+  # the registry it registers in: any it would have started to wait on
+  # Temporal for it.
   defp helpers(watch) do
     {:links, links} = Process.info(watch, :links)
     {:dictionary, dictionary} = Process.info(watch, :dictionary)
-    links -- Keyword.fetch!(dictionary, :"$ancestors")
+
+    registry =
+      for {_id, pid, _type, _modules} <-
+            Supervisor.which_children(Hourglass.ActivityExecutor.Registry),
+          do: pid
+
+    links -- (Keyword.fetch!(dictionary, :"$ancestors") ++ registry)
   end
 
   defp queue, do: "watch-#{System.unique_integer([:positive])}"
 
   defp unknown_run, do: {"watch-#{UUIDv7.generate()}", UUIDv7.generate()}
 
-  # A run Temporal knows and that goes on running: a workflow started on a
-  # queue nobody serves.
-  defp running_run! do
-    {:ok, handle} =
-      Hourglass.start(Hourglass.TestSupport.SignalledChild, %{},
-        id: "watch-running-#{UUIDv7.generate()}",
-        task_queue: "watch-nobody-#{System.unique_integer([:positive])}"
-      )
+  # A run Temporal knows and that goes on running (`UnservedRuns`).
+  defp running_run!, do: UnservedRuns.start!("watch-running")
 
-    {handle.id, handle.run_id}
-  end
-
-  # A process registered as the executor of an activity of `run`, on `queue`.
-  defp fake_activity!(queue, run) do
+  # A process registered as the executor of an activity of `run`, on `queue`,
+  # ending on a cancel request of it if `opted_in`.
+  defp fake_activity!(queue, run, opted_in \\ false) do
     token = "token-#{UUIDv7.generate()}"
     test = self()
 
@@ -190,7 +242,11 @@ defmodule Hourglass.Worker.ClosedWorkflowWatchTest do
         {:ok, _owner} = Registry.register(Hourglass.ActivityExecutor.Registry, queue, token)
 
         {:ok, _owner} =
-          Registry.register(Hourglass.ActivityExecutor.Registry, {:activity, token}, run)
+          Registry.register(
+            Hourglass.ActivityExecutor.Registry,
+            {:activity, token},
+            {run, opted_in}
+          )
 
         send(test, {:registered, token})
         Process.sleep(:infinity)

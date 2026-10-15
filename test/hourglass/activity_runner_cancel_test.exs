@@ -75,6 +75,36 @@ defmodule Hourglass.ActivityRunnerCancelTest do
     assert {:cancelled, _details} = completion.result.status
   end
 
+  test "a cancel requested of the workflow, which ends the activity, is reported as a non-retryable failure" do
+    me = self()
+
+    :ok =
+      ActivityRunner.report_cancelled(tok(), "q", :workflow_cancel_requested, fn _q, bytes ->
+        send(me, {:bytes, bytes})
+        :ok
+      end)
+
+    assert_received {:bytes, bytes}
+    completion = Coresdk.ActivityTaskCompletion.decode(bytes)
+    assert {:failed, %{failure: failure}} = completion.result.status
+
+    assert {:application_failure_info, %{type: "WorkflowCancelRequested", non_retryable: true}} =
+             failure.failure_info
+  end
+
+  test "an activity of a closed run is reported cancelled" do
+    me = self()
+
+    :ok =
+      ActivityRunner.report_cancelled(tok(), "q", :workflow_closed, fn _q, bytes ->
+        send(me, {:bytes, bytes})
+        :ok
+      end)
+
+    assert_received {:bytes, bytes}
+    assert {:cancelled, _details} = Coresdk.ActivityTaskCompletion.decode(bytes).result.status
+  end
+
   test "Start completion clears the token from the registry" do
     t = tok()
     CancelRegistry.mark(t, :cancelled)

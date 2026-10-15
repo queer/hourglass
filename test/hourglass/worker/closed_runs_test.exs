@@ -3,13 +3,15 @@ defmodule Hourglass.Worker.ClosedRunsTest do
   Which runs `Hourglass.Worker.ClosedRuns` reads as closed from Temporal's
   answers: every closed status and a run Temporal no longer knows, and
   nothing else — not a running run, not a namespace Temporal does not know,
-  not a describe that timed out or failed otherwise.
+  not a describe that timed out or failed otherwise. A running run with a
+  cancel requested of it reads as such.
   """
 
   use ExUnit.Case, async: true
 
   alias Hourglass.Bridge
   alias Hourglass.Worker.ClosedRuns
+  alias Temporal.Api.Workflow.V1.WorkflowExecutionExtendedInfo
   alias Temporal.Api.Workflow.V1.WorkflowExecutionInfo
   alias Temporal.Api.Workflowservice.V1.DescribeWorkflowExecutionResponse
 
@@ -32,6 +34,15 @@ defmodule Hourglass.Worker.ClosedRunsTest do
     refute closed?(described(:WORKFLOW_EXECUTION_STATUS_RUNNING))
     refute closed?(described(:WORKFLOW_EXECUTION_STATUS_UNSPECIFIED))
     refute closed?({:ok, Protobuf.encode(%DescribeWorkflowExecutionResponse{})})
+  end
+
+  test "a running run with a cancel requested has a cancel requested; a closed one has closed" do
+    assert state(described(:WORKFLOW_EXECUTION_STATUS_RUNNING, true)) == :cancel_requested
+    assert state(described(:WORKFLOW_EXECUTION_STATUS_RUNNING, false)) == :open
+
+    for status <- @closed do
+      assert state(described(status, true)) == :closed
+    end
   end
 
   test "a run Temporal no longer knows has closed, whatever its workflow id says" do
@@ -72,16 +83,19 @@ defmodule Hourglass.Worker.ClosedRunsTest do
     assert ClosedRuns.answer({:check}) == :unknown
   end
 
-  defp closed?(answer) do
-    {:described, 1, closed} =
+  defp closed?(answer), do: state(answer) == :closed
+
+  defp state(answer) do
+    {:described, 1, [{{"w", "r"}, state}]} =
       ClosedRuns.answer({:hourglass_runs_described, 1, [{"w", "r", answer}]})
 
-    closed == [{"w", "r"}]
+    state
   end
 
-  defp described(status) do
+  defp described(status, cancel_requested \\ false) do
     response = %DescribeWorkflowExecutionResponse{
-      workflow_execution_info: %WorkflowExecutionInfo{status: status}
+      workflow_execution_info: %WorkflowExecutionInfo{status: status},
+      workflow_extended_info: %WorkflowExecutionExtendedInfo{cancel_requested: cancel_requested}
     }
 
     {:ok, Protobuf.encode(response)}

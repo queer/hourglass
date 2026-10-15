@@ -1,3 +1,8 @@
+# credo:disable-for-this-file Credo.Check.Refactor.ModuleDependencies
+#
+# It runs each activity's dispatch: the registry it keeps, the runner, and the
+# closed-workflow watch that admits an activity are each a dependency it has
+# to have.
 defmodule Hourglass.ActivityExecutor.DynamicSupervisor do
   @moduledoc """
   Application-level shared `DynamicSupervisor` for ephemeral activity
@@ -23,6 +28,22 @@ defmodule Hourglass.ActivityExecutor.DynamicSupervisor do
   shipped back to Core inside `run/3`, so OTP-level restart is not
   appropriate. Core owns activity-level retry.
 
+  ## An activity of an ended run never starts
+
+  Before an executor runs an activity, it asks Temporal about the
+  activity's workflow run, through the closed-workflow watch of the
+  activity's Worker (`Hourglass.Worker`, "Activities of a closed
+  workflow"). If the run has closed, or (for an activity that opts in,
+  `use Hourglass.Activity, ends_on_cancel_request: true`) has a cancel
+  requested of it, the activity's `execute/1` is never called: the
+  activity is reported to Temporal as ended for that reason
+  (`Hourglass.ActivityRunner.report_cancelled/3`), and
+  `[:hourglass, :activity, :not_started]` is emitted. Temporal hands out
+  no task of a closed run, but Core fetches tasks ahead of the worker
+  asking for them, and a busy or paused worker may start one long after
+  Temporal handed it out, so only asking tells. A run Temporal has not
+  answered for within a second has not ended, and its activity starts.
+
   ## Executors by task queue
 
   Each executor registers under its task queue in
@@ -31,11 +52,11 @@ defmodule Hourglass.ActivityExecutor.DynamicSupervisor do
   can find the executors of its own queue, and the task tokens of the
   activities they run, with `running/1`. The executor running an
   activity also registers under that activity's task token, with the
-  workflow run the activity belongs to, so `running_activity?/2` can
-  tell whether a dispatch is still going on
-  (`Hourglass.Activity.heartbeat/1`), and `running_activities/1` which
-  runs a Worker's activities belong to (its "Activities of a closed
-  workflow"). A Worker
+  workflow run the activity belongs to and whether it ends on a cancel
+  request, so `running_activity?/2` can tell whether a dispatch is
+  still going on (`Hourglass.Activity.heartbeat/1`), and
+  `running_activities/1` which runs a Worker's activities belong to (its
+  "Activities of a closed workflow"). A Worker
   stops only the executors still running once its drain is over, whose
   outcome either was already reported to Temporal or can never be
   (`Hourglass.Worker`'s "Graceful stop").
@@ -44,6 +65,7 @@ defmodule Hourglass.ActivityExecutor.DynamicSupervisor do
   use DynamicSupervisor
 
   alias Hourglass.ActivityRunner
+  alias Hourglass.Worker.ClosedWorkflowWatch
 
   @registry Hourglass.ActivityExecutor.Registry
 
@@ -103,16 +125,24 @@ defmodule Hourglass.ActivityExecutor.DynamicSupervisor do
 
   @doc """
   The activities running for `task_queue`: for each, the executor running
-  it, its task token, and the workflow id and run id of the run it belongs
-  to. Executors acknowledging a cancel are not among them, nor is an
-  activity whose task names no run.
+  it, its task token, the run it belongs to (`{workflow_id, run_id}`), and
+  whether it ends on a cancel requested of that run. Executors
+  acknowledging a cancel are not among them, nor is an activity whose task
+  names no run, nor one not yet started.
   """
-  @spec running_activities(String.t()) :: [{pid(), binary(), String.t(), String.t()}]
+  @spec running_activities(String.t()) ::
+          [{pid(), binary(), {String.t(), String.t()}, boolean()}]
   def running_activities(task_queue) when is_binary(task_queue) do
     for {pid, task_token} <- running(task_queue),
-        {^pid, {workflow_id, run_id}} <- Registry.lookup(@registry, {:activity, task_token}),
-        do: {pid, task_token, workflow_id, run_id}
+        {^pid, {{_workflow_id, _run_id} = run, opted_in}} <-
+          Registry.lookup(@registry, {:activity, task_token}),
+        do: {pid, task_token, run, opted_in}
   end
+
+  @doc false
+  # The registry executors, and each Worker's closed-workflow watch, register in.
+  @spec registry() :: atom()
+  def registry, do: @registry
 
   @doc """
   Whether `pid` is the executor running the activity whose task token is
@@ -131,20 +161,26 @@ defmodule Hourglass.ActivityExecutor.DynamicSupervisor do
   defp execute(activity_task, task_queue) do
     {:ok, _owner} = Registry.register(@registry, task_queue, activity_task.task_token)
 
-    # The executor that runs an activity — not one acknowledging a cancel of
-    # it — also registers under its task token, with the run it belongs to,
-    # for `running_activity?/2` and `running_activities/1`.
-    with %{variant: {:start, start}} <- activity_task do
-      {:ok, _owner} =
-        Registry.register(@registry, {:activity, activity_task.task_token}, run_of(start))
+    case activity_task do
+      %{variant: {:start, start}} -> start(activity_task, start, task_queue)
+      _cancel -> ActivityRunner.run(activity_task, task_queue)
     end
-
-    ActivityRunner.run(activity_task, task_queue)
   end
 
-  defp run_of(%{workflow_execution: %{workflow_id: workflow_id, run_id: run_id}})
-       when workflow_id != "" and run_id != "",
-       do: {workflow_id, run_id}
+  # Run the activity, unless its run has ended ("An activity of an ended run
+  # never starts"). The executor that runs it — not one acknowledging a cancel
+  # of it — also registers under its task token, with its run and whether it
+  # opted in, for `running_activity?/2` and `running_activities/1`.
+  defp start(activity_task, start, task_queue) do
+    token = activity_task.task_token
 
-  defp run_of(_start), do: nil
+    case ClosedWorkflowWatch.admit(task_queue, token, start) do
+      {:start, run, opted_in} ->
+        {:ok, _owner} = Registry.register(@registry, {:activity, token}, {run, opted_in})
+        ActivityRunner.run(activity_task, task_queue)
+
+      :ended ->
+        :ok
+    end
+  end
 end

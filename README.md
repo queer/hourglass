@@ -273,8 +273,9 @@ end
 > delivered by Temporal Core as a Cancel activity task — and once **its workflow has closed** (see
 > [Activities of a closed workflow](#activities-of-a-closed-workflow)). Requesting cancellation of
 > the *workflow* (`Hourglass.cancel/2`) cancels no activity by itself (the evaluator flags the
-> workflow cancelled but issues no activity-cancel command); a workflow that ends on `cancelled?/0`
-> closes, and that ends its activities.
+> workflow cancelled but issues no activity-cancel command) unless the activity opts in (see
+> [Ending on a cancel request](#ending-on-a-cancel-request)); a workflow that ends on
+> `cancelled?/0` closes, and that ends its activities.
 
 ## Running a worker
 
@@ -351,12 +352,21 @@ The worker ends such an activity within its **closed-workflow bound**, which def
 3. One still running half the bound after it was cancelled is killed, and reported to Temporal as
    cancelled.
 
+An activity whose run has already closed when its task reaches the worker never runs at all: its
+`execute/1` is not called, and it is reported to Temporal as cancelled
+(`[:hourglass, :activity, :not_started]`). Temporal hands out no task of a closed run, but Temporal
+Core fetches tasks ahead of the worker asking for them, and a busy or paused worker can start one
+long after Temporal handed it out; so before each activity starts, the worker asks Temporal about
+its run. **Every activity's start waits for that answer**: one round trip to Temporal, and when
+Temporal is slow, at most a second, whatever the bound, after which the activity starts.
+
 An activity whose workflow is still running is never ended this way — including when a cancel of
-the workflow was requested but its body goes on. Nor is one whose workflow Temporal cannot be asked
-about: an unreachable Temporal is not a closed workflow, and a run Temporal has not answered for
-within a quarter of the bound (at least a second) is asked about again at a later check. The asking
-holds no scheduler thread, so a slow or silent Temporal costs the worker nothing and does not delay
-its stop. Set the bound, in milliseconds (from 100 to 8589934590), per worker or for every worker:
+the workflow was requested but its body goes on, unless the activity opts in (below). Nor is one
+whose workflow Temporal cannot be asked about: an unreachable Temporal is not a closed workflow, and
+a run Temporal has not answered for within a quarter of the bound (at least a second) is asked about
+again at a later check. The periodic asking holds no scheduler thread, so a slow or silent Temporal
+costs the worker nothing and does not delay its stop. Set the bound, in milliseconds (from 100 to
+8589934590), per worker or for every worker:
 
 ```elixir
 # per worker
@@ -370,6 +380,28 @@ Temporal Core alone would tell an activity only through a heartbeat it sends, wh
 to one per 0.8 of the heartbeat timeout (or 30 seconds without one), and never for an activity
 that does not heartbeat; hence the worker asks. See `Hourglass.Worker`'s "Activities of a closed
 workflow" for the details.
+
+#### Ending on a cancel request
+
+A cancel requested of a workflow is only a request: its body decides what to do about it, and the
+workflow's activities run on. An activity that should stop as soon as its workflow is asked to
+cancel opts in:
+
+```elixir
+defmodule MyApp.Activities.Generate do
+  use Hourglass.Activity, input: :map, output: :map, ends_on_cancel_request: true
+  ...
+end
+```
+
+The worker then treats a cancel requested of the activity's workflow as it treats the workflow
+closing, within the same bound: an activity whose workflow has a cancel requested when its task
+reaches the worker never runs, and a running one is cancelled — `heartbeat/0` answers `:cancel`,
+`heartbeat!/0` raises `Hourglass.Activity.Cancelled` with reason `:workflow_cancel_requested`
+(`[:hourglass, :activity, :workflow_cancel_requested]`) — and killed if it is still running half
+the bound later. A workflow still running sees the activity fail, not retryably, with type
+`"WorkflowCancelRequested"`: Temporal refuses a cancellation of an activity the workflow did not
+ask to cancel, so reporting one would leave the workflow waiting out the activity's timeout.
 
 ### Dirty-IO schedulers
 
@@ -436,6 +468,9 @@ Hourglass emits the following `:telemetry` events:
 | `[:hourglass, :activity, :dispatch_failed]` | Activity could not be dispatched |
 | `[:hourglass, :activity, :workflow_closed]` | An activity's workflow run has closed, so its worker cancelled it; metadata `task_queue`, `workflow_id`, `run_id` |
 | `[:hourglass, :activity, :workflow_closed, :stopped]` | Such an activity was still running half the closed-workflow bound later, and was killed; same metadata |
+| `[:hourglass, :activity, :workflow_cancel_requested]` | A cancel was requested of the workflow of an activity that ends on one (`ends_on_cancel_request: true`), so its worker cancelled it; metadata `task_queue`, `workflow_id`, `run_id` |
+| `[:hourglass, :activity, :workflow_cancel_requested, :stopped]` | Such an activity was still running half the closed-workflow bound later, and was killed; same metadata |
+| `[:hourglass, :activity, :not_started]` | An activity's run had ended when its task reached the worker, so it never ran; metadata `task_queue`, `workflow_id`, `run_id`, `reason` (`:workflow_closed` or `:workflow_cancel_requested`) |
 | `[:hourglass, :activity, :heartbeat]` | Activity recorded a liveness heartbeat |
 | `[:hourglass, :activity, :cancel_received]` | A Cancel activity task arrived (heartbeat timeout / server-side cancel); metadata includes `reason` |
 | `[:hourglass, :activity, :heartbeat_lost]` | *(reserved — not yet emitted)* |
