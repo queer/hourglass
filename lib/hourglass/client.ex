@@ -125,7 +125,7 @@ defmodule Hourglass.Client do
   end
 
   # A namespace another caller registered first exists, as ensured.
-  defp exists_after({:error, %Error{reason: :already_started}}), do: :ok
+  defp exists_after({:error, %Error{reason: :namespace_exists}}), do: :ok
   defp exists_after(registered), do: registered
 
   @doc """
@@ -162,7 +162,7 @@ defmodule Hourglass.Client do
   registration, Temporal describes a namespace but refuses every other call
   naming it (a workflow start, a worker's poll) as if it did not exist, and
   this waits that out, for up to a minute. A namespace that exists already
-  is an error (reason `:already_started`).
+  is an error with reason `:namespace_exists`.
   """
   @spec register_namespace(t(), String.t(), keyword()) :: :ok | {:error, Error.t()}
   def register_namespace(client, name, opts \\ []) do

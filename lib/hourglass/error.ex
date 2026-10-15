@@ -1,8 +1,20 @@
 defmodule Hourglass.Error do
   @moduledoc """
-  Higher-level error returned from `Hourglass.*` facade calls.
-  Distinct from `Hourglass.Bridge.Error` (low-level wire error);
-  facade functions translate Bridge.Error to this type.
+  Higher-level error returned from `Hourglass.*` facade calls and
+  `Hourglass.Client`. Distinct from `Hourglass.Bridge.Error` (low-level
+  wire error); facade functions translate Bridge.Error to this type.
+
+  The reasons:
+
+    * `:unreachable` — Temporal was not reached, or did not answer in
+      time; trying again may succeed.
+    * `:already_started` — a workflow with that id is already running
+      (or, as its reuse policy says, may not be started again).
+    * `:namespace_exists` — the namespace a register names exists already.
+    * `:not_found` — the workflow, or the namespace, is unknown to
+      Temporal (or a workflow has closed, for a call that needs it open).
+    * `:namespace_unavailable`, `:timeout`, `:canceled` — as named.
+    * `:rpc_error` — any other failure; `detail` says what.
   """
 
   alias Hourglass.Bridge
@@ -13,6 +25,7 @@ defmodule Hourglass.Error do
           :unreachable
           | :namespace_unavailable
           | :already_started
+          | :namespace_exists
           | :not_found
           | :timeout
           | :canceled
@@ -49,6 +62,9 @@ defmodule Hourglass.Error do
 
   def from_bridge_error(%Bridge.Error{kind: :namespace_not_found, detail: d}),
     do: new(:not_found, d)
+
+  def from_bridge_error(%Bridge.Error{kind: :namespace_exists, detail: d}),
+    do: new(:namespace_exists, d)
 
   def from_bridge_error(%Bridge.Error{} = err), do: new(:rpc_error, err)
 end

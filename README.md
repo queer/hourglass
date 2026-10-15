@@ -488,7 +488,8 @@ returning `{:error, %Hourglass.Error{}}` on failure as the client's other calls 
 ```elixir
 {:ok, client} = Hourglass.Client.connect()
 
-# Register one, with data attached (string keys and values); one that exists is an error.
+# Register one, with data attached (string keys and values); one that exists is an error,
+# reason :namespace_exists (a workflow already running is :already_started).
 :ok = Hourglass.Client.register_namespace(client, "orders-2", data: %{"state" => "importing"})
 
 # Or make one exist, registering it only if Temporal does not know it.

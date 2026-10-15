@@ -111,11 +111,13 @@ defmodule Hourglass.ClientNamespacesTest do
     end
   end
 
-  test "registering a namespace that exists is an error", %{client: client} do
+  test "registering a namespace that exists is a namespace_exists error, not a workflow's", %{
+    client: client
+  } do
     name = Namespaces.scratch!("ns-twice")
     :ok = Patience.retry(fn -> Client.register_namespace(client, name) end)
 
-    assert {:error, %Error{reason: :already_started}} =
+    assert {:error, %Error{reason: :namespace_exists}} =
              Patience.retry(fn -> Client.register_namespace(client, name) end)
   end
 end

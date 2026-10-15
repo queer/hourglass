@@ -18,6 +18,9 @@ pub enum BridgeError {
     // Temporal does not know the namespace a worker was given, or a call names.
     #[error("namespace not found: {0}")]
     NamespaceNotFound(String),
+    // A namespace a call would create already exists.
+    #[error("namespace exists: {0}")]
+    NamespaceExists(String),
     #[error("invalid proto: {0}")]
     InvalidProto(String),
     #[error("nondeterminism: {0}")]
@@ -38,6 +41,7 @@ pub mod atoms {
         tonic_error,
         unreachable,
         namespace_not_found,
+        namespace_exists,
         invalid_proto,
         nondeterminism,
         worker_already_started,
@@ -60,6 +64,7 @@ impl BridgeError {
             BridgeError::TonicError(s) => (atoms::tonic_error(), s.clone()),
             BridgeError::Unreachable(s) => (atoms::unreachable(), s.clone()),
             BridgeError::NamespaceNotFound(s) => (atoms::namespace_not_found(), s.clone()),
+            BridgeError::NamespaceExists(s) => (atoms::namespace_exists(), s.clone()),
             BridgeError::InvalidProto(s) => (atoms::invalid_proto(), s.clone()),
             BridgeError::Nondeterminism(s) => (atoms::nondeterminism(), s.clone()),
             BridgeError::WorkerAlreadyStarted(s) => (atoms::worker_already_started(), s.clone()),
@@ -107,10 +112,12 @@ impl BridgeError {
     }
 
     // A call naming a namespace failed: the namespace is unknown to Temporal,
-    // Temporal was not reached or did not answer in time, or it refused.
+    // exists already (registering it), Temporal was not reached or did not
+    // answer in time, or it refused.
     pub fn from_namespace_call(status: Status) -> Self {
         match status.code() {
             Code::NotFound => BridgeError::NamespaceNotFound(status.to_string()),
+            Code::AlreadyExists => BridgeError::NamespaceExists(status.to_string()),
             code if unreachable_code(code) => BridgeError::Unreachable(status.to_string()),
             _ => BridgeError::TonicError(status.to_string()),
         }
