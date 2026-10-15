@@ -9,9 +9,10 @@ defmodule Hourglass.ClientBridgeTest do
 
   @moduletag :temporal
 
-  # Bridge-NIF contract test — exercises real client_new / register_namespace
-  # / describe_namespace round-trips. Cannot be mocked: proves the NIF
-  # transport. Default `mix test` excludes :temporal.
+  # Bridge-NIF contract test — exercises real client_new / describe_namespace
+  # round-trips against the server's own "default" namespace. Cannot be mocked:
+  # proves the NIF transport. Registering is ClientTest's, through
+  # Namespaces.scratch!/1. Default `mix test` excludes :temporal.
 
   setup do
     runtime = Runtime.handle()
@@ -23,10 +24,6 @@ defmodule Hourglass.ClientBridgeTest do
       })
 
     {:ok, client} = Patience.retry(fn -> Bridge.client_new(runtime, config_bin) end)
-
-    # Ensure the "default" namespace exists; register_namespace is idempotent —
-    # already-exists is a tonic_error which we ignore here.
-    Patience.retry(fn -> Bridge.client_register_namespace(client, "default") end)
 
     [client: client]
   end

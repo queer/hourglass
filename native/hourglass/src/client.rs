@@ -8,6 +8,7 @@ use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
 use temporalio_common::protos::temporal::api::{
     common::v1::WorkflowExecution,
     enums::v1::HistoryEventFilterType,
+    operatorservice::v1::DeleteNamespaceRequest,
     workflowservice::v1::{
         DescribeNamespaceRequest, DescribeWorkflowExecutionRequest,
         GetWorkflowExecutionHistoryRequest, RegisterNamespaceRequest,
@@ -101,6 +102,36 @@ pub fn client_describe_namespace<'a>(
 
     crate::payload::encode_to_binary(env, resp.into_inner().encode_to_vec())
         .map_err(|e| BridgeError::Unknown(e).to_elixir(env))
+}
+
+/// Delete `namespace`, with no delay before Temporal reclaims it. Temporal
+/// renames it at once and removes it, and everything in it, in the background.
+/// Returns the name it holds the namespace under meanwhile.
+#[rustler::nif(schedule = "DirtyIo")]
+pub fn client_delete_namespace(
+    env: rustler::Env,
+    client: ResourceArc<ClientResource>,
+    namespace: String,
+) -> Result<String, ElixirBridgeError> {
+    let req = DeleteNamespaceRequest {
+        namespace,
+        namespace_delete_delay: Some(ProtoDuration {
+            seconds: 0,
+            nanos: 0,
+        }),
+        ..Default::default()
+    };
+
+    match client.runtime.tokio_handle.block_on(async {
+        let mut op_svc = client.client.connection().operator_service();
+        op_svc
+            .delete_namespace(Request::new(req))
+            .await
+            .map_err(|e| BridgeError::TonicError(e.to_string()))
+    }) {
+        Ok(resp) => Ok(resp.into_inner().deleted_namespace),
+        Err(e) => Err(e.to_elixir(env)),
+    }
 }
 
 #[rustler::nif(schedule = "DirtyIo")]

@@ -120,6 +120,10 @@ defmodule Hourglass.Bridge do
           :ok | {:error, Hourglass.Bridge.Error.t()}
   def client_register_namespace(_client, _namespace), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec client_delete_namespace(reference(), String.t()) ::
+          {:ok, String.t()} | {:error, Hourglass.Bridge.Error.t()}
+  def client_delete_namespace(_client, _namespace), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec client_signal_workflow(reference(), binary()) ::
           :ok | {:error, Hourglass.Bridge.Error.t()}
   def client_signal_workflow(_client, _request_bin), do: :erlang.nif_error(:nif_not_loaded)

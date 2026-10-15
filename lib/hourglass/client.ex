@@ -95,6 +95,19 @@ defmodule Hourglass.Client do
     end
   end
 
+  @doc """
+  Deletes the namespace `name`, and everything in it. Temporal renames it at
+  once, so the name is free again, and removes it in the background; the
+  name it holds it under meanwhile is returned.
+  """
+  @spec delete_namespace(t(), String.t()) :: {:ok, String.t()} | {:error, Error.t()}
+  def delete_namespace(client, name) do
+    case Bridge.client_delete_namespace(client, name) do
+      {:ok, deleted_name} -> {:ok, deleted_name}
+      {:error, %Bridge.Error{} = err} -> {:error, classify(err)}
+    end
+  end
+
   @spec health(t()) :: :ok | {:error, Error.t()}
   def health(_client) do
     # client_new succeeding already proved the cluster is reachable. For v0

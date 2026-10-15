@@ -1,6 +1,12 @@
 ExUnit.start()
 ExUnit.configure(exclude: [:temporal])
 
+# A test creates a namespace only through Hourglass.TestSupport.Namespaces.scratch!/1,
+# whose leak check deletes it when the test ends; the guard fails the run if
+# anything registers another (Hourglass.TestSupport.NamespaceGuard).
+{:ok, _guard} = Hourglass.TestSupport.NamespaceGuard.start()
+ExUnit.after_suite(fn _results -> Hourglass.TestSupport.NamespaceGuard.verify() end)
+
 # A message a test waits for comes within this by default. It catches a hang,
 # and is no promise of how soon: on a machine busy with other suites, work
 # the default 100 ms would cover takes seconds. A test that asserts how soon

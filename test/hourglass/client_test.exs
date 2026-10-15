@@ -8,6 +8,7 @@ defmodule Hourglass.ClientTest do
   alias Hourglass.Client.Backend
   alias Hourglass.Client.Real
   alias Hourglass.Error
+  alias Hourglass.TestSupport.Namespaces
   alias Hourglass.TestSupport.Patience
   alias Hourglass.WorkflowHandle
 
@@ -32,10 +33,25 @@ defmodule Hourglass.ClientTest do
 
   test "Client.ensure_namespace/2 creates if missing" do
     {:ok, client} = Patience.retry(fn -> Client.connect() end)
-    name = "ensure-test-#{UUIDv7.generate()}"
+    # Deleted when the test ends; the test fails if Temporal still has it.
+    name = Namespaces.scratch!("ensure-test")
     assert :ok = Patience.retry(fn -> Client.ensure_namespace(client, name) end)
     # Re-running should still return :ok (already-exists is fine)
     assert :ok = Patience.retry(fn -> Client.ensure_namespace(client, name) end)
+  end
+
+  test "Client.delete_namespace/2 frees the name at once" do
+    {:ok, client} = Patience.retry(fn -> Client.connect() end)
+    name = Namespaces.scratch!("delete-test")
+    :ok = Patience.retry(fn -> Client.ensure_namespace(client, name) end)
+
+    deleted = Namespaces.delete!(client, name)
+    assert deleted != name
+
+    assert {:error, %Hourglass.Bridge.Error{detail: detail}} =
+             Patience.retry(fn -> Hourglass.Bridge.client_describe_namespace(client, name) end)
+
+    assert detail =~ "not found"
   end
 
   test "Client.start_workflow returns a %WorkflowHandle{}" do
