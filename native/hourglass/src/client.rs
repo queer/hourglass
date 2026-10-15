@@ -96,7 +96,7 @@ pub fn client_describe_namespace<'a>(
             wf_svc
                 .describe_namespace(Request::new(req))
                 .await
-                .map_err(|e| BridgeError::TonicError(e.to_string()))
+                .map_err(BridgeError::from_namespace_call)
         })
         .map_err(|e| e.to_elixir(env))?;
 
@@ -127,7 +127,7 @@ pub fn client_delete_namespace(
         op_svc
             .delete_namespace(Request::new(req))
             .await
-            .map_err(|e| BridgeError::TonicError(e.to_string()))
+            .map_err(BridgeError::from_namespace_call)
     }) {
         Ok(resp) => Ok(resp.into_inner().deleted_namespace),
         Err(e) => Err(e.to_elixir(env)),
@@ -156,7 +156,7 @@ pub fn client_register_namespace(
         wf_svc
             .register_namespace(Request::new(req))
             .await
-            .map_err(|e| BridgeError::TonicError(e.to_string()))
+            .map_err(BridgeError::from_namespace_call)
     }) {
         Ok(_) => OkOrError::Ok,
         Err(e) => OkOrError::Err(e.to_elixir(env)),

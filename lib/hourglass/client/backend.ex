@@ -79,7 +79,9 @@ defmodule Hourglass.Client.Backend do
 
   @doc """
   Ensures the named namespace exists in the cluster. Idempotent: if the
-  namespace already exists, returns `:ok` without re-registering.
+  namespace already exists, returns `:ok` without re-registering. It
+  registers only a namespace Temporal says it does not know; any other
+  failure to describe it is returned (`Hourglass.Client.ensure_namespace/2`).
   """
   @callback ensure_namespace(name :: String.t()) ::
               :ok | {:error, Error.t()}

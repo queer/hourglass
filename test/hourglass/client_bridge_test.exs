@@ -40,10 +40,10 @@ defmodule Hourglass.ClientBridgeTest do
     refute info_bin == <<>>
   end
 
-  test "describe_namespace on missing namespace returns tonic error", %{client: client} do
+  test "describe_namespace on missing namespace returns namespace_not_found", %{client: client} do
     name = "missing-#{System.unique_integer([:positive])}"
 
-    assert {:error, %Bridge.Error{kind: :tonic_error, detail: detail}} =
+    assert {:error, %Bridge.Error{kind: :namespace_not_found, detail: detail}} =
              Patience.retry(fn -> Bridge.client_describe_namespace(client, name) end)
 
     assert detail =~ "not found"

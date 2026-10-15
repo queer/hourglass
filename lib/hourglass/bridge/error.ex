@@ -3,8 +3,9 @@ defmodule Hourglass.Bridge.Error do
   Tagged failure values returned from the bridge layer.
 
   `:unreachable` is Temporal not reached, or not answering in time, when
-  connecting or registering a worker: worth trying again. `:namespace_not_found`
-  is a worker's namespace unknown to Temporal. `:tonic_error` is any other
+  connecting, registering a worker, or calling about a namespace: worth
+  trying again. `:namespace_not_found` is a namespace a worker was given,
+  or a call names, unknown to Temporal. `:tonic_error` is any other
   failure of a call to Temporal.
   """
   defstruct [:kind, :detail]

@@ -4,10 +4,12 @@ defmodule Hourglass.ClientTest do
   # don't collide on Temporal-side state.
   use ExUnit.Case, async: true
 
+  alias Hourglass.Bridge
   alias Hourglass.Client
   alias Hourglass.Client.Backend
   alias Hourglass.Client.Real
   alias Hourglass.Error
+  alias Hourglass.TestSupport.FreezableProxy
   alias Hourglass.TestSupport.Namespaces
   alias Hourglass.TestSupport.Patience
   alias Hourglass.WorkflowHandle
@@ -35,9 +37,44 @@ defmodule Hourglass.ClientTest do
     {:ok, client} = Patience.retry(fn -> Client.connect() end)
     # Deleted when the test ends; the test fails if Temporal still has it.
     name = Namespaces.scratch!("ensure-test")
+    trace_registers()
     assert :ok = Patience.retry(fn -> Client.ensure_namespace(client, name) end)
+    assert_receive {:trace, _self, :call, {Bridge, :client_register_namespace, [_client, ^name]}}
     # Re-running should still return :ok (already-exists is fine)
     assert :ok = Patience.retry(fn -> Client.ensure_namespace(client, name) end)
+  end
+
+  test "Client.ensure_namespace/2 by many callers at once makes it exist for each" do
+    {:ok, client} = Patience.retry(fn -> Client.connect() end)
+    name = Namespaces.scratch!("ensure-racing")
+
+    results =
+      1..8
+      |> Enum.map(fn _n ->
+        Task.async(fn -> Patience.retry(fn -> Client.ensure_namespace(client, name) end) end)
+      end)
+      |> Task.await_many(Patience.ms())
+
+    assert Enum.uniq(results) == [:ok]
+  end
+
+  # Core gives up on a call after 30 s.
+  @tag timeout: Patience.test_timeout(2)
+  test "Client.ensure_namespace/2 returns a describe Temporal does not answer, and registers nothing" do
+    proxy = start_supervised!(FreezableProxy)
+
+    {:ok, client} =
+      Patience.retry(fn -> Client.connect(target_url: FreezableProxy.url(proxy)) end)
+
+    name = Namespaces.scratch!("ensure-silent")
+    trace_registers()
+    :ok = FreezableProxy.freeze(proxy)
+
+    assert {:error, %Error{reason: :unreachable, detail: detail}} =
+             Client.ensure_namespace(client, name)
+
+    assert detail =~ "Timeout expired"
+    refute_receive {:trace, _self, :call, {Bridge, :client_register_namespace, _args}}, 1_000
   end
 
   test "Client.delete_namespace/2 frees the name at once" do
@@ -52,6 +89,26 @@ defmodule Hourglass.ClientTest do
              Patience.retry(fn -> Hourglass.Bridge.client_describe_namespace(client, name) end)
 
     assert detail =~ "not found"
+  end
+
+  # Trace the calling process's calls that register a namespace, to it,
+  # through a relay (a process is not its own tracer).
+  defp trace_registers do
+    test = self()
+    relay = spawn_link(fn -> relay(test) end)
+    session = :trace.session_create(__MODULE__, relay, [])
+    on_exit(fn -> :trace.session_destroy(session) end)
+    1 = :trace.process(session, test, true, [:call])
+    1 = :trace.function(session, {Bridge, :client_register_namespace, 2}, true, [:global])
+    :ok
+  end
+
+  defp relay(test) do
+    receive do
+      message ->
+        send(test, message)
+        relay(test)
+    end
   end
 
   test "Client.start_workflow returns a %WorkflowHandle{}" do

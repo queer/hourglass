@@ -86,18 +86,7 @@ defmodule Hourglass.Client.Real do
 
   @impl Hourglass.Client.Backend
   def ensure_namespace(name) do
-    with {:ok, client} <- connect([]) do
-      case Bridge.client_describe_namespace(client, name) do
-        {:ok, _info} ->
-          :ok
-
-        {:error, %Bridge.Error{kind: :tonic_error}} ->
-          register_namespace(client, name)
-
-        {:error, %Bridge.Error{} = err} ->
-          {:error, classify_bridge_error(err)}
-      end
-    end
+    with {:ok, client} <- connect([]), do: Client.ensure_namespace(client, name)
   end
 
   @impl Hourglass.Client.Backend
@@ -231,13 +220,6 @@ defmodule Hourglass.Client.Real do
   end
 
   defp classify_tonic_detail(_detail), do: :tcp_reset
-
-  defp register_namespace(client, name) do
-    case Bridge.client_register_namespace(client, name) do
-      :ok -> :ok
-      {:error, %Bridge.Error{} = err} -> {:error, classify_bridge_error(err)}
-    end
-  end
 
   # Pipeline-friendly wrapper: turns `{:ok, _}` straight through and
   # converts a `Bridge.Error` into a `Hourglass.Error` for the

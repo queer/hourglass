@@ -87,14 +87,30 @@ defmodule Hourglass.Client do
 
   defp classify_tonic_detail(_detail), do: :tcp_reset
 
+  @doc """
+  Makes the namespace `name` exist: registers it, with a day's retention,
+  only if Temporal says it does not know it. Any other failure to describe
+  it (Temporal not answering, say: reason `:unreachable`) is returned as
+  that failure, and nothing is registered. A namespace another caller
+  registered between the two is there, as asked: `:ok`.
+  """
   @spec ensure_namespace(t(), String.t()) :: :ok | {:error, Error.t()}
   def ensure_namespace(client, name) do
     case Bridge.client_describe_namespace(client, name) do
-      {:ok, _info} -> :ok
-      {:error, %Bridge.Error{kind: :tonic_error}} -> register_namespace(client, name)
-      {:error, %Bridge.Error{} = err} -> {:error, classify(err)}
+      {:ok, _info} ->
+        :ok
+
+      {:error, %Bridge.Error{kind: :namespace_not_found}} ->
+        exists_after(register_namespace(client, name))
+
+      {:error, %Bridge.Error{} = err} ->
+        {:error, classify(err)}
     end
   end
+
+  # A namespace another caller registered first exists, as ensured.
+  defp exists_after({:error, %Error{reason: :already_started}}), do: :ok
+  defp exists_after(registered), do: registered
 
   @doc """
   Deletes the namespace `name`, and everything in it. Temporal renames it at

@@ -1,6 +1,6 @@
 use rustler::{Atom, Env, NifStruct};
 use temporalio_client::errors::ClientConnectError;
-use temporalio_client::tonic::Code;
+use temporalio_client::tonic::{Code, Status};
 use temporalio_sdk_core::WorkerValidationError;
 use thiserror::Error;
 
@@ -15,7 +15,7 @@ pub enum BridgeError {
     // unlike a call Temporal refused.
     #[error("unreachable: {0}")]
     Unreachable(String),
-    // Temporal does not know the namespace a worker was given.
+    // Temporal does not know the namespace a worker was given, or a call names.
     #[error("namespace not found: {0}")]
     NamespaceNotFound(String),
     #[error("invalid proto: {0}")]
@@ -103,6 +103,16 @@ impl BridgeError {
             BridgeError::Unreachable(e.to_string())
         } else {
             BridgeError::TonicError(e.to_string())
+        }
+    }
+
+    // A call naming a namespace failed: the namespace is unknown to Temporal,
+    // Temporal was not reached or did not answer in time, or it refused.
+    pub fn from_namespace_call(status: Status) -> Self {
+        match status.code() {
+            Code::NotFound => BridgeError::NamespaceNotFound(status.to_string()),
+            code if unreachable_code(code) => BridgeError::Unreachable(status.to_string()),
+            _ => BridgeError::TonicError(status.to_string()),
         }
     }
 

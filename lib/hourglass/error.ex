@@ -46,5 +46,9 @@ defmodule Hourglass.Error do
 
   def from_bridge_error(%Bridge.Error{kind: :shutdown}), do: new(:unreachable, :shutdown)
   def from_bridge_error(%Bridge.Error{kind: :unreachable, detail: d}), do: new(:unreachable, d)
+
+  def from_bridge_error(%Bridge.Error{kind: :namespace_not_found, detail: d}),
+    do: new(:not_found, d)
+
   def from_bridge_error(%Bridge.Error{} = err), do: new(:rpc_error, err)
 end
