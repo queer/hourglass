@@ -80,7 +80,8 @@ defmodule Hourglass.Activity do
     * if it is running, `heartbeat/0` answers `:cancel`, and
       `heartbeat!/0` raises `Hourglass.Activity.Cancelled` with reason
       `:workflow_cancel_requested`; one still running half the
-      closed-workflow bound later is killed.
+      closed-workflow bound later is killed. If its run closes
+      meanwhile, it is told `:workflow_closed` from then on.
 
   Either way, a workflow still running sees the activity fail, not
   retryably, with type `"WorkflowCancelRequested"`: Temporal refuses a
@@ -243,8 +244,8 @@ defmodule Hourglass.Activity do
 
   @doc """
   Like `heartbeat/0`, but RAISES `Hourglass.Activity.Cancelled` when the activity has been
-  cancelled (instead of returning `:cancel`), with reason `:workflow_closed` when its worker
-  cancelled it because its workflow run has closed, `:workflow_cancel_requested` when it opted in
+  cancelled (instead of returning `:cancel`), with reason `:workflow_closed` when its workflow run
+  has closed (whatever cancel Temporal Core sent it, before or after), `:workflow_cancel_requested` when it opted in
   to ending on a cancel request (see "Ending on a cancel request") and one was requested of its
   workflow, and `:cancel_requested` otherwise. The runner turns the raise into a Temporal
   Cancellation completion. Use in activity bodies that want automatic unwinding at the next

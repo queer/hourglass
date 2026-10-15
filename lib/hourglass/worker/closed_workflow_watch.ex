@@ -283,32 +283,59 @@ defmodule Hourglass.Worker.ClosedWorkflowWatch do
   defp answered(_other, state), do: state
 
   # The runs that have an activity running on the queue, but for those whose
-  # activities are already being ended.
+  # activities are already being ended for good (`settled?/2`).
   defp runs(state) do
     for {_pid, token, run, _opted_in} <- Executors.running_activities(state.task_queue),
-        not Map.has_key?(state.ending, token),
+        not settled?(state, token),
         uniq: true,
         do: run
   end
 
+  # Whether the activity of `token` is being ended for good: one being ended
+  # for its run's cancel request is still asked about, as its run closing
+  # changes what it is told.
+  defp settled?(state, token) do
+    case Map.get(state.ending, token) do
+      nil -> false
+      {_pid, _workflow_id, _run_id, reason} -> reason != @cancel_requested
+    end
+  end
+
   # Mark each activity whose run has ended (`states`) cancelled, and have it
-  # stopped if it is still running half the bound from now. Returns
-  # `state.ending` with them added.
+  # stopped if it is still running half the bound from now; one being ended
+  # for its run's cancel request whose run has since closed is told that
+  # instead. Returns `state.ending` with them.
   defp cancel(states, state) do
     states = Map.new(states)
 
-    for {pid, token, run, opted_in} <- Executors.running_activities(state.task_queue),
-        reason = ended(Map.get(states, run), opted_in),
-        reason != nil,
-        not Map.has_key?(state.ending, token),
-        into: state.ending do
-      {workflow_id, run_id} = run
-      CancelRegistry.mark(token, reason)
-      metadata = %{task_queue: state.task_queue, workflow_id: workflow_id, run_id: run_id}
-      :telemetry.execute([:hourglass, :activity, reason], %{count: 1}, metadata)
-      Process.send_after(self(), {:stop, token}, state.stop_after)
-      {token, {pid, workflow_id, run_id, reason}}
+    state.task_queue
+    |> Executors.running_activities()
+    |> Enum.reduce(state.ending, fn {_pid, _token, run, opted_in} = activity, ending ->
+      end_activity(activity, ended(Map.get(states, run), opted_in), ending, state)
+    end)
+  end
+
+  defp end_activity(_activity, nil, ending, _state), do: ending
+
+  defp end_activity({pid, token, run, _opted_in}, reason, ending, state) do
+    case Map.get(ending, token) do
+      nil ->
+        Process.send_after(self(), {:stop, token}, state.stop_after)
+        Map.put(ending, token, mark(token, pid, run, reason, state))
+
+      {^pid, _workflow_id, _run_id, @cancel_requested} when reason == @closed ->
+        Map.put(ending, token, mark(token, pid, run, @closed, state))
+
+      _being_ended ->
+        ending
     end
+  end
+
+  defp mark(token, pid, {workflow_id, run_id}, reason, state) do
+    CancelRegistry.mark(token, reason)
+    metadata = %{task_queue: state.task_queue, workflow_id: workflow_id, run_id: run_id}
+    :telemetry.execute([:hourglass, :activity, reason], %{count: 1}, metadata)
+    {pid, workflow_id, run_id, reason}
   end
 
   @doc false

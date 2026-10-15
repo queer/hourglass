@@ -348,7 +348,10 @@ The worker ends such an activity within its **closed-workflow bound**, which def
    activity running on its queue, up to sixteen runs at a time.
 2. Each activity of a run that has closed is cancelled: `heartbeat/0` answers `:cancel` from then
    on, and `heartbeat!/0` raises `Hourglass.Activity.Cancelled` (reason `:workflow_closed`). An
-   activity that heeds it has half the bound to clean up and end by itself.
+   activity that heeds it has half the bound to clean up and end by itself. The reason stays
+   `:workflow_closed` whatever cancel Temporal Core sends the activity, before or after: one Core
+   sends first is checked against Temporal, and reported as `:workflow_closed` if the run has
+   closed.
 3. One still running half the bound after it was cancelled is killed, and reported to Temporal as
    cancelled.
 

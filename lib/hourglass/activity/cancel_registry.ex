@@ -9,6 +9,10 @@ defmodule Hourglass.Activity.CancelRegistry do
   periodically sweep leaked entries — a Cancel that arrives AFTER its Start task already
   completed (and `clear`ed) would otherwise leave an entry nobody reads.
 
+  Once an activity is marked `:workflow_closed` (its run has closed), that mark stays until it is
+  cleared: a later `mark/2` with another reason — a cancel Core sends — leaves it, so `heartbeat!/0`
+  reports the run closed whatever Core sends after.
+
   Started app-scope (always-on) by `Hourglass.Application` so `heartbeat/0` can read it in every
   test lane, not only the `:temporal` suite.
   """
@@ -24,8 +28,24 @@ defmodule Hourglass.Activity.CancelRegistry do
   def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
   @spec mark(binary(), term()) :: :ok
+  def mark(task_token, :workflow_closed) when is_binary(task_token) do
+    :ets.insert(@table, {task_token, :workflow_closed, now_ms()})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  # Any other reason marks a token not yet marked, or replaces a mark other than
+  # `:workflow_closed`; each step is atomic, so a `:workflow_closed` mark made
+  # meanwhile is never replaced.
   def mark(task_token, reason) when is_binary(task_token) do
-    :ets.insert(@table, {task_token, reason, now_ms()})
+    entry = {task_token, reason, now_ms()}
+
+    unless :ets.insert_new(@table, entry) do
+      replaceable = [{:"=/=", :"$1", :workflow_closed}]
+      :ets.select_replace(@table, [{{task_token, :"$1", :_}, replaceable, [{:const, entry}]}])
+    end
+
     :ok
   rescue
     ArgumentError -> :ok

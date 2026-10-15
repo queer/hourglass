@@ -139,6 +139,19 @@ defmodule Hourglass.ActivityExecutor.DynamicSupervisor do
         do: {pid, task_token, run, opted_in}
   end
 
+  @doc """
+  The run (`{workflow_id, run_id}`) of the running activity whose task
+  token is `task_token`, or `nil` if none is running or its task named no
+  run.
+  """
+  @spec run_of_activity(binary()) :: {String.t(), String.t()} | nil
+  def run_of_activity(task_token) when is_binary(task_token) do
+    case Registry.lookup(@registry, {:activity, task_token}) do
+      [{_pid, {run, _opted_in}} | _rest] -> run
+      [] -> nil
+    end
+  end
+
   @doc false
   # The registry executors, and each Worker's closed-workflow watch, register in.
   @spec registry() :: atom()

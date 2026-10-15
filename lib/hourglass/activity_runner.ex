@@ -54,8 +54,11 @@ defmodule Hourglass.ActivityRunner do
 
   alias Hourglass.Activity.Info
   alias Hourglass.Activity.RetryClassifier
+  # credo:disable-for-next-line Credo.Check.Readability.AliasAs
+  alias Hourglass.ActivityExecutor.DynamicSupervisor, as: Executors
   alias Hourglass.BridgeHolder
   alias Hourglass.Failure
+  alias Hourglass.Worker.ClosedWorkflowWatch
 
   require Logger
 
@@ -207,7 +210,22 @@ defmodule Hourglass.ActivityRunner do
      }}
   end
 
-  defp invoke(%{variant: {:cancel, %{reason: reason}}, task_token: task_token}, _task_queue) do
+  # What to mark an activity Core cancelled with: `:workflow_closed` if its run
+  # has closed, as Temporal says when asked now, else Core's reason. Core's
+  # cancel can come before the closed-workflow watch has seen the run close
+  # (Core cancels with NOT_FOUND when a heartbeat finds the run gone), and the
+  # activity must learn its run closed whichever comes first
+  # (`Hourglass.Worker`, "Activities of a closed workflow").
+  defp mark_for(task_token, task_queue, reason) do
+    with {_workflow_id, _run_id} = run <- Executors.run_of_activity(task_token),
+         :closed <- ClosedWorkflowWatch.run_state(task_queue, run) do
+      :workflow_closed
+    else
+      _running_or_unknown -> reason
+    end
+  end
+
+  defp invoke(%{variant: {:cancel, %{reason: reason}}, task_token: task_token}, task_queue) do
     # Temporal sends a Cancel variant when a workflow is terminated, an activity heartbeat times
     # out, or completion races a cancellation request; Core sends one with reason WORKER_SHUTDOWN
     # once a stopping worker's grace has run out (Hourglass.Worker, "Graceful stop"). Mark the
@@ -216,7 +234,7 @@ defmodule Hourglass.ActivityRunner do
     # Cancellation completion — which Core reports to the server as a retryable "WorkerShutdown"
     # failure when the reason was WORKER_SHUTDOWN. The Start task's `after` block clears the token
     # once it finishes.
-    Hourglass.Activity.CancelRegistry.mark(task_token, reason)
+    Hourglass.Activity.CancelRegistry.mark(task_token, mark_for(task_token, task_queue, reason))
 
     :telemetry.execute([:hourglass, :activity, :cancel_received], %{count: 1}, %{reason: reason})
 

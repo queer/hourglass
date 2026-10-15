@@ -66,6 +66,11 @@ defmodule Hourglass.Worker do
        `:workflow_closed`). An activity that heeds it has half the
        bound to clean up and end by itself, reporting as it ends as
        usual. `[:hourglass, :activity, :workflow_closed]` is emitted.
+       From then on `heartbeat!/0` says `:workflow_closed` whatever
+       Core sends; and a cancel Core sends first (as it does, with
+       `NOT_FOUND`, once a heartbeat finds the run gone) is checked
+       against Temporal, and says `:workflow_closed` too if the run has
+       closed.
     3. One still running half the bound after it was cancelled is
        killed, and reported to Temporal as cancelled, so Core lets go
        of the task. `[:hourglass, :activity, :workflow_closed,
