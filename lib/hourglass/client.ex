@@ -9,7 +9,9 @@ defmodule Hourglass.Client do
   alias Hourglass.Error
   alias Hourglass.Runtime
   alias Hourglass.WorkflowHandle
+  alias Temporal.Api.Workflowservice.V1.DescribeNamespaceResponse
   alias Temporal.Api.Workflowservice.V1.GetWorkflowExecutionHistoryResponse
+  alias Temporal.Api.Workflowservice.V1.ListNamespacesResponse
   alias Temporal.Api.Workflowservice.V1.StartWorkflowExecutionResponse
 
   @type t :: reference()
@@ -139,6 +141,112 @@ defmodule Hourglass.Client do
     end
   end
 
+  @typedoc """
+  A namespace as Temporal describes it: its name, its state, and the data
+  attached to it (string keys and values, set when it is registered or by
+  `update_namespace_data/3`).
+  """
+  @type namespace :: %{
+          name: String.t(),
+          state: :registered | :deprecated | :deleted | :unspecified,
+          data: %{optional(String.t()) => String.t()}
+        }
+
+  @doc """
+  Registers the namespace `name`, with a day's retention. Options:
+
+    * `:data` — string keys and values to attach to it (`describe_namespace/2`
+      reads them back). Default: none.
+
+  It returns once Temporal serves the namespace: for some seconds after a
+  registration, Temporal describes a namespace but refuses every other call
+  naming it (a workflow start, a worker's poll) as if it did not exist, and
+  this waits that out, for up to a minute. A namespace that exists already
+  is an error (reason `:already_started`).
+  """
+  @spec register_namespace(t(), String.t(), keyword()) :: :ok | {:error, Error.t()}
+  def register_namespace(client, name, opts \\ []) do
+    data = string_map!(Keyword.get(opts, :data, %{}))
+
+    case Bridge.client_register_namespace(client, name, data) do
+      :ok -> :ok
+      {:error, %Bridge.Error{} = err} -> {:error, classify(err)}
+    end
+  end
+
+  @doc """
+  The namespace `name`, with its data. One Temporal does not know is an
+  error with reason `:not_found`.
+  """
+  @spec describe_namespace(t(), String.t()) :: {:ok, namespace()} | {:error, Error.t()}
+  def describe_namespace(client, name) do
+    case Bridge.client_describe_namespace(client, name) do
+      {:ok, bytes} -> {:ok, namespace(DescribeNamespaceResponse.decode(bytes))}
+      {:error, %Bridge.Error{} = err} -> {:error, classify(err)}
+    end
+  end
+
+  @doc """
+  Merges `data` into the namespace `name`'s data: each key given is set to
+  its value, and the keys not given are left as they are.
+  """
+  @spec update_namespace_data(t(), String.t(), %{optional(String.t()) => String.t()}) ::
+          :ok | {:error, Error.t()}
+  def update_namespace_data(client, name, data) do
+    case Bridge.client_update_namespace_data(client, name, string_map!(data)) do
+      :ok -> :ok
+      {:error, %Bridge.Error{} = err} -> {:error, classify(err)}
+    end
+  end
+
+  @doc """
+  Every namespace Temporal knows, with its data, read page by page until the
+  last. Options:
+
+    * `:page_size` — how many to ask for at a time. Default: the server's.
+  """
+  @spec list_namespaces(t(), keyword()) :: {:ok, [namespace()]} | {:error, Error.t()}
+  def list_namespaces(client, opts \\ []) do
+    list_namespaces(client, Keyword.get(opts, :page_size, 0), "", [])
+  end
+
+  defp list_namespaces(client, page_size, token, listed) do
+    case Bridge.client_list_namespaces(client, page_size, token) do
+      {:ok, bytes} ->
+        page = ListNamespacesResponse.decode(bytes)
+
+        listed =
+          page.namespaces
+          |> Enum.map(&namespace/1)
+          |> Enum.reverse(listed)
+
+        if page.next_page_token in ["", nil],
+          do: {:ok, Enum.reverse(listed)},
+          else: list_namespaces(client, page_size, page.next_page_token, listed)
+
+      {:error, %Bridge.Error{} = err} ->
+        {:error, classify(err)}
+    end
+  end
+
+  # Namespace data is strings to strings, as Temporal keeps it.
+  defp string_map!(data) do
+    if is_map(data) and
+         Enum.all?(data, fn {key, value} -> is_binary(key) and is_binary(value) end),
+       do: data,
+       else:
+         raise(ArgumentError, "namespace data must map strings to strings, got: #{inspect(data)}")
+  end
+
+  defp namespace(%{namespace_info: info}) do
+    %{name: info.name, state: namespace_state(info.state), data: Map.new(info.data)}
+  end
+
+  defp namespace_state(:NAMESPACE_STATE_REGISTERED), do: :registered
+  defp namespace_state(:NAMESPACE_STATE_DEPRECATED), do: :deprecated
+  defp namespace_state(:NAMESPACE_STATE_DELETED), do: :deleted
+  defp namespace_state(_unspecified), do: :unspecified
+
   @spec health(t()) :: :ok | {:error, Error.t()}
   def health(_client) do
     # client_new succeeding already proved the cluster is reachable. For v0
@@ -220,13 +328,6 @@ defmodule Hourglass.Client do
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
-
-  defp register_namespace(client, name) do
-    case Bridge.client_register_namespace(client, name) do
-      :ok -> :ok
-      {:error, %Bridge.Error{} = err} -> {:error, classify(err)}
-    end
-  end
 
   @doc """
   Returns the cluster default namespace as resolved from

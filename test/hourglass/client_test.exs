@@ -39,7 +39,10 @@ defmodule Hourglass.ClientTest do
     name = Namespaces.scratch!("ensure-test")
     trace_registers()
     assert :ok = Patience.retry(fn -> Client.ensure_namespace(client, name) end)
-    assert_receive {:trace, _self, :call, {Bridge, :client_register_namespace, [_client, ^name]}}
+
+    assert_receive {:trace, _self, :call,
+                    {Bridge, :client_register_namespace, [_client, ^name, _data]}}
+
     # Re-running should still return :ok (already-exists is fine)
     assert :ok = Patience.retry(fn -> Client.ensure_namespace(client, name) end)
   end
@@ -99,7 +102,7 @@ defmodule Hourglass.ClientTest do
     session = :trace.session_create(__MODULE__, relay, [])
     on_exit(fn -> :trace.session_destroy(session) end)
     1 = :trace.process(session, test, true, [:call])
-    1 = :trace.function(session, {Bridge, :client_register_namespace, 2}, true, [:global])
+    1 = :trace.function(session, {Bridge, :client_register_namespace, 3}, true, [:global])
     :ok
   end
 

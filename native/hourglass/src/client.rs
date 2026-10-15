@@ -1,20 +1,22 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use prost::Message;
 use prost_wkt_types::Duration as ProtoDuration;
 use rustler::{Binary, ResourceArc};
-use temporalio_client::tonic::Request;
+use temporalio_client::tonic::{Code, Request};
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
 use temporalio_common::protos::temporal::api::{
     common::v1::WorkflowExecution,
     enums::v1::HistoryEventFilterType,
+    namespace::v1::UpdateNamespaceInfo,
     operatorservice::v1::DeleteNamespaceRequest,
     workflowservice::v1::{
         DescribeNamespaceRequest, DescribeWorkflowExecutionRequest,
-        GetWorkflowExecutionHistoryRequest, RegisterNamespaceRequest,
-        RequestCancelWorkflowExecutionRequest, SignalWorkflowExecutionRequest,
-        StartWorkflowExecutionRequest,
+        GetWorkflowExecutionHistoryRequest, ListNamespacesRequest, ListWorkflowExecutionsRequest,
+        RegisterNamespaceRequest, RequestCancelWorkflowExecutionRequest,
+        SignalWorkflowExecutionRequest, StartWorkflowExecutionRequest, UpdateNamespaceRequest,
     },
 };
 use tokio::sync::OnceCell;
@@ -163,11 +165,75 @@ pub fn client_delete_namespace(
     }
 }
 
+// One page of the namespaces Temporal knows, up to `page_size` (0: the
+// server's default), from `next_page_token` (empty: the first page). Returns
+// the encoded ListNamespacesResponse, whose next_page_token is empty on the
+// last page.
+#[rustler::nif(schedule = "DirtyIo")]
+pub fn client_list_namespaces<'a>(
+    env: rustler::Env<'a>,
+    client: ResourceArc<ClientResource>,
+    page_size: i32,
+    next_page_token: Binary,
+) -> Result<Binary<'a>, ElixirBridgeError> {
+    let req = ListNamespacesRequest {
+        page_size,
+        next_page_token: next_page_token.as_slice().to_vec(),
+        ..Default::default()
+    };
+
+    let resp = client
+        .runtime
+        .tokio_handle
+        .block_on(async {
+            let mut wf_svc = client.client.connection().workflow_service();
+            wf_svc
+                .list_namespaces(Request::new(req))
+                .await
+                .map_err(BridgeError::from_namespace_call)
+        })
+        .map_err(|e| e.to_elixir(env))?;
+
+    crate::payload::encode_to_binary(env, resp.into_inner().encode_to_vec())
+        .map_err(|e| BridgeError::Unknown(e).to_elixir(env))
+}
+
+// Merge `data` into `namespace`'s data: the keys given are set, the others
+// left as they are.
+#[rustler::nif(schedule = "DirtyIo")]
+pub fn client_update_namespace_data(
+    env: rustler::Env,
+    client: ResourceArc<ClientResource>,
+    namespace: String,
+    data: HashMap<String, String>,
+) -> OkOrError {
+    let req = UpdateNamespaceRequest {
+        namespace,
+        update_info: Some(UpdateNamespaceInfo {
+            data,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    match client.runtime.tokio_handle.block_on(async {
+        let mut wf_svc = client.client.connection().workflow_service();
+        wf_svc
+            .update_namespace(Request::new(req))
+            .await
+            .map_err(BridgeError::from_namespace_call)
+    }) {
+        Ok(_) => OkOrError::Ok,
+        Err(e) => OkOrError::Err(e.to_elixir(env)),
+    }
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
 pub fn client_register_namespace(
     env: rustler::Env,
     client: ResourceArc<ClientResource>,
     namespace: String,
+    data: HashMap<String, String>,
 ) -> OkOrError {
     // 1-day retention period is required by the Temporal server.
     let retention = ProtoDuration {
@@ -175,8 +241,9 @@ pub fn client_register_namespace(
         nanos: 0,
     };
     let req = RegisterNamespaceRequest {
-        namespace,
+        namespace: namespace.clone(),
         workflow_execution_retention_period: Some(retention),
+        data,
         ..Default::default()
     };
 
@@ -185,10 +252,45 @@ pub fn client_register_namespace(
         wf_svc
             .register_namespace(Request::new(req))
             .await
-            .map_err(BridgeError::from_namespace_call)
+            .map_err(BridgeError::from_namespace_call)?;
+        served(&client, namespace).await
     }) {
-        Ok(_) => OkOrError::Ok,
+        Ok(()) => OkOrError::Ok,
         Err(e) => OkOrError::Err(e.to_elixir(env)),
+    }
+}
+
+// How long Temporal may take to serve a namespace it has registered.
+const SERVED_WITHIN: Duration = Duration::from_secs(60);
+
+// Wait until Temporal serves `namespace`, just registered. For some seconds
+// after a registration, Temporal's frontend describes the namespace, but
+// answers every other call naming it (a workflow start, a worker's poll) as
+// if it did not exist; a call listing its workflows tells.
+async fn served(client: &ClientResource, namespace: String) -> Result<(), BridgeError> {
+    let deadline = tokio::time::Instant::now() + SERVED_WITHIN;
+
+    loop {
+        let req = ListWorkflowExecutionsRequest {
+            namespace: namespace.clone(),
+            page_size: 1,
+            ..Default::default()
+        };
+        let mut wf_svc = client.client.connection().workflow_service();
+
+        match wf_svc.list_workflow_executions(Request::new(req)).await {
+            Ok(_) => return Ok(()),
+            Err(status) if status.code() == Code::NotFound => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(BridgeError::Unreachable(format!(
+                        "namespace {namespace} registered, but not served after {} s",
+                        SERVED_WITHIN.as_secs()
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(status) => return Err(BridgeError::from_namespace_call(status)),
+        }
     }
 }
 

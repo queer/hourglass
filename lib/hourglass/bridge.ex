@@ -116,9 +116,21 @@ defmodule Hourglass.Bridge do
           {:ok, binary()} | {:error, Hourglass.Bridge.Error.t()}
   def client_describe_namespace(_client, _namespace), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec client_register_namespace(reference(), String.t()) ::
+  @spec client_register_namespace(reference(), String.t(), %{optional(String.t()) => String.t()}) ::
           :ok | {:error, Hourglass.Bridge.Error.t()}
-  def client_register_namespace(_client, _namespace), do: :erlang.nif_error(:nif_not_loaded)
+  def client_register_namespace(_client, _namespace, _data),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec client_list_namespaces(reference(), integer(), binary()) ::
+          {:ok, binary()} | {:error, Hourglass.Bridge.Error.t()}
+  def client_list_namespaces(_client, _page_size, _next_page_token),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec client_update_namespace_data(reference(), String.t(), %{
+          optional(String.t()) => String.t()
+        }) :: :ok | {:error, Hourglass.Bridge.Error.t()}
+  def client_update_namespace_data(_client, _namespace, _data),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   @spec client_delete_namespace(reference(), String.t()) ::
           {:ok, String.t()} | {:error, Hourglass.Bridge.Error.t()}

@@ -20,12 +20,12 @@ defmodule Hourglass.TestSupport.NamespaceGuard do
   alias Hourglass.TestSupport.Namespaces
   alias Hourglass.TestSupport.Patience
 
-  @registers {Bridge, :client_register_namespace, 2}
+  @registers {Bridge, :client_register_namespace, 3}
 
   @doc """
   Start a guard, unlinked: it lives for the whole run. Options, for testing
   the guard itself: `:name` (default `#{inspect(__MODULE__)}`), `:registers`
-  (the `{module, function, 2}` that registers the namespace named by its
+  (the `{module, function, arity}` that registers the namespace named by its
   second argument) and `:delete` (deletes a namespace a violation created).
   """
   @spec start(keyword()) :: GenServer.on_start()
@@ -116,14 +116,14 @@ defmodule Hourglass.TestSupport.NamespaceGuard do
 
   @impl GenServer
   def handle_info(
-        {:trace, caller, :call, {m, f, [_client, name]}},
-        %{registers: {m, f, 2}} = state
+        {:trace, caller, :call, {m, f, [_client, name | _rest]}},
+        %{registers: {m, f, _arity}} = state
       ),
       do: {:noreply, %{state | calls: Map.put(state.calls, caller, name)}}
 
   def handle_info(
-        {:trace, caller, :return_from, {m, f, 2}, result},
-        %{registers: {m, f, 2}} = state
+        {:trace, caller, :return_from, {m, f, arity}, result},
+        %{registers: {m, f, arity}} = state
       ) do
     {name, calls} = Map.pop(state.calls, caller)
     state = %{state | calls: calls}

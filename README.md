@@ -477,6 +477,33 @@ runs. A connection lost is made again by the next call. See `Hourglass.Client.co
 
 `Hourglass.result/2` polls `status/2` until the workflow closes or the timeout budget expires. Production code should use it sparingly — long-running workflows may execute for hours or days. Prefer observing projections that workflows commit to, or poll `status/2` on demand.
 
+## Managing namespaces
+
+`Hourglass.Client` registers, describes, updates, lists and deletes namespaces, each call
+returning `{:error, %Hourglass.Error{}}` on failure as the client's other calls do:
+
+```elixir
+{:ok, client} = Hourglass.Client.connect()
+
+# Register one, with data attached (string keys and values); one that exists is an error.
+:ok = Hourglass.Client.register_namespace(client, "orders-2", data: %{"state" => "importing"})
+
+# Or make one exist, registering it only if Temporal does not know it.
+:ok = Hourglass.Client.ensure_namespace(client, "orders")
+
+# Describe one: %{name: "orders-2", state: :registered, data: %{"state" => "importing"}}.
+{:ok, namespace} = Hourglass.Client.describe_namespace(client, "orders-2")
+
+# Merge into its data: the keys given are set, the others kept.
+:ok = Hourglass.Client.update_namespace_data(client, "orders-2", %{"state" => "restored"})
+
+# Every namespace Temporal knows, across all pages.
+{:ok, namespaces} = Hourglass.Client.list_namespaces(client)
+
+# Delete one, and everything in it; returns the name Temporal holds it under while removing it.
+{:ok, _deleted_as} = Hourglass.Client.delete_namespace(client, "orders-2")
+```
+
 ## Telemetry
 
 Hourglass emits the following `:telemetry` events:
